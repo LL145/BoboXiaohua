@@ -51,7 +51,8 @@ output/日期_标题/标题.mp4
 | macOS(Apple 芯片) | `AI-Video-Generator_macos-arm64.tar.gz` | 首次**右键 → 打开** `AI短视频生成器.app` |
 | Linux(x86-64) | `AI-Video-Generator_linux64.tar.gz` | 终端运行 `./AI短视频生成器` |
 
-首次运行会在程序目录自动生成 `config.yaml`,点击「打开配置文件」填入两个 API KEY 即可使用。
+首次运行会在程序旁自动生成 `config.yaml`(macOS 生成在 `.app` 旁边),
+点击「打开配置文件」填入两个 API KEY 即可使用;成片输出到同目录的 `output/` 文件夹。
 
 > macOS 版未做付费签名,首次启动请**右键(或按住 Control 点击)→ 打开**,
 > 才会出现「仍要打开」按钮;Intel 芯片的旧款 Mac 请用源码运行。
@@ -66,7 +67,7 @@ output/日期_标题/标题.mp4
    Linux 用 `sudo apt install ffmpeg`(或对应发行版的包管理器)
 3. 安装依赖:
 
-```bat
+```bash
 pip install -r requirements.txt
 ```
 
@@ -95,7 +96,7 @@ OpenRouter 上的任意模型(如 `openai/gpt-5.2`、`google/gemini-3-pro`、`de
 
 也支持命令行模式:
 
-```bat
+```bash
 python main.py "一只橘猫在雨后的东京街头漫步,霓虹灯倒映在水洼里,电影感画面"
 ```
 
@@ -128,3 +129,16 @@ output/20260803_153000_雨巷橘猫/
   也可把端点换成 Kling 3 Standard(`v3/standard/...`,约 75 折)或旧版 2.x。
 - **费用参考**(以 fal.ai 实时定价为准)— 60 秒成片:Kling 3 Pro 含音效约 $10,
   关音效约 $6.7;参考图 $0.08;分镜脚本几美分到几十美分(视模型而定)。
+
+## 发布新版本(维护者)
+
+打一个以 **`v` 开头**的 tag,GitHub Actions 会自动构建三个平台的压缩包并附到同名 Release:
+
+```bash
+git tag v1.1.0
+git push origin v1.1.0
+```
+
+也可以直接在 GitHub 网页上 *Releases → Draft a new release* 创建新标签发布。
+注意标签**必须以 `v` 开头**(如 `v1.1.0`,而不是 `1.1.0`),否则不会触发自动构建;
+构建约需几分钟,完成后三个平台的压缩包会自动出现在该 Release 的 Assets 中。
