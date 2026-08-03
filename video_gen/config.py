@@ -19,9 +19,13 @@ def app_dir() -> Path:
 CONFIG_PATH = app_dir() / "config.yaml"
 
 _DEFAULTS: dict[str, Any] = {
-    "anthropic_api_key": "",
+    "openrouter_api_key": "",
     "fal_api_key": "",
-    "claude": {"model": "claude-opus-5", "max_tokens": 16000},
+    "llm": {
+        "model": "anthropic/claude-fable-5",
+        "reasoning_effort": "high",
+        "max_tokens": 32000,
+    },
     "kling": {
         "endpoint": "fal-ai/kling-video/v2.5-turbo/pro/text-to-video",
         "clip_duration": 10,
@@ -52,8 +56,8 @@ class Config:
         return self._data[key]
 
     @property
-    def anthropic_api_key(self) -> str:
-        return (self._data.get("anthropic_api_key") or "").strip()
+    def openrouter_api_key(self) -> str:
+        return (self._data.get("openrouter_api_key") or "").strip()
 
     @property
     def fal_api_key(self) -> str:
@@ -70,8 +74,8 @@ class Config:
     def validate(self) -> list[str]:
         """返回配置问题列表,为空表示可用。"""
         problems = []
-        if not self.anthropic_api_key:
-            problems.append("config.yaml 中缺少 anthropic_api_key")
+        if not self.openrouter_api_key:
+            problems.append("config.yaml 中缺少 openrouter_api_key")
         if not self.fal_api_key:
             problems.append("config.yaml 中缺少 fal_api_key")
         if int(self._data["kling"]["clip_duration"]) not in (5, 10):

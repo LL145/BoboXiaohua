@@ -19,7 +19,7 @@ _PLACEHOLDER = "例如:一只橘猫在雨后的东京街头漫步,霓虹灯倒�
 class App:
     def __init__(self) -> None:
         self.root = tk.Tk()
-        self.root.title("AI 短视频生成器 — Claude × Kling")
+        self.root.title("AI 短视频生成器 — LLM × Kling")
         self.root.geometry("760x560")
         self.root.minsize(640, 480)
 

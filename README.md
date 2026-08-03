@@ -1,4 +1,4 @@
-# AI 短视频生成器(Claude × Kling)
+# AI 短视频生成器(OpenRouter × Kling)
 
 在 Windows 上运行的桌面小工具:输入一句话描述,点击「生成」,自动产出一条约 **60 秒**的高质量短视频。
 
@@ -8,7 +8,8 @@
 一句话描述
    │
    ▼
-① Claude(编剧 + 导演)          → 扩写为 6 个镜头的分镜脚本(每镜头 10 秒)
+① LLM 导演(经 OpenRouter)     → 扩写为 6 个镜头的分镜脚本(每镜头 10 秒)
+   │  默认 Claude Fable 5 (high)     可换 OpenRouter 上任意模型
    │                              固定风格签名 + 角色描述逐字复用,保证跨镜头一致
    ▼
 ② Kling(fal.ai)               → 多镜头并行生成,单镜头独立重试
@@ -24,7 +25,7 @@ output/日期_标题/标题.mp4
 
 - **并行生成**:多个镜头同时提交 Kling,总耗时约等于单个镜头(数分钟);
 - **断点续传**:分镜脚本与已完成片段落盘保存,同一描述再次生成时自动续接,不重复扣费;
-- **一致性**:Claude 先确定统一的风格签名(色调/光线/胶片感)与角色外观描述,并在每个镜头 prompt 中逐字复用;
+- **一致性**:导演模型先确定统一的风格签名(色调/光线/胶片感)与角色外观描述,并在每个镜头 prompt 中逐字复用;
 - **背景音乐**:把 mp3 放进 `music/` 文件夹即自动随机混入(压低音量、结尾淡出),文件夹为空则输出纯净成片。
 
 ## 安装
@@ -42,9 +43,12 @@ pip install -r requirements.txt
 编辑程序目录下的 `config.yaml`,填入两个 API KEY:
 
 ```yaml
-anthropic_api_key: "sk-ant-..."   # https://platform.claude.com/
+openrouter_api_key: "sk-or-..."   # https://openrouter.ai/settings/keys
 fal_api_key: "..."                # https://fal.ai/dashboard/keys
 ```
+
+编剧/导演默认使用 **Claude Fable 5**(思考深度 high)。想换模型只需改 `llm.model` 一行,
+支持 OpenRouter 上的任意模型(如 `openai/gpt-5.2`、`google/gemini-3-pro`、`deepseek/deepseek-r2`)。
 
 其余配置(Kling 模型端点、镜头时长、画幅比例、目标总时长、输出目录、ffmpeg 路径)均可在该文件中调整,注释里有说明。
 
@@ -78,4 +82,5 @@ output/20260803_153000_雨巷橘猫/
 
 - **提示未找到 ffmpeg** — 确认已安装并加入 PATH,或在 `config.yaml` 的 `ffmpeg.path` 填写完整路径。
 - **想换 Kling 版本** — 修改 `config.yaml` 中 `kling.endpoint`,可选端点见 [fal.ai 模型页](https://fal.ai/models)。
-- **费用** — Claude 一次分镜脚本约几美分;Kling 按片段计费(以 fal.ai 定价为准),6 个 10 秒镜头为主要成本。
+- **想换编剧模型** — 修改 `config.yaml` 中 `llm.model` 为 OpenRouter 上的任意模型 ID;`llm.reasoning_effort` 控制思考深度(不支持思考的模型自动忽略)。
+- **费用** — 分镜脚本一次约几美分到几十美分(视模型而定);Kling 按片段计费(以 fal.ai 定价为准),6 个 10 秒镜头为主要成本。
