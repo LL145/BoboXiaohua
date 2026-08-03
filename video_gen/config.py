@@ -11,9 +11,14 @@ import yaml
 
 
 def app_dir() -> Path:
-    """程序所在目录(兼容 PyInstaller 打包后的 exe)。"""
+    """程序所在目录(兼容 PyInstaller 打包后的程序)。"""
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
+        exe_dir = Path(sys.executable).parent
+        # macOS .app 包内可执行文件位于 xx.app/Contents/MacOS,
+        # 配置与输出放到 .app 旁边,便于用户找到
+        if sys.platform == "darwin" and exe_dir.parts[-2:] == ("Contents", "MacOS"):
+            return exe_dir.parent.parent.parent
+        return exe_dir
     return Path(__file__).resolve().parent.parent
 
 
