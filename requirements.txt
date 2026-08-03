@@ -1,0 +1,4 @@
+anthropic>=0.60.0
+fal-client>=0.5.0
+PyYAML>=6.0
+requests>=2.31.0

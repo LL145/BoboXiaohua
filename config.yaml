@@ -1,0 +1,44 @@
+# ============================================================
+#  AI 短视频生成器 配置文件
+#  首次使用请填入下方的 API KEY
+# ============================================================
+
+# Anthropic Claude API Key (https://platform.claude.com/ 获取)
+anthropic_api_key: ""
+
+# fal.ai API Key (https://fal.ai/dashboard/keys 获取)
+fal_api_key: ""
+
+# ---------------- Claude(编剧 + 导演) ----------------
+claude:
+  # 用于撰写分镜脚本的模型
+  model: "claude-opus-5"
+  # 单次请求最大输出 token
+  max_tokens: 16000
+
+# ---------------- Kling 视频生成(fal.ai) ----------------
+kling:
+  # fal.ai 上的 Kling 文生视频模型端点,可按需替换,例如:
+  #   fal-ai/kling-video/v2.5-turbo/pro/text-to-video
+  #   fal-ai/kling-video/v2.1/master/text-to-video
+  #   fal-ai/kling-video/v1.6/pro/text-to-video
+  endpoint: "fal-ai/kling-video/v2.5-turbo/pro/text-to-video"
+  # 每个镜头时长(秒),Kling 仅支持 5 或 10
+  clip_duration: 10
+  # 画幅比例: 16:9 / 9:16 / 1:1
+  aspect_ratio: "16:9"
+  # 生成失败时单个镜头的重试次数
+  max_retries: 2
+
+# ---------------- 成片 ----------------
+video:
+  # 目标总时长(秒),实际时长 = 镜头数 x 每镜头时长,就近凑齐
+  target_duration: 60
+  # 输出目录(相对程序目录)
+  output_dir: "output"
+
+# ---------------- ffmpeg ----------------
+ffmpeg:
+  # ffmpeg 可执行文件路径。已加入 PATH 时保持 "ffmpeg" 即可,
+  # 否则填绝对路径,例如 C:\\tools\\ffmpeg\\bin\\ffmpeg.exe
+  path: "ffmpeg"
