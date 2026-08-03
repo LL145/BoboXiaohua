@@ -24,6 +24,11 @@ APP_NAME = "AI短视频生成器"
 FFMPEG_DIR = ROOT / "ffmpeg"
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 
+# Windows 控制台/CI 默认编码可能是 cp1252/GBK,打印中文会崩,强制 UTF-8
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 
 def ensure_pyinstaller() -> None:
     if importlib.util.find_spec("PyInstaller") is None:

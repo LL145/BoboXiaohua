@@ -14,6 +14,8 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write # 打 tag 时创建 Release 需要
+    env:
+      PYTHONUTF8: "1" # 应用名/路径含中文,PyInstaller 等子进程输出需 UTF-8
     steps:
       - uses: actions/checkout@v4
 
