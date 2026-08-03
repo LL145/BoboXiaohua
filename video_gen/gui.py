@@ -97,7 +97,7 @@ class App:
 
         def work() -> None:
             try:
-                pipeline = Pipeline(config, self._log)
+                pipeline = Pipeline(config, self._log, progress=self._on_progress)
                 final_path = pipeline.run(description)
                 self._log_queue.put(f"__DONE__{final_path}")
             except Exception as exc:  # noqa: BLE001 - 汇总展示给用户
@@ -140,6 +140,10 @@ class App:
     def _log(self, message: str) -> None:
         self._log_queue.put(message)
 
+    def _on_progress(self, done: int, total: int) -> None:
+        """镜头完成进度(由工作线程调用,经队列转到主线程)。"""
+        self._log_queue.put(f"__PROG__{done}/{total}")
+
     def _clear_log(self) -> None:
         self.log_box.config(state="normal")
         self.log_box.delete("1.0", "end")
@@ -155,6 +159,11 @@ class App:
                     self.open_btn.config(state="normal")
                 elif message == "__FAIL__":
                     self._finish("生成失败,详见日志。")
+                elif message.startswith("__PROG__"):
+                    done, total = message[len("__PROG__"):].split("/")
+                    self.progress.stop()
+                    self.progress.config(mode="determinate", maximum=int(total))
+                    self.progress["value"] = int(done)
                 else:
                     self.log_box.config(state="normal")
                     self.log_box.insert("end", message + "\n")
@@ -166,6 +175,8 @@ class App:
 
     def _finish(self, status: str) -> None:
         self.progress.stop()
+        self.progress.config(mode="indeterminate")
+        self.progress["value"] = 0
         self.generate_btn.config(state="normal")
         self.status_var.set(status)
 

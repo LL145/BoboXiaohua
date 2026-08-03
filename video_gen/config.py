@@ -27,13 +27,22 @@ _DEFAULTS: dict[str, Any] = {
         "max_tokens": 32000,
     },
     "kling": {
-        "endpoint": "fal-ai/kling-video/v2.5-turbo/pro/text-to-video",
+        "text_endpoint": "fal-ai/kling-video/v3/pro/text-to-video",
+        "reference_endpoint": "fal-ai/kling-video/o3/pro/reference-to-video",
         "clip_duration": 10,
         "aspect_ratio": "16:9",
+        "generate_audio": True,
         "max_retries": 2,
         "concurrency": 3,
+        "shot_timeout": 1500,
     },
-    "video": {"target_duration": 60, "output_dir": "output", "bgm_volume": 0.22},
+    "image": {"endpoint": "fal-ai/nano-banana-2"},
+    "video": {
+        "target_duration": 60,
+        "output_dir": "output",
+        "transition": 0.5,
+        "bgm_volume": 0.22,
+    },
     "ffmpeg": {"path": "ffmpeg"},
 }
 
@@ -78,8 +87,10 @@ class Config:
             problems.append("config.yaml 中缺少 openrouter_api_key")
         if not self.fal_api_key:
             problems.append("config.yaml 中缺少 fal_api_key")
-        if int(self._data["kling"]["clip_duration"]) not in (5, 10):
-            problems.append("kling.clip_duration 只支持 5 或 10")
+        if not 3 <= int(self._data["kling"]["clip_duration"]) <= 15:
+            problems.append("kling.clip_duration 需在 3~15 秒之间")
+        if float(self._data["video"]["transition"]) < 0:
+            problems.append("video.transition 不能为负数")
         return problems
 
 

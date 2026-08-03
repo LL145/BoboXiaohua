@@ -33,6 +33,8 @@ class Storyboard:
     title: str
     logline: str
     shots: list[Shot]
+    reference_prompt: str = ""  # 主角参考图的文生图提示词,空串表示无固定主角
+    bgm_file: str = ""          # 导演按情绪挑选的背景音乐文件名,空串表示未选
 
     @property
     def total_duration(self) -> int:
@@ -42,6 +44,8 @@ class Storyboard:
         return {
             "title": self.title,
             "logline": self.logline,
+            "reference_prompt": self.reference_prompt,
+            "bgm_file": self.bgm_file,
             "shots": [asdict(s) for s in self.shots],
         }
 
@@ -50,6 +54,8 @@ class Storyboard:
         return cls(
             title=data["title"],
             logline=data["logline"],
+            reference_prompt=data.get("reference_prompt", ""),
+            bgm_file=data.get("bgm_file", ""),
             shots=[Shot(**raw) for raw in data["shots"]],
         )
 
@@ -64,6 +70,15 @@ _STORYBOARD_SCHEMA = {
             "description": (
                 "English style signature reused verbatim in every shot prompt: "
                 "color palette, lighting scheme, film stock / rendering style"
+            ),
+        },
+        "reference_prompt": {
+            "type": "string",
+            "description": (
+                "If the story has one recurring main subject: an English "
+                "text-to-image prompt for its reference portrait (frontal, "
+                "full body, clean neutral background, includes style_anchor). "
+                "Empty string if there is no recurring subject."
             ),
         },
         "shots": {
@@ -90,7 +105,7 @@ _STORYBOARD_SCHEMA = {
             },
         },
     },
-    "required": ["title", "logline", "style_anchor", "shots"],
+    "required": ["title", "logline", "style_anchor", "reference_prompt", "shots"],
     "additionalProperties": False,
 }
 
@@ -113,6 +128,16 @@ of field, shot on 35mm film, cinematic color grading")。
 逐字重复(如 "a ginger tabby cat with white paws and a red collar")。绝不使用 \
 "the same cat as before" 这类跨镜头指代——各镜头相互独立生成,看不到彼此。
 
+## 主角参考图(角色一致性)
+判断创意中是否存在贯穿多个镜头的核心主体(人物、动物、物品等):
+- 存在:在 reference_prompt 字段写一段英文文生图提示词,用于生成该主体的参考图——\
+正面、完整主体、姿态自然、背景干净的纯色或简单环境、外观细节完整清晰,并包含 \
+style_anchor 的风格词。该参考图会随每个镜头一起送入视频模型以锁定主角外观。\
+同时,凡镜头 prompt 中提到该主体,必须写成 "@Image1 (完整的固定外观描述)" 的形式\
+——@Image1 是参考图占位符,括号内是逐字重复的外观描述。
+- 不存在(纯风景、抽象影像、每个镜头主体各不相同等):reference_prompt 置为空字符串,\
+所有 prompt 中都不得出现 @Image1。
+
 ## 每个镜头 prompt 的结构(英文,按顺序)
 1. Setting:环境、时间、天气、氛围;
 2. Subject:主体及关键外观细节(复用固定描述);
@@ -124,14 +149,16 @@ of field, shot on 35mm film, cinematic color grading")。
 
 ## 其他
 - 画面中不得出现文字、字幕、logo、水印。
+- 以视觉叙事为主,不要设计对白/台词场景(模型会自动生成环境音效)。
 - negative_prompt 用英文,列出需规避项(如 blur, distortion, warping, text, \
 watermark, extra limbs, deformed hands, flickering)。
 - title 与 logline 用中文;title 简短(不超过 10 个字),将用作文件名。
 
 ## 输出格式
 只输出一个 JSON 对象(不要 Markdown 代码块、不要任何解释文字),字段为:
-title(string)、logline(string)、style_anchor(string)、\
-shots(数组,每项含 title、prompt、negative_prompt)。
+title(string)、logline(string)、style_anchor(string)、reference_prompt(string)、\
+shots(数组,每项含 title、prompt、negative_prompt);\
+若用户消息中提供了背景音乐列表,则额外包含 bgm_file(string)。
 """
 
 
@@ -160,12 +187,14 @@ class Director:
     def __init__(self, config: Config):
         self._config = config
 
-    def write_storyboard(self, description: str) -> Storyboard:
+    def write_storyboard(
+        self, description: str, bgm_options: list[str] | None = None
+    ) -> Storyboard:
         """根据用户一句话描述生成分镜脚本(含瞬时错误重试)。"""
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                return self._write_once(description)
+                return self._write_once(description, bgm_options)
             except (requests.ConnectionError, requests.Timeout,
                     json.JSONDecodeError, KeyError, _RetryableHTTPError) as exc:
                 last_error = exc
@@ -174,7 +203,9 @@ class Director:
 
     # ---------------- OpenRouter 调用 ----------------
 
-    def _write_once(self, description: str) -> Storyboard:
+    def _write_once(
+        self, description: str, bgm_options: list[str] | None = None
+    ) -> Storyboard:
         kling = self._config["kling"]
         clip_duration = int(kling["clip_duration"])
         target = int(self._config["video"]["target_duration"])
@@ -186,16 +217,28 @@ class Director:
             total=num_shots * clip_duration,
         )
 
+        user_message = f"请为以下创意撰写分镜脚本:\n\n{description}"
+        schema = _STORYBOARD_SCHEMA
+        if bgm_options:
+            schema = json.loads(json.dumps(_STORYBOARD_SCHEMA))
+            schema["properties"]["bgm_file"] = {
+                "type": "string",
+                "description": "从候选列表中选出的最贴合影片情绪的背景音乐文件名(原样照抄)",
+            }
+            schema["required"].append("bgm_file")
+            user_message += (
+                "\n\n候选背景音乐文件列表(请根据影片情绪在 bgm_file 字段填入"
+                "最合适的一个文件名,原样照抄):\n"
+                + "\n".join(f"- {name}" for name in bgm_options)
+            )
+
         llm = self._config["llm"]
         body: dict = {
             "model": llm["model"],
             "max_tokens": int(llm["max_tokens"]),
             "messages": [
                 {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": f"请为以下创意撰写分镜脚本:\n\n{description}",
-                },
+                {"role": "user", "content": user_message},
             ],
             # 支持结构化输出的模型会严格遵守;不支持的模型由 _extract_json 兜底
             "response_format": {
@@ -203,7 +246,7 @@ class Director:
                 "json_schema": {
                     "name": "storyboard",
                     "strict": True,
-                    "schema": _STORYBOARD_SCHEMA,
+                    "schema": schema,
                 },
             },
         }
@@ -272,7 +315,11 @@ class Director:
             for i, raw in enumerate(raw_shots)
         ]
         return Storyboard(
-            title=str(data["title"]), logline=str(data["logline"]), shots=shots
+            title=str(data["title"]),
+            logline=str(data["logline"]),
+            reference_prompt=str(data.get("reference_prompt", "")).strip(),
+            bgm_file=str(data.get("bgm_file", "")).strip(),
+            shots=shots,
         )
 
 
