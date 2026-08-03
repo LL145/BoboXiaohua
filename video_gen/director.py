@@ -188,13 +188,16 @@ class Director:
         self._config = config
 
     def write_storyboard(
-        self, description: str, bgm_options: list[str] | None = None
+        self,
+        description: str,
+        bgm_options: list[str] | None = None,
+        aspect_ratio: str = "",
     ) -> Storyboard:
         """根据用户一句话描述生成分镜脚本(含瞬时错误重试)。"""
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                return self._write_once(description, bgm_options)
+                return self._write_once(description, bgm_options, aspect_ratio)
             except (requests.ConnectionError, requests.Timeout,
                     json.JSONDecodeError, KeyError, _RetryableHTTPError) as exc:
                 last_error = exc
@@ -203,8 +206,17 @@ class Director:
 
     # ---------------- OpenRouter 调用 ----------------
 
+    _ASPECT_NOTES = {
+        "9:16": "本片为竖屏 9:16(手机短视频),请按竖屏构图设计画面与镜头运动。",
+        "16:9": "本片为横屏 16:9,请按横屏电影感构图设计画面与镜头运动。",
+        "1:1": "本片为方形 1:1 画幅,请按居中构图设计画面。",
+    }
+
     def _write_once(
-        self, description: str, bgm_options: list[str] | None = None
+        self,
+        description: str,
+        bgm_options: list[str] | None = None,
+        aspect_ratio: str = "",
     ) -> Storyboard:
         kling = self._config["kling"]
         clip_duration = int(kling["clip_duration"])
@@ -218,6 +230,9 @@ class Director:
         )
 
         user_message = f"请为以下创意撰写分镜脚本:\n\n{description}"
+        note = self._ASPECT_NOTES.get(str(aspect_ratio).strip())
+        if note:
+            user_message += f"\n\n{note}"
         schema = _STORYBOARD_SCHEMA
         if bgm_options:
             schema = json.loads(json.dumps(_STORYBOARD_SCHEMA))

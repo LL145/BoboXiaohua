@@ -41,6 +41,17 @@ output/日期_标题/标题.mp4
 
 ## 安装
 
+### 方式一:免安装版(推荐)
+
+从 [Releases](../../releases) 下载 `AI短视频生成器_win64.zip`,解压后双击
+`AI短视频生成器.exe` 即可——**无需安装 Python 和 ffmpeg**(均已内置)。
+首次运行会在程序目录自动生成 `config.yaml`,点击「打开配置文件」填入两个 API KEY 即可使用。
+
+> 打包版由仓库的 GitHub Actions 自动构建(Actions → *Build Windows exe*),
+> 也可以在 Windows 上执行 `python build.py` 本地打包。
+
+### 方式二:源码运行
+
 1. 安装 [Python 3.10+](https://www.python.org/downloads/)(勾选 *Add python.exe to PATH*)
 2. 安装 [ffmpeg](https://www.gyan.dev/ffmpeg/builds/) 并加入 PATH(或在 `config.yaml` 里填绝对路径)
 3. 安装依赖:
@@ -65,12 +76,12 @@ OpenRouter 上的任意模型(如 `openai/gpt-5.2`、`google/gemini-3-pro`、`de
 
 ## 使用
 
-```bat
-python main.py
-```
+双击 `AI短视频生成器.exe`(或源码运行 `python main.py`)。
 
-在窗口里输入一句话描述,点击「🎬 生成视频」。全程约十几分钟(Kling 每个镜头需要数分钟),
+在窗口里输入一句话描述,选择**横屏 16:9**(B 站/YouTube)或**竖屏 9:16**
+(抖音/快手/视频号),点击「🎬 生成视频」。全程约十几分钟(Kling 每个镜头需要数分钟),
 进度条按镜头推进,日志实时显示,完成后点击「打开成片」。
+导演模型会按所选画幅设计构图,横竖屏的未完成任务互相独立、各自断点续传。
 
 也支持命令行模式:
 
@@ -94,7 +105,8 @@ output/20260803_153000_雨巷橘猫/
 
 ## 常见问题
 
-- **提示未找到 ffmpeg** — 确认已安装并加入 PATH,或在 `config.yaml` 的 `ffmpeg.path` 填写完整路径。
+- **提示未找到 ffmpeg** — 免安装版已内置 ffmpeg,不会出现此问题;源码运行时请确认
+  已安装并加入 PATH,或在 `config.yaml` 的 `ffmpeg.path` 填写完整路径。
 - **想换 Kling 版本** — 修改 `config.yaml` 中 `kling.text_endpoint` / `kling.reference_endpoint`,
   可选端点见 [fal.ai 模型页](https://fal.ai/models)。注意旧版 Kling(2.x)仅支持 5/10 秒镜头且无原生音效。
 - **想换编剧模型** — 修改 `config.yaml` 中 `llm.model` 为 OpenRouter 上的任意模型 ID;

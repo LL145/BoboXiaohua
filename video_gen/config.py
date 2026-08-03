@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,25 @@ def app_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent.parent
+
+
+def _bundle_dir() -> Path | None:
+    """PyInstaller 解包目录(打包时通过 --add-data/--add-binary 放入的资源)。"""
+    meipass = getattr(sys, "_MEIPASS", None)
+    return Path(meipass) if meipass else None
+
+
+def bundled_ffmpeg() -> str | None:
+    """查找随程序分发的 ffmpeg:打包资源目录或程序目录下的 ffmpeg/ 子目录。"""
+    exe = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+    roots = [_bundle_dir(), app_dir()]
+    for root in roots:
+        if root is None:
+            continue
+        candidate = root / "ffmpeg" / exe
+        if candidate.exists():
+            return str(candidate)
+    return None
 
 
 CONFIG_PATH = app_dir() / "config.yaml"
@@ -73,6 +93,16 @@ class Config:
         return (self._data.get("fal_api_key") or "").strip()
 
     @property
+    def ffmpeg_path(self) -> str:
+        """ffmpeg 可执行文件:用户显式配置优先,否则优先随程序分发的版本。"""
+        configured = str(self._data["ffmpeg"]["path"]).strip()
+        if configured in ("", "ffmpeg", "ffmpeg.exe"):
+            bundled = bundled_ffmpeg()
+            if bundled:
+                return bundled
+        return configured or "ffmpeg"
+
+    @property
     def output_dir(self) -> Path:
         path = Path(self._data["video"]["output_dir"])
         if not path.is_absolute():
@@ -96,9 +126,15 @@ class Config:
 
 def load_config() -> Config:
     if not CONFIG_PATH.exists():
-        raise FileNotFoundError(
-            f"未找到配置文件: {CONFIG_PATH}\n请在程序目录下创建 config.yaml 并填入 API KEY。"
-        )
+        # 打包版首次运行:从内置模板生成 config.yaml,用户只需填 KEY
+        bundle = _bundle_dir()
+        template = bundle / "config.yaml" if bundle else None
+        if template is not None and template.exists():
+            shutil.copyfile(template, CONFIG_PATH)
+        else:
+            raise FileNotFoundError(
+                f"未找到配置文件: {CONFIG_PATH}\n请在程序目录下创建 config.yaml 并填入 API KEY。"
+            )
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         user_data = yaml.safe_load(f) or {}
     return Config(_merge(_DEFAULTS, user_data))

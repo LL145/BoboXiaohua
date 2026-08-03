@@ -23,7 +23,7 @@ _CREATIONFLAGS = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDO
 
 class Assembler:
     def __init__(self, config: Config, log: LogFn):
-        self._ffmpeg = str(config["ffmpeg"]["path"])
+        self._ffmpeg = config.ffmpeg_path
         self._ffprobe = self._derive_ffprobe(self._ffmpeg)
         self._bgm_volume = float(config["video"]["bgm_volume"])
         self._transition = max(0.0, float(config["video"]["transition"]))

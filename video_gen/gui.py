@@ -53,6 +53,15 @@ class App:
         self.open_btn.pack(side="left", padx=(8, 0))
         ttk.Button(bar, text="打开配置文件", command=self._open_config).pack(side="left", padx=(8, 0))
 
+        self.aspect_var = tk.StringVar(value=self._default_aspect())
+        ttk.Radiobutton(
+            bar, text="📱 竖屏 9:16", value="9:16", variable=self.aspect_var
+        ).pack(side="right")
+        ttk.Radiobutton(
+            bar, text="🖥 横屏 16:9", value="16:9", variable=self.aspect_var
+        ).pack(side="right", padx=(0, 10))
+        ttk.Label(bar, text="画幅:").pack(side="right", padx=(0, 4))
+
         self.progress = ttk.Progressbar(self.root, mode="indeterminate")
         self.progress.pack(fill="x", padx=12)
 
@@ -69,6 +78,15 @@ class App:
     def _clear_placeholder(self, _event: object) -> None:
         if self.desc_text.get("1.0", "end-1c") == _PLACEHOLDER:
             self.desc_text.delete("1.0", "end")
+
+    @staticmethod
+    def _default_aspect() -> str:
+        """默认画幅取自 config.yaml,配置缺失或非横/竖屏时用横屏。"""
+        try:
+            aspect = str(load_config()["kling"]["aspect_ratio"])
+        except Exception:  # noqa: BLE001 - 首次启动可能还没有配置文件
+            aspect = ""
+        return aspect if aspect in ("16:9", "9:16") else "16:9"
 
     # ---------------- 事件 ----------------
 
@@ -87,6 +105,8 @@ class App:
         if problems:
             messagebox.showerror("配置错误", "\n".join(problems))
             return
+        # 界面上选择的画幅优先于 config.yaml
+        config["kling"]["aspect_ratio"] = self.aspect_var.get()
 
         self._final_path = None
         self.open_btn.config(state="disabled")
