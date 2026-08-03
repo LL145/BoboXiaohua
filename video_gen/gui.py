@@ -16,6 +16,18 @@ from .pipeline import Pipeline
 _PLACEHOLDER = "例如:一只橘猫在雨后的东京街头漫步,霓虹灯倒映在水洼里,电影感画面"
 
 
+def _open_path(path: Path) -> None:
+    """用系统默认程序打开文件(跨平台)。"""
+    if sys.platform == "win32":
+        import os
+
+        os.startfile(path)  # noqa: S606
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
+
+
 class App:
     def __init__(self) -> None:
         self.root = tk.Tk()
@@ -129,12 +141,7 @@ class App:
 
     def _open_result(self) -> None:
         if self._final_path and self._final_path.exists():
-            if sys.platform == "win32":
-                import os
-
-                os.startfile(self._final_path)  # noqa: S606
-            else:
-                subprocess.Popen(["xdg-open", str(self._final_path)])
+            _open_path(self._final_path)
 
     def _on_close(self) -> None:
         if self._worker and self._worker.is_alive():
@@ -148,12 +155,7 @@ class App:
         self.root.destroy()
 
     def _open_config(self) -> None:
-        if sys.platform == "win32":
-            import os
-
-            os.startfile(CONFIG_PATH)  # noqa: S606
-        else:
-            subprocess.Popen(["xdg-open", str(CONFIG_PATH)])
+        _open_path(CONFIG_PATH)
 
     # ---------------- 日志 ----------------
 

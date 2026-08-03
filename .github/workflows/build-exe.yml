@@ -1,8 +1,8 @@
-# 自动构建 Windows 免安装版(内置 Python 与 ffmpeg)。
+# 自动构建 Windows / Linux / macOS 免安装版(内置 Python 与 ffmpeg)。
 # 触发方式:
-#   - 手动:GitHub 仓库页 → Actions → Build Windows exe → Run workflow
-#   - 打 tag:git tag v1.0.0 && git push origin v1.0.0(会自动创建 Release 并附上 zip)
-name: Build Windows exe
+#   - 手动:GitHub 仓库页 → Actions → Build packages → Run workflow
+#   - 打 tag:git tag v1.1.0 && git push origin v1.1.0(自动创建 Release 并附上三个平台的压缩包)
+name: Build packages
 
 on:
   workflow_dispatch:
@@ -11,7 +11,17 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest # x64
+            tag: win64
+          - os: ubuntu-latest # x64
+            tag: linux64
+          - os: macos-latest # Apple 芯片(arm64)
+            tag: macos-arm64
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: write # 打 tag 时创建 Release 需要
     env:
@@ -24,7 +34,9 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt pyinstaller
+        run: |
+          pip install -r requirements.txt pyinstaller
+          python -c "import tkinter; print('tkinter OK, Tk', tkinter.TkVersion)"
 
       - name: Build
         run: python build.py
@@ -32,11 +44,15 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ai-video-generator-win64
-          path: dist/*.zip
+          name: ai-video-generator-${{ matrix.tag }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
 
       - name: Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.zip
+          files: |
+            dist/*.zip
+            dist/*.tar.gz

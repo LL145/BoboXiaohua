@@ -1,6 +1,6 @@
 # AI 短视频生成器(OpenRouter × Kling)
 
-在 Windows 上运行的桌面小工具:输入一句话描述,点击「生成」,自动产出一条约 **60 秒**的高质量短视频。
+跨平台桌面小工具(Windows / macOS / Linux):输入一句话描述,点击「生成」,自动产出一条约 **60 秒**的高质量短视频。
 
 ## 工作原理
 
@@ -43,20 +43,31 @@ output/日期_标题/标题.mp4
 
 ### 方式一:免安装版(推荐)
 
-从 [Releases](../../releases) 下载 `AI短视频生成器_win64.zip`,解压后双击
-`AI短视频生成器.exe` 即可——**无需安装 Python 和 ffmpeg**(均已内置)。
-首次运行会在程序目录自动生成 `config.yaml`,点击「打开配置文件」填入两个 API KEY 即可使用。
+从 [Releases](../../releases) 下载对应平台的压缩包——**无需安装 Python 和 ffmpeg**(均已内置):
 
-> 打包版由仓库的 GitHub Actions 自动构建(Actions → *Build Windows exe*),
-> 也可以在 Windows 上执行 `python build.py` 本地打包。
+| 平台 | 下载文件 | 解压后 |
+| --- | --- | --- |
+| Windows(64 位) | `AI-Video-Generator_win64.zip` | 双击 `AI短视频生成器.exe` |
+| macOS(Apple 芯片) | `AI-Video-Generator_macos-arm64.tar.gz` | 首次**右键 → 打开** `AI短视频生成器.app` |
+| Linux(x86-64) | `AI-Video-Generator_linux64.tar.gz` | 终端运行 `./AI短视频生成器` |
+
+首次运行会在程序旁自动生成 `config.yaml`(macOS 生成在 `.app` 旁边),
+点击「打开配置文件」填入两个 API KEY 即可使用;成片输出到同目录的 `output/` 文件夹。
+
+> macOS 版未做付费签名,首次启动请**右键(或按住 Control 点击)→ 打开**,
+> 才会出现「仍要打开」按钮;Intel 芯片的旧款 Mac 请用源码运行。
+> 打包版由仓库的 GitHub Actions 自动构建(Actions → *Build packages*),
+> 也可以在本机执行 `python build.py` 打包当前平台。
 
 ### 方式二:源码运行
 
-1. 安装 [Python 3.10+](https://www.python.org/downloads/)(勾选 *Add python.exe to PATH*)
-2. 安装 [ffmpeg](https://www.gyan.dev/ffmpeg/builds/) 并加入 PATH(或在 `config.yaml` 里填绝对路径)
+1. 安装 [Python 3.10+](https://www.python.org/downloads/)(Windows 勾选 *Add python.exe to PATH*)
+2. 安装 ffmpeg 并加入 PATH(或在 `config.yaml` 里填绝对路径):
+   Windows 用 [gyan.dev 构建](https://www.gyan.dev/ffmpeg/builds/),macOS 用 `brew install ffmpeg`,
+   Linux 用 `sudo apt install ffmpeg`(或对应发行版的包管理器)
 3. 安装依赖:
 
-```bat
+```bash
 pip install -r requirements.txt
 ```
 
@@ -76,7 +87,7 @@ OpenRouter 上的任意模型(如 `openai/gpt-5.2`、`google/gemini-3-pro`、`de
 
 ## 使用
 
-双击 `AI短视频生成器.exe`(或源码运行 `python main.py`)。
+打开免安装版程序(或源码运行 `python main.py`)。
 
 在窗口里输入一句话描述,选择**横屏 16:9**(B 站/YouTube)或**竖屏 9:16**
 (抖音/快手/视频号),点击「🎬 生成视频」。全程约十几分钟(Kling 每个镜头需要数分钟),
@@ -85,7 +96,7 @@ OpenRouter 上的任意模型(如 `openai/gpt-5.2`、`google/gemini-3-pro`、`de
 
 也支持命令行模式:
 
-```bat
+```bash
 python main.py "一只橘猫在雨后的东京街头漫步,霓虹灯倒映在水洼里,电影感画面"
 ```
 
@@ -107,6 +118,9 @@ output/20260803_153000_雨巷橘猫/
 
 - **提示未找到 ffmpeg** — 免安装版已内置 ffmpeg,不会出现此问题;源码运行时请确认
   已安装并加入 PATH,或在 `config.yaml` 的 `ffmpeg.path` 填写完整路径。
+- **macOS 提示"已损坏"或"无法验证开发者"** — 因为程序未做付费签名。首次启动请
+  右键(按住 Control 点击)→ 打开;若仍被拦截,在终端执行
+  `xattr -cr AI短视频生成器.app` 后再打开。
 - **想换 Kling 版本** — 修改 `config.yaml` 中 `kling.text_endpoint` / `kling.reference_endpoint`,
   可选端点见 [fal.ai 模型页](https://fal.ai/models)。注意旧版 Kling(2.x)仅支持 5/10 秒镜头且无原生音效。
 - **想换编剧模型** — 修改 `config.yaml` 中 `llm.model` 为 OpenRouter 上的任意模型 ID;
@@ -115,3 +129,16 @@ output/20260803_153000_雨巷橘猫/
   也可把端点换成 Kling 3 Standard(`v3/standard/...`,约 75 折)或旧版 2.x。
 - **费用参考**(以 fal.ai 实时定价为准)— 60 秒成片:Kling 3 Pro 含音效约 $10,
   关音效约 $6.7;参考图 $0.08;分镜脚本几美分到几十美分(视模型而定)。
+
+## 发布新版本(维护者)
+
+打一个以 **`v` 开头**的 tag,GitHub Actions 会自动构建三个平台的压缩包并附到同名 Release:
+
+```bash
+git tag v1.1.0
+git push origin v1.1.0
+```
+
+也可以直接在 GitHub 网页上 *Releases → Draft a new release* 创建新标签发布。
+注意标签**必须以 `v` 开头**(如 `v1.1.0`,而不是 `1.1.0`),否则不会触发自动构建;
+构建约需几分钟,完成后三个平台的压缩包会自动出现在该 Release 的 Assets 中。
