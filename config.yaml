@@ -1,6 +1,6 @@
 # ============================================================
 #  AI 短视频生成器 配置文件
-#  首次使用请填入下方的 API KEY
+#  首次使用只需填入下方两个 API KEY,其余保持默认即可
 # ============================================================
 
 # OpenRouter API Key (https://openrouter.ai/settings/keys 获取)
@@ -27,19 +27,28 @@ llm:
 
 # ---------------- Kling 视频生成(fal.ai) ----------------
 kling:
-  # fal.ai 上的 Kling 文生视频模型端点,可按需替换,例如:
-  #   fal-ai/kling-video/v2.5-turbo/pro/text-to-video
-  #   fal-ai/kling-video/v2.1/master/text-to-video
-  #   fal-ai/kling-video/v1.6/pro/text-to-video
-  endpoint: "fal-ai/kling-video/v2.5-turbo/pro/text-to-video"
-  # 每个镜头时长(秒),Kling 仅支持 5 或 10
+  # 文生视频端点:无固定主角的镜头使用
+  text_endpoint: "fal-ai/kling-video/v3/pro/text-to-video"
+  # 参考图生视频端点:有固定主角时使用,把主角参考图带入每个镜头,
+  # 保证全片角色外观一致(是否需要由导演模型自动判断,无需设置)
+  reference_endpoint: "fal-ai/kling-video/o3/pro/reference-to-video"
+  # 每个镜头时长(秒),3~15
   clip_duration: 10
   # 画幅比例: 16:9 / 9:16 / 1:1
   aspect_ratio: "16:9"
+  # Kling 3 原生音效(环境声)。关闭可节省约 1/3 视频费用
+  generate_audio: true
   # 生成失败时单个镜头的重试次数
   max_retries: 2
   # 同时生成的镜头数(并行提交,显著缩短总耗时)
   concurrency: 3
+  # 单个镜头的生成超时(秒),超时按失败重试
+  shot_timeout: 1500
+
+# ---------------- 主角参考图(fal.ai) ----------------
+image:
+  # 生成主角参考图的文生图模型
+  endpoint: "fal-ai/nano-banana-2"
 
 # ---------------- 成片 ----------------
 video:
@@ -47,12 +56,16 @@ video:
   target_duration: 60
   # 输出目录(相对程序目录)
   output_dir: "output"
+  # 镜头间交叉溶解转场时长(秒),0 为硬切
+  transition: 0.5
   # 背景音乐音量(0~1)。把 mp3 等音频文件放进程序目录的 music/
-  # 文件夹即可自动随机混入背景音乐;文件夹为空则输出纯净成片。
+  # 文件夹即可自动混入背景音乐(由导演模型按影片情绪挑选);
+  # 文件夹为空则不加背景音乐。
   bgm_volume: 0.22
 
 # ---------------- ffmpeg ----------------
 ffmpeg:
   # ffmpeg 可执行文件路径。已加入 PATH 时保持 "ffmpeg" 即可,
   # 否则填绝对路径,例如 C:\\tools\\ffmpeg\\bin\\ffmpeg.exe
+  # (拼接转场需要同目录下的 ffprobe,标准 ffmpeg 发行包均自带)
   path: "ffmpeg"
