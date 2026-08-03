@@ -29,6 +29,7 @@ class App:
 
         self._build_ui()
         self._poll_log_queue()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------------- UI ----------------
 
@@ -114,6 +115,17 @@ class App:
                 os.startfile(self._final_path)  # noqa: S606
             else:
                 subprocess.Popen(["xdg-open", str(self._final_path)])
+
+    def _on_close(self) -> None:
+        if self._worker and self._worker.is_alive():
+            if not messagebox.askokcancel(
+                "确认退出",
+                "视频仍在生成中,退出后进度会保留:\n"
+                "下次输入相同描述再点「生成」会从断点继续,已生成的镜头不会重复扣费。\n\n"
+                "确定退出吗?",
+            ):
+                return
+        self.root.destroy()
 
     def _open_config(self) -> None:
         if sys.platform == "win32":

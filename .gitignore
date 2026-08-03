@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
 output/
+music/*
+!music/说明.txt
 .venv/
 venv/

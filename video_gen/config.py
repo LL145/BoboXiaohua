@@ -27,8 +27,9 @@ _DEFAULTS: dict[str, Any] = {
         "clip_duration": 10,
         "aspect_ratio": "16:9",
         "max_retries": 2,
+        "concurrency": 3,
     },
-    "video": {"target_duration": 60, "output_dir": "output"},
+    "video": {"target_duration": 60, "output_dir": "output", "bgm_volume": 0.22},
     "ffmpeg": {"path": "ffmpeg"},
 }
 

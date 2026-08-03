@@ -14,6 +14,13 @@ from .director import Shot
 
 LogFn = Callable[[str], None]
 
+# 小于该体积的文件视为无效片段(错误页/截断下载)
+_MIN_CLIP_BYTES = 10 * 1024
+
+
+def clip_is_valid(path: Path) -> bool:
+    return path.exists() and path.stat().st_size >= _MIN_CLIP_BYTES
+
 
 class KlingGenerator:
     def __init__(self, config: Config, log: LogFn):
@@ -23,7 +30,11 @@ class KlingGenerator:
         os.environ["FAL_KEY"] = config.fal_api_key
 
     def generate_clip(self, shot: Shot, out_path: Path) -> Path:
-        """生成单个镜头,下载到 out_path,失败时按配置重试。"""
+        """生成单个镜头并下载到 out_path;已有有效片段时直接复用(断点续传)。"""
+        if clip_is_valid(out_path):
+            self._log(f"  镜头 {shot.index} 已存在,跳过生成 ↺")
+            return out_path
+
         import fal_client
 
         kling = self._config["kling"]
@@ -50,19 +61,24 @@ class KlingGenerator:
                 )
                 video_url = result["video"]["url"]
                 self._download(video_url, out_path)
+                if not clip_is_valid(out_path):
+                    raise RuntimeError("下载的片段无效(体积过小)")
                 return out_path
             except Exception as exc:  # noqa: BLE001 - 逐镜头重试,最终仍会抛出
                 last_error = exc
-                self._log(f"  镜头 {shot.index} 生成失败: {exc}")
+                self._log(f"  镜头 {shot.index} 第 {attempt} 次尝试失败: {exc}")
                 if attempt <= max_retries:
-                    time.sleep(3)
+                    time.sleep(min(3 * attempt, 15))
 
-        raise RuntimeError(f"镜头 {shot.index} 多次生成失败") from last_error
+        raise RuntimeError(f"镜头 {shot.index} 多次生成失败: {last_error}") from last_error
 
     def _download(self, url: str, out_path: Path) -> None:
-        self._log(f"  下载片段 → {out_path.name}")
+        """先写临时文件再原子改名,避免半截文件被断点续传误认为有效。"""
+        tmp_path = out_path.with_suffix(".part")
         with requests.get(url, stream=True, timeout=300) as resp:
             resp.raise_for_status()
-            with open(out_path, "wb") as f:
+            with open(tmp_path, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=1 << 20):
                     f.write(chunk)
+        tmp_path.replace(out_path)
+        self._log(f"  片段已下载 → {out_path.name}")

@@ -29,6 +29,8 @@ kling:
   aspect_ratio: "16:9"
   # 生成失败时单个镜头的重试次数
   max_retries: 2
+  # 同时生成的镜头数(并行提交,显著缩短总耗时)
+  concurrency: 3
 
 # ---------------- 成片 ----------------
 video:
@@ -36,6 +38,9 @@ video:
   target_duration: 60
   # 输出目录(相对程序目录)
   output_dir: "output"
+  # 背景音乐音量(0~1)。把 mp3 等音频文件放进程序目录的 music/
+  # 文件夹即可自动随机混入背景音乐;文件夹为空则输出纯净成片。
+  bgm_volume: 0.22
 
 # ---------------- ffmpeg ----------------
 ffmpeg:

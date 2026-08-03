@@ -1,4 +1,4 @@
-"""用 ffmpeg 将各镜头片段拼接为最终成片。"""
+"""用 ffmpeg 将各镜头片段拼接为最终成片,并自动混入背景音乐(如有)。"""
 
 from __future__ import annotations
 
@@ -19,10 +19,13 @@ _CREATIONFLAGS = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDO
 class Assembler:
     def __init__(self, config: Config, log: LogFn):
         self._ffmpeg = str(config["ffmpeg"]["path"])
+        self._bgm_volume = float(config["video"]["bgm_volume"])
         self._log = log
 
     def check_ffmpeg(self) -> bool:
         return shutil.which(self._ffmpeg) is not None or Path(self._ffmpeg).exists()
+
+    # ---------------- 拼接 ----------------
 
     def concat(self, clips: list[Path], out_path: Path) -> Path:
         """拼接片段。优先无损 copy,失败则回退到重编码。"""
@@ -52,6 +55,47 @@ class Assembler:
             list_file.unlink(missing_ok=True)
         return out_path
 
+    # ---------------- 背景音乐 ----------------
+
+    def add_bgm(self, video: Path, bgm: Path, duration: int, out_path: Path) -> Path:
+        """混入背景音乐:循环补齐时长、压低音量、结尾淡出。
+
+        优先与原片音轨混音;若片段本身无音轨(Kling 文生视频通常无声),
+        回退为仅背景音乐。任一步失败都不影响成片——直接沿用无音乐版本。
+        """
+        fade_start = max(0, duration - 2)
+        bgm_filter = (
+            f"[1:a]volume={self._bgm_volume},"
+            f"afade=t=in:d=1,afade=t=out:st={fade_start}:d=2[bg]"
+        )
+        common = [
+            "-i", str(video), "-stream_loop", "-1", "-i", str(bgm),
+        ]
+        tail = ["-map", "0:v", "-c:v", "copy", "-c:a", "aac",
+                "-t", str(duration), str(out_path)]
+
+        try:
+            self._log(f"混入背景音乐: {bgm.name}")
+            try:
+                # 与原片音轨混音
+                self._run(
+                    [*common,
+                     "-filter_complex", f"{bgm_filter};[0:a][bg]amix=inputs=2:duration=first[a]",
+                     "-map", "[a]", *tail]
+                )
+            except subprocess.CalledProcessError:
+                # 原片无音轨,仅用背景音乐
+                self._run(
+                    [*common, "-filter_complex", bgm_filter, "-map", "[bg]", *tail]
+                )
+            return out_path
+        except subprocess.CalledProcessError:
+            self._log("背景音乐混入失败,输出无音乐版本。")
+            shutil.copyfile(video, out_path)
+            return out_path
+
+    # ---------------- 内部 ----------------
+
     def _run(self, args: list[str]) -> None:
         cmd = [self._ffmpeg, "-y", "-hide_banner", "-loglevel", "error", *args]
         result = subprocess.run(
@@ -61,5 +105,4 @@ class Assembler:
             creationflags=_CREATIONFLAGS,
         )
         if result.returncode != 0:
-            self._log(f"ffmpeg 出错: {result.stderr.strip()[:500]}")
             raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
