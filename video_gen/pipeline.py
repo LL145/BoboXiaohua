@@ -59,7 +59,7 @@ class Pipeline:
                 "请安装 ffmpeg 并加入 PATH,或在 config.yaml 的 ffmpeg.path 中填写完整路径。"
             )
 
-        # 1. 分镜脚本:优先恢复未完成任务,否则请 Claude 新写
+        # 1. 分镜脚本:优先恢复未完成任务,否则请 LLM 新写
         run_dir, storyboard = self._resume_or_create(description)
         log(f"《{storyboard.title}》—— {storyboard.logline}")
         log(f"共 {len(storyboard.shots)} 个镜头,预计总时长约 {storyboard.total_duration} 秒:")
@@ -123,7 +123,7 @@ class Pipeline:
     # ---------------- 断点续传 ----------------
 
     def _resume_or_create(self, description: str) -> tuple[Path, Storyboard]:
-        """同一描述且未产出成片的任务目录 → 恢复;否则新建目录并请 Claude 写分镜。"""
+        """同一描述且未产出成片的任务目录 → 恢复;否则新建目录并请 LLM 写分镜。"""
         key = _description_key(description)
 
         for candidate in sorted(self._config.output_dir.glob(f"*_{key}*"), reverse=True):
@@ -143,7 +143,7 @@ class Pipeline:
             self._log(f"① 检测到未完成的任务,继续上次进度: {candidate.name}")
             return candidate, storyboard
 
-        self._log("① Claude 正在撰写分镜脚本 …")
+        self._log("① 导演模型正在撰写分镜脚本 …")
         storyboard = Director(self._config).write_storyboard(description)
 
         base = f"{time.strftime('%Y%m%d_%H%M%S')}_{_safe_name(storyboard.title)}_{key}"

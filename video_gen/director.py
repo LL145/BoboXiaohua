@@ -1,14 +1,22 @@
-"""Claude 担任编剧 + 导演:把一句话描述扩写成完整的分镜脚本。"""
+"""LLM 担任编剧 + 导演:把一句话描述扩写成完整的分镜脚本。
+
+通过 OpenRouter(OpenAI 兼容接口)调用,可在 config.yaml 中切换任意模型;
+默认使用 anthropic/claude-fable-5(reasoning effort: high)。
+"""
 
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import asdict, dataclass
 
-import anthropic
+import requests
 
 from .config import Config
+
+_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+_RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504, 524}
 
 
 @dataclass
@@ -119,25 +127,52 @@ of field, shot on 35mm film, cinematic color grading")。
 - negative_prompt 用英文,列出需规避项(如 blur, distortion, warping, text, \
 watermark, extra limbs, deformed hands, flickering)。
 - title 与 logline 用中文;title 简短(不超过 10 个字),将用作文件名。
+
+## 输出格式
+只输出一个 JSON 对象(不要 Markdown 代码块、不要任何解释文字),字段为:
+title(string)、logline(string)、style_anchor(string)、\
+shots(数组,每项含 title、prompt、negative_prompt)。
 """
+
+
+def _extract_json(text: str) -> dict:
+    """容错解析:兼容不支持结构化输出、输出裹在代码块/夹带说明文字的模型。"""
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # 去掉 ```json ... ``` 围栏
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    if fence:
+        try:
+            return json.loads(fence.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+    # 截取首个 { 到最后一个 } 之间的内容
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        return json.loads(text[start:end + 1])
+    raise json.JSONDecodeError("未找到 JSON 对象", text, 0)
 
 
 class Director:
     def __init__(self, config: Config):
         self._config = config
-        self._client = anthropic.Anthropic(api_key=config.anthropic_api_key)
 
     def write_storyboard(self, description: str) -> Storyboard:
         """根据用户一句话描述生成分镜脚本(含瞬时错误重试)。"""
         last_error: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 return self._write_once(description)
-            except (anthropic.APIConnectionError, json.JSONDecodeError, KeyError) as exc:
+            except (requests.ConnectionError, requests.Timeout,
+                    json.JSONDecodeError, KeyError, _RetryableHTTPError) as exc:
                 last_error = exc
-                if attempt == 0:
-                    time.sleep(2)
+                time.sleep(2 * (attempt + 1))
         raise RuntimeError(f"分镜脚本生成失败: {last_error}") from last_error
+
+    # ---------------- OpenRouter 调用 ----------------
 
     def _write_once(self, description: str) -> Storyboard:
         kling = self._config["kling"]
@@ -151,44 +186,102 @@ class Director:
             total=num_shots * clip_duration,
         )
 
-        response = self._client.messages.create(
-            model=self._config["claude"]["model"],
-            max_tokens=int(self._config["claude"]["max_tokens"]),
-            system=system,
-            output_config={
-                "format": {"type": "json_schema", "schema": _STORYBOARD_SCHEMA}
-            },
-            messages=[
+        llm = self._config["llm"]
+        body: dict = {
+            "model": llm["model"],
+            "max_tokens": int(llm["max_tokens"]),
+            "messages": [
+                {"role": "system", "content": system},
                 {
                     "role": "user",
                     "content": f"请为以下创意撰写分镜脚本:\n\n{description}",
-                }
+                },
             ],
+            # 支持结构化输出的模型会严格遵守;不支持的模型由 _extract_json 兜底
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "storyboard",
+                    "strict": True,
+                    "schema": _STORYBOARD_SCHEMA,
+                },
+            },
+        }
+        effort = str(llm.get("reasoning_effort") or "").strip()
+        if effort:
+            body["reasoning"] = {"effort": effort}
+
+        resp = requests.post(
+            _OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {self._config.openrouter_api_key}",
+                "Content-Type": "application/json",
+                # OpenRouter 推荐的应用标识(可选)
+                "X-Title": "AI Short Video Generator",
+            },
+            json=body,
+            timeout=(15, 900),  # 深度思考模型单次请求可能长达数分钟
         )
 
-        if response.stop_reason == "refusal":
-            detail = ""
-            if response.stop_details and response.stop_details.explanation:
-                detail = f"({response.stop_details.explanation})"
-            raise RuntimeError(f"Claude 拒绝了该创意,请调整描述后重试 {detail}")
-        if response.stop_reason == "max_tokens":
-            raise RuntimeError("Claude 输出被截断,请提高 claude.max_tokens 后重试")
+        if resp.status_code in _RETRYABLE_STATUS:
+            raise _RetryableHTTPError(f"HTTP {resp.status_code}: {_error_message(resp)}")
+        if resp.status_code == 401:
+            raise RuntimeError("OpenRouter API KEY 无效,请检查 config.yaml 中的 openrouter_api_key")
+        if resp.status_code == 402:
+            raise RuntimeError("OpenRouter 余额不足,请前往 openrouter.ai 充值")
+        if resp.status_code == 404:
+            raise RuntimeError(
+                f"模型不存在: {llm['model']},请检查 config.yaml 中的 llm.model"
+            )
+        if resp.status_code != 200:
+            raise RuntimeError(f"OpenRouter 请求失败 HTTP {resp.status_code}: {_error_message(resp)}")
 
-        text = next(b.text for b in response.content if b.type == "text")
-        data = json.loads(text)
+        data = resp.json()
+        if "error" in data:  # OpenRouter 可能以 200 返回上游错误
+            raise _RetryableHTTPError(str(data["error"].get("message", data["error"])))
 
+        choice = data["choices"][0]
+        finish = choice.get("finish_reason")
+        message = choice["message"]
+        if message.get("refusal"):
+            raise RuntimeError(f"模型拒绝了该创意,请调整描述后重试({message['refusal']})")
+        if finish == "length":
+            raise RuntimeError("模型输出被截断,请提高 config.yaml 中的 llm.max_tokens 后重试")
+        if finish == "content_filter":
+            raise RuntimeError("内容被安全策略拦截,请调整描述后重试")
+
+        content = message.get("content") or ""
+        parsed = _extract_json(content)
+        return self._build_storyboard(parsed, num_shots, clip_duration)
+
+    # ---------------- 结果组装 ----------------
+
+    @staticmethod
+    def _build_storyboard(data: dict, num_shots: int, clip_duration: int) -> Storyboard:
         raw_shots = data["shots"][:num_shots]
         if not raw_shots:
             raise KeyError("shots 为空")
-
         shots = [
             Shot(
                 index=i + 1,
-                title=raw["title"],
-                prompt=raw["prompt"],
-                negative_prompt=raw["negative_prompt"],
+                title=str(raw["title"]),
+                prompt=str(raw["prompt"]),
+                negative_prompt=str(raw.get("negative_prompt", "")),
                 duration=clip_duration,
             )
             for i, raw in enumerate(raw_shots)
         ]
-        return Storyboard(title=data["title"], logline=data["logline"], shots=shots)
+        return Storyboard(
+            title=str(data["title"]), logline=str(data["logline"]), shots=shots
+        )
+
+
+class _RetryableHTTPError(Exception):
+    pass
+
+
+def _error_message(resp: requests.Response) -> str:
+    try:
+        return str(resp.json().get("error", {}).get("message", resp.text[:300]))
+    except Exception:  # noqa: BLE001
+        return resp.text[:300]
