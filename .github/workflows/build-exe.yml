@@ -1,0 +1,40 @@
+# 自动构建 Windows 免安装版(内置 Python 与 ffmpeg)。
+# 触发方式:
+#   - 手动:GitHub 仓库页 → Actions → Build Windows exe → Run workflow
+#   - 打 tag:git tag v1.0.0 && git push origin v1.0.0(会自动创建 Release 并附上 zip)
+name: Build Windows exe
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write # 打 tag 时创建 Release 需要
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build
+        run: python build.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-video-generator-win64
+          path: dist/*.zip
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip

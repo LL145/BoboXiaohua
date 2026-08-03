@@ -66,7 +66,7 @@ class Pipeline:
         assembler = Assembler(config, log)
         if not assembler.check_ffmpeg():
             raise RuntimeError(
-                f"未找到 ffmpeg(配置路径: {config['ffmpeg']['path']})。"
+                f"未找到 ffmpeg(查找路径: {config.ffmpeg_path})。"
                 "请安装 ffmpeg 并加入 PATH,或在 config.yaml 的 ffmpeg.path 中填写完整路径。"
             )
         self._preflight()
@@ -203,6 +203,7 @@ class Pipeline:
     ) -> tuple[Path, Storyboard]:
         """同一描述且未产出成片的任务目录 → 恢复;否则新建目录并请 LLM 写分镜。"""
         key = _description_key(description)
+        aspect = str(self._config["kling"]["aspect_ratio"])
 
         for candidate in sorted(self._config.output_dir.glob(f"*_{key}*"), reverse=True):
             manifest_path = candidate / _MANIFEST_NAME
@@ -211,6 +212,9 @@ class Pipeline:
             try:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                 if manifest.get("description", "").strip() != description.strip():
+                    continue
+                # 画幅不同的旧任务不续传(片段横竖屏不能混拼)
+                if manifest.get("aspect_ratio", aspect) != aspect:
                     continue
                 storyboard = Storyboard.from_dict(manifest["storyboard"])
             except Exception:  # noqa: BLE001 - 损坏的 manifest 直接忽略
@@ -222,7 +226,9 @@ class Pipeline:
             return candidate, storyboard
 
         self._log("① 导演模型正在撰写分镜脚本 …")
-        storyboard = Director(self._config).write_storyboard(description, bgm_options)
+        storyboard = Director(self._config).write_storyboard(
+            description, bgm_options, aspect_ratio=aspect
+        )
 
         base = f"{time.strftime('%Y%m%d_%H%M%S')}_{_safe_name(storyboard.title)}_{key}"
         run_dir = self._config.output_dir / base
@@ -231,7 +237,11 @@ class Pipeline:
             run_dir = self._config.output_dir / f"{base}_{serial}"
             serial += 1
         run_dir.mkdir(parents=True)
-        manifest = {"description": description, "storyboard": storyboard.to_dict()}
+        manifest = {
+            "description": description,
+            "aspect_ratio": aspect,
+            "storyboard": storyboard.to_dict(),
+        }
         (run_dir / _MANIFEST_NAME).write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
         )

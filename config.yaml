@@ -34,7 +34,8 @@ kling:
   reference_endpoint: "fal-ai/kling-video/o3/pro/reference-to-video"
   # 每个镜头时长(秒),3~15
   clip_duration: 10
-  # 画幅比例: 16:9 / 9:16 / 1:1
+  # 默认画幅: 16:9(横屏)/ 9:16(竖屏)/ 1:1
+  # 界面上选择的横屏/竖屏优先于此处;此处仅作为界面默认值与命令行模式的画幅
   aspect_ratio: "16:9"
   # Kling 3 原生音效(环境声)。关闭可节省约 1/3 视频费用
   generate_audio: true
@@ -65,7 +66,8 @@ video:
 
 # ---------------- ffmpeg ----------------
 ffmpeg:
-  # ffmpeg 可执行文件路径。已加入 PATH 时保持 "ffmpeg" 即可,
+  # ffmpeg 可执行文件路径。打包版(exe)已内置 ffmpeg,无需设置;
+  # 源码运行时,已加入 PATH 保持 "ffmpeg" 即可,
   # 否则填绝对路径,例如 C:\\tools\\ffmpeg\\bin\\ffmpeg.exe
   # (拼接转场需要同目录下的 ffprobe,标准 ffmpeg 发行包均自带)
   path: "ffmpeg"

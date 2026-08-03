@@ -5,3 +5,9 @@ music/*
 !music/说明.txt
 .venv/
 venv/
+
+# 打包产物(build.py)
+build/
+dist/
+*.spec
+ffmpeg/
