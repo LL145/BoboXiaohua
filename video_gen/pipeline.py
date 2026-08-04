@@ -12,16 +12,21 @@
 - 旁白与字幕:导演判断影片需要解说时,用 Edge TTS 合成旁白并生成字幕;
   TTS 不可用、混音或字幕失败,都只是放弃对应环节,绝不影响画面成片;
 - 运行日志同步写入任务目录 log.txt,便于排查问题;
-- 背景音乐:程序目录 music/ 下有音频文件时,由导演模型按影片情绪挑选混入。
+- 背景音乐:程序目录 music/ 下有音频文件时,由导演模型按影片情绪挑选混入;
+- 费用预估:生成前按待生成镜头秒数估算 fal 费用并展示;
+- 可取消:界面「取消」按钮置位 cancel_event,各阶段与 Kling 轮询检查后
+  以 GenerationCancelled 停止,已完成产物保留、可断点续传。
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import random
 import re
 import shutil
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -35,7 +40,8 @@ from .config import Config, app_dir
 from .director import Director, Storyboard
 
 LogFn = Callable[[str], None]
-ProgressFn = Callable[[int, int], None]
+# 进度回调:(总进度百分比 0~100, 当前阶段文字)
+ProgressFn = Callable[[int, str], None]
 
 _MANIFEST_NAME = "manifest.json"
 _REFERENCE_NAME = "reference.png"
@@ -51,12 +57,27 @@ def _description_key(description: str) -> str:
     return hashlib.sha1(description.strip().encode("utf-8")).hexdigest()[:8]
 
 
+class GenerationCancelled(RuntimeError):
+    """用户主动取消本次生成;已完成的产物保留,可断点续传。"""
+
+
 class Pipeline:
-    def __init__(self, config: Config, log: LogFn, progress: ProgressFn | None = None):
+    def __init__(
+        self,
+        config: Config,
+        log: LogFn,
+        progress: ProgressFn | None = None,
+        cancel_event: threading.Event | None = None,
+    ):
         self._config = config
         self._ui_log = log
         self._progress = progress
+        self._cancel = cancel_event
         self._logfile: Path | None = None
+
+    def _check_cancel(self) -> None:
+        if self._cancel is not None and self._cancel.is_set():
+            raise GenerationCancelled("已取消生成")
 
     # ---------------- 主流程 ----------------
 
@@ -74,6 +95,7 @@ class Pipeline:
                 "请安装 ffmpeg 并加入 PATH,或在 config.yaml 的 ffmpeg.path 中填写完整路径。"
             )
         self._preflight()
+        self._report_progress(2, "撰写分镜脚本")
 
         # 1. 分镜脚本:优先恢复未完成任务,否则请 LLM 新写
         bgm_tracks = self._bgm_tracks()
@@ -98,11 +120,23 @@ class Pipeline:
             if not clip_is_valid(run_dir / f"shot_{s.index:02d}.mp4")
         ]
         done_before = len(storyboard.shots) - len(pending)
-        generator = KlingGenerator(config, log)
+
+        # 费用预估:只计待生成的镜头秒数,已复用的镜头不重复计费
+        price = float(config["kling"]["price_per_second"])
+        if pending and price > 0:
+            seconds = sum(s.duration for s in pending)
+            log(
+                f"  💰 预计本次视频生成费用约 {seconds} 秒 × ${price:g}/秒"
+                f" ≈ ${seconds * price:.2f}(分镜脚本与参考图另计少量费用)"
+            )
+
+        self._check_cancel()
+        generator = KlingGenerator(config, log, cancel_event=self._cancel)
 
         # 2. 主角参考图(导演判断有固定主角时才生成;失败自动降级纯文生)
         reference_url: str | None = None
         if storyboard.reference_prompt and pending:
+            self._report_progress(8, "生成主角参考图")
             reference_url = self._prepare_reference(generator, run_dir, storyboard)
 
         # 3. Kling 并行生成各镜头
@@ -111,7 +145,7 @@ class Pipeline:
             log(f"③ 已有 {done_before} 个镜头可复用,补齐剩余 {len(pending)} 个 …")
         else:
             log(f"③ Kling 并行生成 {len(pending)} 个镜头(并发 {concurrency},约需十几分钟)…")
-        self._report_progress(done_before, len(storyboard.shots))
+        self._shot_progress(done_before, len(storyboard.shots))
 
         if pending:
             errors: list[str] = []
@@ -132,13 +166,16 @@ class Pipeline:
                         future.result()
                         finished += 1
                         log(f"  镜头 {shot.index} 完成 ✓({finished}/{len(storyboard.shots)})")
-                        self._report_progress(finished, len(storyboard.shots))
+                        self._shot_progress(finished, len(storyboard.shots))
                     except FatalGenerationError as exc:
                         # KEY 无效等致命错误:取消尚未开始的镜头,立即终止
                         pool.shutdown(wait=False, cancel_futures=True)
+                        if self._cancel is not None and self._cancel.is_set():
+                            raise GenerationCancelled("已取消生成") from None
                         raise RuntimeError(str(exc)) from exc
                     except Exception as exc:  # noqa: BLE001
                         errors.append(str(exc))
+            self._check_cancel()
             if errors:
                 raise RuntimeError(
                     f"{len(errors)} 个镜头生成失败:{errors[0]}\n"
@@ -153,13 +190,16 @@ class Pipeline:
         step = 4
         if storyboard.has_narration and bool(narration_cfg["enabled"]):
             log("④ 合成旁白配音(Edge TTS)…")
+            self._report_progress(82, "合成旁白配音")
             narration_audio = tts.synthesize_all(
                 storyboard, run_dir, str(narration_cfg["voice"]), log
             )
             step = 5
 
         # 5. ffmpeg 拼接:转场 → 旁白 → 背景音乐 → 字幕,逐级可降级
+        self._check_cancel()
         log(f"{'④⑤⑥⑦⑧'[step - 4]} 正在拼接成片 …")
+        self._report_progress(86, "拼接成片")
         final_path = run_dir / f"{_safe_name(storyboard.title)}.mp4"
         stage_path = run_dir / "_stage_concat.mp4"
         _, offsets = assembler.concat(
@@ -170,12 +210,14 @@ class Pipeline:
 
         srt_path: Path | None = None
         if narration_audio:
+            self._report_progress(90, "混入旁白与生成字幕")
             current, srt_path = self._apply_narration(
                 assembler, storyboard, narration_audio, offsets, current, run_dir
             )
 
         bgm = self._pick_bgm(storyboard, bgm_tracks)
         if bgm is not None:
+            self._report_progress(93, "混入背景音乐")
             duration = assembler.probe_duration(current) or float(
                 storyboard.total_duration
             )
@@ -184,6 +226,7 @@ class Pipeline:
             current = bgm_path
 
         if srt_path is not None and bool(narration_cfg["subtitles"]):
+            self._report_progress(96, "烧录字幕")
             subtitled_path = run_dir / "_stage_subtitled.mp4"
             if assembler.embed_subtitles(current, srt_path, subtitled_path):
                 current = subtitled_path
@@ -192,6 +235,7 @@ class Pipeline:
         for leftover in run_dir.glob("_stage_*.mp4"):
             leftover.unlink(missing_ok=True)
 
+        self._report_progress(100, "完成")
         log(f"✅ 完成!成片已保存: {final_path}")
         return final_path
 
@@ -208,6 +252,7 @@ class Pipeline:
     ) -> tuple[Path, Path | None]:
         """把旁白混入成片并生成字幕文件;失败时沿用无旁白版本。"""
         total = assembler.probe_duration(current) or float(storyboard.total_duration)
+        voice = str(self._config["narration"]["voice"])
         segments: list[tuple[float, Path, float]] = []
         segment_shots = []
         for i, shot in enumerate(storyboard.shots):
@@ -217,6 +262,7 @@ class Pipeline:
             start = offsets[i]
             end = offsets[i + 1] if i + 1 < len(offsets) else total
             slot = max(1.0, end - start - 0.3)  # 留 0.3 秒呼吸,避免串到下一组
+            audio = self._fit_narration(assembler, shot, audio, slot, voice)
             segments.append((start, audio, slot))
             segment_shots.append(shot)
 
@@ -229,16 +275,53 @@ class Pipeline:
             return current, None
 
         entries: list[tuple[float, float, str]] = []
-        for (start, effective), shot in zip(timeline, segment_shots):
-            entries += tts.narration_srt_entries(
-                shot.narration.strip(), start, effective
-            )
+        for (start, effective, tempo), (_, audio, _), shot in zip(
+            timeline, segments, segment_shots
+        ):
+            entries += self._srt_entries(shot, audio, start, effective, tempo)
         srt_path = run_dir / f"{_safe_name(storyboard.title)}.srt"
         try:
             srt_path.write_text(tts.build_srt(entries), encoding="utf-8")
         except OSError:
             return narration_path, None
         return narration_path, srt_path
+
+    def _fit_narration(
+        self, assembler: Assembler, shot, audio: Path, slot: float, voice: str
+    ) -> Path:
+        """旁白明显超长时,用更快语速重新合成一版(原生变速,音质自然);
+        重合成失败则保留原音频,由混音阶段的 atempo 兜底加速。"""
+        duration = assembler.probe_duration(audio)
+        if duration is None or duration <= slot * 1.02:
+            return audio
+        rate = min(40, math.ceil((duration / slot - 1) * 100))
+        fast = audio.with_name(f"{audio.stem}_r{rate}.mp3")
+        if not tts.narration_is_valid(fast):
+            self._log(
+                f"  镜头组 {shot.index} 旁白超长({duration:.1f}s > {slot:.1f}s),"
+                f"以 +{rate}% 语速重新合成 …"
+            )
+            tts.synthesize(
+                shot.narration.strip(), voice, fast, self._log, shot.index, rate=rate
+            )
+        return fast if tts.narration_is_valid(fast) else audio
+
+    @staticmethod
+    def _srt_entries(
+        shot, audio: Path, start: float, effective: float, tempo: float
+    ) -> list[tuple[float, float, str]]:
+        """字幕条目:优先用合成时记录的逐句精确时间轴,缺失时按字数比例估算。"""
+        sentences = tts.load_timeline(audio)
+        if sentences:
+            entries: list[tuple[float, float, str]] = []
+            for s, e, text in sentences:
+                begin = s / tempo
+                if begin >= effective:
+                    break  # 被截断的尾句不再显示字幕
+                entries.append((start + begin, start + min(e / tempo, effective), text))
+            if entries:
+                return entries
+        return tts.narration_srt_entries(shot.narration.strip(), start, effective)
 
     # ---------------- 预检 ----------------
 
@@ -365,12 +448,17 @@ class Pipeline:
             except OSError:
                 pass
 
-    def _report_progress(self, done: int, total: int) -> None:
+    def _report_progress(self, percent: int, stage: str) -> None:
         if self._progress is not None:
             try:
-                self._progress(done, total)
+                self._progress(max(0, min(100, percent)), stage)
             except Exception:  # noqa: BLE001 - 进度回调不应影响主流程
                 pass
+
+    def _shot_progress(self, done: int, total: int) -> None:
+        """镜头生成占总进度的 10%~80%,按完成数线性推进。"""
+        percent = 10 + round(70 * done / max(1, total))
+        self._report_progress(percent, f"生成镜头 {done}/{total}")
 
     @staticmethod
     def _format_storyboard(description: str, storyboard: Storyboard) -> str:

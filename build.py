@@ -167,6 +167,9 @@ def main() -> None:
         # config.yaml 模板打进包里,首次运行自动生成到程序旁
         "--add-data", f"config.yaml{sep}.",
     ]
+    if (ROOT / "fonts").is_dir():
+        # 内置字幕字体(Noto Sans SC),避免系统缺中文字体导致字幕烧录失败
+        args += ["--add-data", f"fonts{sep}fonts"]
     if bundle_ffmpeg:
         args += [
             "--add-binary", f"{FFMPEG_DIR / ('ffmpeg' + suffix)}{sep}ffmpeg",

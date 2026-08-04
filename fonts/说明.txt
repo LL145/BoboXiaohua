@@ -1,0 +1,7 @@
+本目录存放随程序分发的字幕字体,用于把旁白字幕烧录进画面,
+避免系统缺少中文字体导致字幕显示异常。
+
+- NotoSansSC-Medium.ttf:思源黑体(Noto Sans SC)Medium 字重,
+  依据 SIL Open Font License 1.1 免费分发(见 OFL.txt)。
+
+删除本目录后程序仍可运行,字幕将改用系统字体(效果因系统而异)。

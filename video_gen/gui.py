@@ -10,8 +10,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
 
-from .config import CONFIG_PATH, load_config
-from .pipeline import Pipeline
+from .config import CONFIG_PATH, app_dir, load_config
+from .pipeline import GenerationCancelled, Pipeline
 
 _PLACEHOLDER = "例如:一只橘猫在雨后的东京街头漫步,霓虹灯倒映在水洼里,电影感画面"
 
@@ -32,12 +32,13 @@ class App:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title("AI 短视频生成器 — LLM × Kling")
-        self.root.geometry("760x560")
-        self.root.minsize(640, 480)
+        self.root.geometry("880x580")
+        self.root.minsize(760, 480)
 
         self._log_queue: queue.Queue[str] = queue.Queue()
         self._worker: threading.Thread | None = None
         self._final_path: Path | None = None
+        self._cancel_event: threading.Event | None = None
 
         self._build_ui()
         self._poll_log_queue()
@@ -61,11 +62,15 @@ class App:
         bar.pack(fill="x", **pad)
         self.generate_btn = ttk.Button(bar, text="🎬 生成视频", command=self._on_generate)
         self.generate_btn.pack(side="left")
+        self.cancel_btn = ttk.Button(bar, text="⏹ 取消", command=self._on_cancel, state="disabled")
+        self.cancel_btn.pack(side="left", padx=(8, 0))
         self.open_btn = ttk.Button(bar, text="打开成片", command=self._open_result, state="disabled")
         self.open_btn.pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text="打开输出文件夹", command=self._open_output_dir).pack(side="left", padx=(8, 0))
         ttk.Button(bar, text="打开配置文件", command=self._open_config).pack(side="left", padx=(8, 0))
 
-        self.aspect_var = tk.StringVar(value=self._default_aspect())
+        default_aspect, default_subtitles = self._config_defaults()
+        self.aspect_var = tk.StringVar(value=default_aspect)
         ttk.Radiobutton(
             bar, text="📱 竖屏 9:16", value="9:16", variable=self.aspect_var
         ).pack(side="right")
@@ -73,9 +78,17 @@ class App:
             bar, text="🖥 横屏 16:9", value="16:9", variable=self.aspect_var
         ).pack(side="right", padx=(0, 10))
         ttk.Label(bar, text="画幅:").pack(side="right", padx=(0, 4))
+        self.subtitle_var = tk.BooleanVar(value=default_subtitles)
+        ttk.Checkbutton(
+            bar, text="旁白字幕", variable=self.subtitle_var
+        ).pack(side="right", padx=(0, 16))
 
-        self.progress = ttk.Progressbar(self.root, mode="indeterminate")
-        self.progress.pack(fill="x", padx=12)
+        prog_frame = ttk.Frame(self.root)
+        prog_frame.pack(fill="x", padx=12)
+        self.step_var = tk.StringVar(value="")
+        ttk.Label(prog_frame, textvariable=self.step_var, anchor="w").pack(fill="x")
+        self.progress = ttk.Progressbar(prog_frame, mode="determinate", maximum=100)
+        self.progress.pack(fill="x", pady=(2, 0))
 
         log_frame = ttk.LabelFrame(self.root, text="进度日志")
         log_frame.pack(fill="both", expand=True, **pad)
@@ -92,13 +105,16 @@ class App:
             self.desc_text.delete("1.0", "end")
 
     @staticmethod
-    def _default_aspect() -> str:
-        """默认画幅取自 config.yaml,配置缺失或非横/竖屏时用横屏。"""
+    def _config_defaults() -> tuple[str, bool]:
+        """界面选项默认值取自 config.yaml:画幅(非横/竖屏时用横屏)与字幕开关。"""
+        aspect, subtitles = "", True
         try:
-            aspect = str(load_config()["kling"]["aspect_ratio"])
+            config = load_config()
+            aspect = str(config["kling"]["aspect_ratio"])
+            subtitles = bool(config["narration"]["subtitles"])
         except Exception:  # noqa: BLE001 - 首次启动可能还没有配置文件
-            aspect = ""
-        return aspect if aspect in ("16:9", "9:16") else "16:9"
+            pass
+        return (aspect if aspect in ("16:9", "9:16") else "16:9"), subtitles
 
     # ---------------- 事件 ----------------
 
@@ -117,27 +133,55 @@ class App:
         if problems:
             messagebox.showerror("配置错误", "\n".join(problems))
             return
-        # 界面上选择的画幅优先于 config.yaml
+        # 界面上选择的画幅与字幕开关优先于 config.yaml
         config["kling"]["aspect_ratio"] = self.aspect_var.get()
+        config["narration"]["subtitles"] = bool(self.subtitle_var.get())
 
         self._final_path = None
+        self._cancel_event = threading.Event()
         self.open_btn.config(state="disabled")
         self.generate_btn.config(state="disabled")
-        self.progress.start(12)
+        self.cancel_btn.config(state="normal")
+        self.progress["value"] = 0
+        self.step_var.set("准备开始 …")
         self.status_var.set("生成中…全程可能需要十几分钟,请勿关闭窗口。")
         self._clear_log()
 
+        cancel_event = self._cancel_event
+
         def work() -> None:
             try:
-                pipeline = Pipeline(config, self._log, progress=self._on_progress)
+                pipeline = Pipeline(
+                    config, self._log,
+                    progress=self._on_progress, cancel_event=cancel_event,
+                )
                 final_path = pipeline.run(description)
                 self._log_queue.put(f"__DONE__{final_path}")
+            except GenerationCancelled:
+                self._log("⏹ 已取消。已完成的镜头已保存,不会重复扣费。")
+                self._log_queue.put("__CANCEL__")
             except Exception as exc:  # noqa: BLE001 - 汇总展示给用户
                 self._log(f"❌ 出错: {exc}")
                 self._log_queue.put("__FAIL__")
 
         self._worker = threading.Thread(target=work, daemon=True)
         self._worker.start()
+
+    def _on_cancel(self) -> None:
+        if self._cancel_event is None or self._cancel_event.is_set():
+            return
+        self._cancel_event.set()
+        self.cancel_btn.config(state="disabled")
+        self.status_var.set("正在取消,等待当前步骤停止(进度已保留)…")
+        self._log("⏹ 正在取消 …")
+
+    def _open_output_dir(self) -> None:
+        try:
+            out_dir = load_config().output_dir
+        except Exception:  # noqa: BLE001 - 无配置时也能打开默认输出目录
+            out_dir = app_dir() / "output"
+            out_dir.mkdir(parents=True, exist_ok=True)
+        _open_path(out_dir)
 
     def _open_result(self) -> None:
         if self._final_path and self._final_path.exists():
@@ -162,9 +206,9 @@ class App:
     def _log(self, message: str) -> None:
         self._log_queue.put(message)
 
-    def _on_progress(self, done: int, total: int) -> None:
-        """镜头完成进度(由工作线程调用,经队列转到主线程)。"""
-        self._log_queue.put(f"__PROG__{done}/{total}")
+    def _on_progress(self, percent: int, stage: str) -> None:
+        """总进度与当前阶段(由工作线程调用,经队列转到主线程)。"""
+        self._log_queue.put(f"__PROG__{percent}|{stage}")
 
     def _clear_log(self) -> None:
         self.log_box.config(state="normal")
@@ -177,15 +221,16 @@ class App:
                 message = self._log_queue.get_nowait()
                 if message.startswith("__DONE__"):
                     self._final_path = Path(message[len("__DONE__"):])
-                    self._finish("完成!点击「打开成片」查看视频。")
+                    self._finish("完成!点击「打开成片」查看视频。", step="✅ 全部完成")
                     self.open_btn.config(state="normal")
                 elif message == "__FAIL__":
-                    self._finish("生成失败,详见日志。")
+                    self._finish("生成失败,详见日志。", step="❌ 已中止")
+                elif message == "__CANCEL__":
+                    self._finish("已取消。再次生成相同描述可从断点继续。", step="⏹ 已取消")
                 elif message.startswith("__PROG__"):
-                    done, total = message[len("__PROG__"):].split("/")
-                    self.progress.stop()
-                    self.progress.config(mode="determinate", maximum=int(total))
-                    self.progress["value"] = int(done)
+                    percent, stage = message[len("__PROG__"):].split("|", 1)
+                    self.progress["value"] = int(percent)
+                    self.step_var.set(f"当前步骤:{stage}({percent}%)")
                 else:
                     self.log_box.config(state="normal")
                     self.log_box.insert("end", message + "\n")
@@ -195,12 +240,13 @@ class App:
             pass
         self.root.after(150, self._poll_log_queue)
 
-    def _finish(self, status: str) -> None:
-        self.progress.stop()
-        self.progress.config(mode="indeterminate")
-        self.progress["value"] = 0
+    def _finish(self, status: str, step: str = "") -> None:
         self.generate_btn.config(state="normal")
+        self.cancel_btn.config(state="disabled")
+        if step:
+            self.step_var.set(step)
         self.status_var.set(status)
+        self.root.bell()  # 全程耗时较长,提示音告知用户已结束
 
     def run(self) -> None:
         self.root.mainloop()

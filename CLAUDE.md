@@ -44,13 +44,16 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
    去掉占位符,兼容旧 manifest 的 `@Image1`/`image_urls`)。`FatalGenerationError`
    (KEY 无效/余额不足/端点不存在)立即终止全部镜头组,其余错误逐组重试。
 3. **tts.py** — Edge TTS(免费)合成导演写的中文旁白,逐组落盘
-   `narration_XX.mp3`(断点续传复用);并提供 SRT 字幕生成(旁白按句读
-   与字数比例分配时间轴)。edge-tts 缺失/网络失败只丢旁白,不影响成片。
+   `narration_XX.mp3`(断点续传复用),同步记录逐句精确时间轴
+   `narration_XX.timeline.json`(SentenceBoundary 事件)供字幕对齐,
+   旧版 edge-tts 只有词边界时按句子字数归组推算;SRT 生成优先用该时间轴,
+   缺失时回退按字数比例估算。edge-tts 缺失/网络失败只丢旁白,不影响成片。
 4. **assembler.py** — ffmpeg 拼接:优先 xfade 交叉溶解 + 首尾淡入淡出(需重编码),
    失败回退 concat 无损拼接;`concat()` 返回各镜头组在成片时间轴上的偏移,供旁白
-   与字幕定位。旁白按偏移 adelay+amix 混入(超长自动 atempo 加速≤1.4 并截断);
-   字幕优先烧录(libass),失败退 mp4 软字幕;`music/` 目录有音频时由导演挑选
-   一首混入(bgm)。每级失败都沿用上一级产物。
+   与字幕定位。旁白超长时先用 edge-tts 语速参数(+N%,≤40)重合成(音质自然),
+   仍超长才 atempo 加速≤1.4 并截断;字幕优先烧录(libass,使用随程序分发的
+   `fonts/` 内 Noto Sans SC 字体,缺失时回退平台系统字体),失败退 mp4 软字幕;
+   `music/` 目录有音频时由导演挑选一首混入(bgm)。每级失败都沿用上一级产物。
 5. **config.py** — 读取程序目录 `config.yaml`,与 `_DEFAULTS` 深合并;`app_dir()` 兼容
    PyInstaller 冻结与 macOS .app 布局。**新增配置项必须同时更新 `_DEFAULTS`、
    `config.yaml` 的中文注释,必要时补 `validate()`。**

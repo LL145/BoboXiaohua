@@ -41,6 +41,19 @@ def bundled_ffmpeg() -> str | None:
     return None
 
 
+def bundled_font_dir() -> Path | None:
+    """查找随程序分发的字幕字体目录(fonts/,内含 Noto Sans SC)。"""
+    for root in (_bundle_dir(), app_dir()):
+        if root is None:
+            continue
+        candidate = root / "fonts"
+        if candidate.is_dir() and any(
+            p.suffix.lower() in (".ttf", ".otf") for p in candidate.iterdir()
+        ):
+            return candidate
+    return None
+
+
 CONFIG_PATH = app_dir() / "config.yaml"
 
 _DEFAULTS: dict[str, Any] = {
@@ -60,6 +73,7 @@ _DEFAULTS: dict[str, Any] = {
         "max_retries": 2,
         "concurrency": 3,
         "shot_timeout": 1500,
+        "price_per_second": 0.168,
     },
     "image": {"endpoint": "fal-ai/nano-banana-2"},
     "narration": {
@@ -134,6 +148,8 @@ class Config:
             problems.append("video.transition 不能为负数")
         if not 0 <= float(self._data["narration"]["volume"]) <= 2:
             problems.append("narration.volume 需在 0~2 之间")
+        if float(self._data["kling"]["price_per_second"]) < 0:
+            problems.append("kling.price_per_second 不能为负数(设 0 可关闭费用预估)")
         return problems
 
 
