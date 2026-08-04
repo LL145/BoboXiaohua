@@ -34,15 +34,22 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
    `Storyboard`(含镜头组 `Shot` 列表,每组内含 1~6 个分镜 `Cut`)。组内分镜由 Kling
    一次连续生成(multi_prompt,组总长 3~15 秒、单分镜 1~15 秒),组间才用转场;
    代码约束总时长在 `video.target_duration` ±15% 内并用 `_clamp_duration`/`_build_cuts`
-   钳制;`kling.clip_duration` 仅是模型未给时长时的回退值。导演同时决定声音形态:
+   钳制;`kling.clip_duration` 仅是模型未给时长时的回退值。单条分镜 prompt 要求模型
+   控制在 450 字符内(Kling multi_prompt 有 512 字符硬上限)。用户可上传主角图片:
+   随创意以多模态消息发给导演模型照图撰写 @Element1 外观描述,模型不支持图片输入时
+   自动去图重试(文字说明仍告知存在用户参考图)。导演同时决定声音形态:
    解说型逐组写中文旁白(`narration` 字段),沉浸型全部置空;角色台词直接写进分镜
    prompt(中文引号台词),由 Kling 原生配音。请求带 `response_format: json_schema`,
    不支持结构化输出的模型由 `_extract_json` 容错兜底。
-2. **kling.py** — `KlingGenerator` 调 fal.ai 逐镜头组生成视频。有固定主角时先文生图出
-   参考图,作为 `elements` 角色元素(prompt 中 `@Element1`)送入 reference-to-video
+2. **kling.py** — `KlingGenerator` 调 fal.ai 逐镜头组生成视频。参考图优先用用户上传的
+   主角图片(pipeline 复制进任务目录并上传),否则有固定主角时先文生图,作为
+   `elements` 角色元素(prompt 中 `@Element1`)送入 reference-to-video
    锁定角色外观;参考图任何一步失败自动降级纯文生视频(`strip_reference_tokens`
-   去掉占位符,兼容旧 manifest 的 `@Image1`/`image_urls`)。`FatalGenerationError`
-   (KEY 无效/余额不足/端点不存在)立即终止全部镜头组,其余错误逐组重试。
+   去掉占位符,兼容旧 manifest 的 `@Image1`/`image_urls`)。提交前 `fit_prompt`
+   按分句边界把提示词钳制到端点硬上限内(multi_prompt 单条 512 字符,单
+   prompt/negative_prompt 2500)。`FatalGenerationError`(KEY 无效/余额不足/端点
+   不存在)立即终止全部镜头组;422 参数校验错误是确定性的,跳过重试直接降级/报错;
+   其余错误逐组重试。
 3. **tts.py** — Edge TTS(免费)合成导演写的中文旁白,逐组落盘
    `narration_XX.mp3`(断点续传复用),同步记录逐句精确时间轴
    `narration_XX.timeline.json`(SentenceBoundary 事件)供字幕对齐,

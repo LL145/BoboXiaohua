@@ -8,7 +8,7 @@ import sys
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from .config import CONFIG_PATH, app_dir, load_config
 from .pipeline import GenerationCancelled, Pipeline
@@ -41,6 +41,7 @@ class App:
         self._worker: threading.Thread | None = None
         self._final_path: Path | None = None
         self._cancel_event: threading.Event | None = None
+        self._ref_image: Path | None = None  # 用户上传的主角图片(可选)
 
         self._build_ui()
         self._poll_log_queue()
@@ -59,6 +60,21 @@ class App:
         self.desc_text.pack(fill="x", pady=(4, 0))
         self.desc_text.insert("1.0", _PLACEHOLDER)
         self.desc_text.bind("<FocusIn>", self._clear_placeholder)
+
+        # 可选:上传主角图片,作为参考图锁定全片主角外观
+        ref_bar = ttk.Frame(top)
+        ref_bar.pack(fill="x", pady=(4, 0))
+        ttk.Button(
+            ref_bar, text="🖼 上传主角图片(可选)", command=self._pick_reference
+        ).pack(side="left")
+        self.ref_clear_btn = ttk.Button(
+            ref_bar, text="✕ 清除", command=self._clear_reference, state="disabled"
+        )
+        self.ref_clear_btn.pack(side="left", padx=(6, 0))
+        self.ref_var = tk.StringVar(value="未选择(有固定主角时将由 AI 自动生成形象)")
+        ttk.Label(ref_bar, textvariable=self.ref_var, foreground="gray").pack(
+            side="left", padx=(8, 0)
+        )
 
         bar = ttk.Frame(self.root)
         bar.pack(fill="x", **pad)
@@ -106,6 +122,25 @@ class App:
         if self.desc_text.get("1.0", "end-1c") == _PLACEHOLDER:
             self.desc_text.delete("1.0", "end")
 
+    def _pick_reference(self) -> None:
+        path = filedialog.askopenfilename(
+            title="选择主角图片",
+            filetypes=[
+                ("图片文件", "*.png *.jpg *.jpeg *.webp *.bmp"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        self._ref_image = Path(path)
+        self.ref_var.set(f"主角图片:{self._ref_image.name}")
+        self.ref_clear_btn.config(state="normal")
+
+    def _clear_reference(self) -> None:
+        self._ref_image = None
+        self.ref_var.set("未选择(有固定主角时将由 AI 自动生成形象)")
+        self.ref_clear_btn.config(state="disabled")
+
     @staticmethod
     def _config_defaults() -> tuple[str, bool]:
         """界面选项默认值取自 config.yaml:画幅(非横/竖屏时用横屏)与字幕开关。"""
@@ -124,6 +159,12 @@ class App:
         description = self.desc_text.get("1.0", "end-1c").strip()
         if not description or description == _PLACEHOLDER:
             messagebox.showwarning("提示", "请先输入一句话描述。")
+            return
+        ref_image = self._ref_image
+        if ref_image is not None and not ref_image.is_file():
+            messagebox.showwarning(
+                "提示", f"主角图片不存在:{ref_image}\n请重新选择或清除。"
+            )
             return
 
         try:
@@ -157,7 +198,7 @@ class App:
                     config, self._log,
                     progress=self._on_progress, cancel_event=cancel_event,
                 )
-                final_path = pipeline.run(description)
+                final_path = pipeline.run(description, reference_image=ref_image)
                 self._log_queue.put(("done", final_path))
             except GenerationCancelled:
                 self._log("⏹ 已取消。已完成的镜头已保存,不会重复扣费。")

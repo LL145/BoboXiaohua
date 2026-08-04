@@ -5,8 +5,9 @@
 - 生成前预检:先校验 OpenRouter KEY、fal KEY 与磁盘空间,配错即刻提示,不浪费费用;
 - 断点续传:同一描述的未完成任务会复用已有分镜脚本、参考图、旁白音频和
   已生成片段,失败后再次点击「生成」只补齐缺失部分,不重复扣费;
-- 主角参考图:导演模型判断有固定主角时自动生成参考图并作为角色元素
-  (@Element1)送入每个镜头组;参考图任何一步失败都自动降级为纯文生视频;
+- 主角参考图:用户可上传主角图片(随创意发给导演模型照图写外观描述),
+  未上传时导演模型判断有固定主角则自动文生图;参考图作为角色元素
+  (@Element1)送入每个镜头组,任何一步失败都自动降级为纯文生视频;
 - 并行生成:多个镜头组同时提交 Kling,总耗时约等于单个镜头组;
 - 单镜头组独立重试 + 超时看门狗,KEY 无效等致命错误立即终止,不空耗重试;
 - 旁白与字幕:导演判断影片需要解说时,用 Edge TTS 合成旁白并生成字幕;
@@ -82,8 +83,14 @@ class Pipeline:
 
     # ---------------- 主流程 ----------------
 
-    def run(self, description: str) -> Path:
-        """执行完整流程,返回成片路径。"""
+    def run(self, description: str, reference_image: Path | None = None) -> Path:
+        """执行完整流程,返回成片路径。
+
+        reference_image 为用户上传的主角图片(可选):作为角色元素锁定主角外观,
+        并随创意发给导演模型照图撰写外观描述;不提供时由导演判断是否自动生成。
+        """
+        if reference_image is not None:
+            reference_image = Path(reference_image)
         from .kling import FatalGenerationError, KlingGenerator, clip_is_valid
 
         config = self._config
@@ -101,7 +108,7 @@ class Pipeline:
         # 1. 分镜脚本:优先恢复未完成任务,否则请 LLM 新写
         bgm_tracks = self._bgm_tracks()
         run_dir, storyboard = self._resume_or_create(
-            description, [t.name for t in bgm_tracks]
+            description, [t.name for t in bgm_tracks], reference_image
         )
         self._logfile = run_dir / "log.txt"
         log(f"《{storyboard.title}》—— {storyboard.logline}")
@@ -134,11 +141,14 @@ class Pipeline:
         self._check_cancel()
         generator = KlingGenerator(config, log, cancel_event=self._cancel)
 
-        # 2. 主角参考图(导演判断有固定主角时才生成;失败自动降级纯文生)
+        # 2. 主角参考图(用户上传优先;否则导演判断有固定主角时自动生成;
+        # 失败自动降级纯文生)
         reference_url: str | None = None
-        if storyboard.reference_prompt and pending:
-            self._report_progress(8, "生成主角参考图")
-            reference_url = self._prepare_reference(generator, run_dir, storyboard)
+        if pending and (reference_image or storyboard.reference_prompt):
+            self._report_progress(8, "准备主角参考图")
+            reference_url = self._prepare_reference(
+                generator, run_dir, storyboard, reference_image
+            )
 
         # 3. Kling 并行生成各镜头
         concurrency = max(1, int(config["kling"]["concurrency"]))
@@ -372,26 +382,61 @@ class Pipeline:
 
     # ---------------- 主角参考图 ----------------
 
-    def _prepare_reference(self, generator, run_dir: Path, storyboard: Storyboard):
-        """生成或复用主角参考图,返回其 URL;失败返回 None(降级纯文生)。"""
+    def _prepare_reference(
+        self,
+        generator,
+        run_dir: Path,
+        storyboard: Storyboard,
+        user_image: Path | None = None,
+    ):
+        """准备主角参考图并返回其 URL;失败返回 None(降级纯文生)。
+
+        优先级:用户上传的图片 → 任务目录中已有的参考图(断点续传)→
+        按导演的 reference_prompt 文生图。
+        """
         from .kling import image_is_valid
 
-        ref_path = run_dir / _REFERENCE_NAME
-        if image_is_valid(ref_path):
-            self._log("② 复用已有主角参考图,重新上传 …")
-            url = generator.upload_image(ref_path)
+        if user_image is not None and image_is_valid(user_image):
+            # 复制进任务目录(保留原扩展名,保证上传时内容类型正确),断点续传可复用
+            local = run_dir / f"reference{user_image.suffix.lower()}"
+            try:
+                if user_image.resolve() != local.resolve():
+                    shutil.copyfile(user_image, local)
+            except OSError as exc:
+                self._log(f"  ⚠ 复制主角图片失败: {exc}")
+                local = user_image
+            self._log("② 使用用户上传的主角图片作为参考图,上传中 …")
+            url = generator.upload_image(local)
             if url:
                 return url
-        self._log("② 正在生成主角参考图(锁定全片角色外观)…")
-        url = generator.generate_reference(storyboard.reference_prompt, ref_path)
-        if url is None:
-            self._log("  参考图不可用,本次退回纯文字模式(角色一致性略降,不影响出片)。")
-        return url
+        elif user_image is not None:
+            self._log("  ⚠ 上传的主角图片无效(文件缺失或过小),忽略。")
+
+        existing = next(
+            (p for p in sorted(run_dir.glob("reference.*")) if image_is_valid(p)), None
+        )
+        if existing is not None:
+            self._log("② 复用已有主角参考图,重新上传 …")
+            url = generator.upload_image(existing)
+            if url:
+                return url
+        if storyboard.reference_prompt:
+            self._log("② 正在生成主角参考图(锁定全片角色外观)…")
+            url = generator.generate_reference(
+                storyboard.reference_prompt, run_dir / _REFERENCE_NAME
+            )
+            if url is not None:
+                return url
+        self._log("  参考图不可用,本次退回纯文字模式(角色一致性略降,不影响出片)。")
+        return None
 
     # ---------------- 断点续传 ----------------
 
     def _resume_or_create(
-        self, description: str, bgm_options: list[str]
+        self,
+        description: str,
+        bgm_options: list[str],
+        reference_image: Path | None = None,
     ) -> tuple[Path, Storyboard]:
         """同一描述且未产出成片的任务目录 → 恢复;否则新建目录并请 LLM 写分镜。"""
         key = _description_key(description)
@@ -419,7 +464,8 @@ class Pipeline:
 
         self._log("① 导演模型正在撰写分镜脚本 …")
         storyboard = Director(self._config).write_storyboard(
-            description, bgm_options, aspect_ratio=aspect
+            description, bgm_options, aspect_ratio=aspect,
+            reference_image=reference_image,
         )
 
         base = f"{time.strftime('%Y%m%d_%H%M%S')}_{_safe_name(storyboard.title)}_{key}"
