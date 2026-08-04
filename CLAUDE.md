@@ -49,7 +49,9 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
    按分句边界把提示词钳制到端点硬上限内(multi_prompt 单条 512 字符,单
    prompt/negative_prompt 2500)。`FatalGenerationError`(KEY 无效/余额不足/端点
    不存在)立即终止全部镜头组;422 参数校验错误是确定性的,跳过重试直接降级/报错;
-   其余错误逐组重试。
+   其余错误逐组重试。画幅上 Kling 端点原生仅支持 16:9/9:16/1:1;3:4、4:3 经
+   `generation_aspect` 映射为 9:16/16:9 生成,拼接后由 `assembler.crop_to_aspect`
+   居中裁剪出目标画幅(在字幕烧录之前;导演 prompt 会提示把主体放画面中部)。
 3. **tts.py** — Edge TTS(免费)合成导演写的中文旁白,逐组落盘
    `narration_XX.mp3`(断点续传复用),同步记录逐句精确时间轴
    `narration_XX.timeline.json`(SentenceBoundary 事件)供字幕对齐,
@@ -69,8 +71,8 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
 ## 关键约定
 
 - **断点续传**:任务目录(`output/日期_标题_<描述哈希>/`)落盘 `manifest.json`
-  (描述、画幅、storyboard)与各 `shot_XX.mp4`。同一描述再次生成时复用已有脚本与片段,
-  只补缺失镜头——所以 `Shot`/`Storyboard` 字段变更要保持 `from_dict` 对旧 manifest 兼容
+  (描述、画幅、目标时长、storyboard)与各 `shot_XX.mp4`。同一描述再次生成时复用
+  已有脚本与片段,只补缺失镜头;画幅或目标时长不同的旧任务不续传——所以 `Shot`/`Storyboard` 字段变更要保持 `from_dict` 对旧 manifest 兼容
   (用 `.get()` + 默认值)。
 - **提示词一致性**:分镜脚本要求每个分镜 prompt 逐字重复 style_anchor 与角色外观描述,
   禁止跨组/跨分镜指代(镜头组之间相互独立生成);有主角时 prompt 用

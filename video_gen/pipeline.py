@@ -220,6 +220,18 @@ class Pipeline:
         )
         current = stage_path
 
+        # 3:4 / 4:3 等 Kling 不原生支持的画幅:片段按相邻原生画幅生成,
+        # 在此居中裁剪出目标画幅(须在字幕烧录前,失败沿用生成画幅)
+        from .kling import generation_aspect
+
+        aspect = str(config["kling"]["aspect_ratio"])
+        if generation_aspect(aspect) != aspect:
+            self._check_cancel()
+            self._report_progress(88, "裁剪画幅")
+            crop_path = run_dir / "_stage_crop.mp4"
+            if assembler.crop_to_aspect(current, aspect, crop_path):
+                current = crop_path
+
         srt_path: Path | None = None
         if narration_audio:
             self._check_cancel()
@@ -441,6 +453,7 @@ class Pipeline:
         """同一描述且未产出成片的任务目录 → 恢复;否则新建目录并请 LLM 写分镜。"""
         key = _description_key(description)
         aspect = str(self._config["kling"]["aspect_ratio"])
+        target = int(self._config["video"]["target_duration"])
 
         for candidate in sorted(self._config.output_dir.glob(f"*_{key}*"), reverse=True):
             manifest_path = candidate / _MANIFEST_NAME
@@ -452,6 +465,9 @@ class Pipeline:
                     continue
                 # 画幅不同的旧任务不续传(片段横竖屏不能混拼)
                 if manifest.get("aspect_ratio", aspect) != aspect:
+                    continue
+                # 目标时长不同的旧任务不续传(分镜脚本按旧时长设计)
+                if int(manifest.get("target_duration", target)) != target:
                     continue
                 storyboard = Storyboard.from_dict(manifest["storyboard"])
             except Exception:  # noqa: BLE001 - 损坏的 manifest 直接忽略
@@ -478,6 +494,7 @@ class Pipeline:
         manifest = {
             "description": description,
             "aspect_ratio": aspect,
+            "target_duration": target,
             "storyboard": storyboard.to_dict(),
         }
         (run_dir / _MANIFEST_NAME).write_text(

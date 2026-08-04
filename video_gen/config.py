@@ -144,6 +144,12 @@ class Config:
             problems.append("config.yaml 中缺少 fal_api_key")
         if not 3 <= int(self._data["kling"]["clip_duration"]) <= 15:
             problems.append("kling.clip_duration 需在 3~15 秒之间")
+        if str(self._data["kling"]["aspect_ratio"]) not in (
+            "16:9", "9:16", "1:1", "3:4", "4:3"
+        ):
+            problems.append("kling.aspect_ratio 需为 16:9 / 9:16 / 1:1 / 3:4 / 4:3 之一")
+        if not 10 <= int(self._data["video"]["target_duration"]) <= 600:
+            problems.append("video.target_duration 需在 10~600 秒之间")
         if float(self._data["video"]["transition"]) < 0:
             problems.append("video.transition 不能为负数")
         if not 0 <= float(self._data["narration"]["volume"]) <= 2:

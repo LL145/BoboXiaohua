@@ -15,6 +15,21 @@ from .pipeline import GenerationCancelled, Pipeline
 
 _PLACEHOLDER = "例如:一只橘猫在雨后的东京街头漫步,霓虹灯倒映在水洼里,电影感画面"
 
+# 画幅选项:显示文案 → 配置值(3:4 / 4:3 由相邻画幅生成后自动居中裁剪)
+_ASPECT_CHOICES = {
+    "🖥 横屏 16:9": "16:9",
+    "📱 竖屏 9:16": "9:16",
+    "方形 1:1": "1:1",
+    "横幅 4:3": "4:3",
+    "竖幅 3:4": "3:4",
+}
+# 大约时长选项:显示文案 → 目标秒数(实际成片在目标值 ±15% 内)
+_DURATION_CHOICES = {
+    "30 秒": 30,
+    "1 分钟": 60,
+    "2 分钟": 120,
+}
+
 
 def _open_path(path: Path) -> None:
     """用系统默认程序打开文件(跨平台)。"""
@@ -87,15 +102,30 @@ class App:
         ttk.Button(bar, text="打开输出文件夹", command=self._open_output_dir).pack(side="left", padx=(8, 0))
         ttk.Button(bar, text="打开配置文件", command=self._open_config).pack(side="left", padx=(8, 0))
 
-        default_aspect, default_subtitles = self._config_defaults()
-        self.aspect_var = tk.StringVar(value=default_aspect)
-        ttk.Radiobutton(
-            bar, text="📱 竖屏 9:16", value="9:16", variable=self.aspect_var
+        default_aspect, default_duration, default_subtitles = self._config_defaults()
+        # 画幅与时长下拉框以显示文案为值,提交时经映射表转回配置值
+        self.aspect_var = tk.StringVar(
+            value=next(
+                (label for label, v in _ASPECT_CHOICES.items() if v == default_aspect),
+                "🖥 横屏 16:9",
+            )
+        )
+        ttk.Combobox(
+            bar, textvariable=self.aspect_var, state="readonly",
+            values=list(_ASPECT_CHOICES), width=11,
         ).pack(side="right")
-        ttk.Radiobutton(
-            bar, text="🖥 横屏 16:9", value="16:9", variable=self.aspect_var
-        ).pack(side="right", padx=(0, 10))
         ttk.Label(bar, text="画幅:").pack(side="right", padx=(0, 4))
+        self.duration_var = tk.StringVar(
+            value=min(
+                _DURATION_CHOICES,
+                key=lambda label: abs(_DURATION_CHOICES[label] - default_duration),
+            )
+        )
+        ttk.Combobox(
+            bar, textvariable=self.duration_var, state="readonly",
+            values=list(_DURATION_CHOICES), width=7,
+        ).pack(side="right", padx=(0, 10))
+        ttk.Label(bar, text="时长:").pack(side="right", padx=(0, 4))
         self.subtitle_var = tk.BooleanVar(value=default_subtitles)
         ttk.Checkbutton(
             bar, text="旁白字幕", variable=self.subtitle_var
@@ -142,16 +172,19 @@ class App:
         self.ref_clear_btn.config(state="disabled")
 
     @staticmethod
-    def _config_defaults() -> tuple[str, bool]:
-        """界面选项默认值取自 config.yaml:画幅(非横/竖屏时用横屏)与字幕开关。"""
-        aspect, subtitles = "", True
+    def _config_defaults() -> tuple[str, int, bool]:
+        """界面选项默认值取自 config.yaml:画幅、目标时长(取最接近的档位)与字幕开关。"""
+        aspect, duration, subtitles = "", 60, True
         try:
             config = load_config()
             aspect = str(config["kling"]["aspect_ratio"])
+            duration = int(config["video"]["target_duration"])
             subtitles = bool(config["narration"]["subtitles"])
         except Exception:  # noqa: BLE001 - 首次启动可能还没有配置文件
             pass
-        return (aspect if aspect in ("16:9", "9:16") else "16:9"), subtitles
+        if aspect not in _ASPECT_CHOICES.values():
+            aspect = "16:9"
+        return aspect, duration, subtitles
 
     # ---------------- 事件 ----------------
 
@@ -176,8 +209,13 @@ class App:
         if problems:
             messagebox.showerror("配置错误", "\n".join(problems))
             return
-        # 界面上选择的画幅与字幕开关优先于 config.yaml
-        config["kling"]["aspect_ratio"] = self.aspect_var.get()
+        # 界面上选择的画幅、时长与字幕开关优先于 config.yaml
+        config["kling"]["aspect_ratio"] = _ASPECT_CHOICES.get(
+            self.aspect_var.get(), "16:9"
+        )
+        config["video"]["target_duration"] = _DURATION_CHOICES.get(
+            self.duration_var.get(), 60
+        )
         config["narration"]["subtitles"] = bool(self.subtitle_var.get())
 
         self._final_path = None

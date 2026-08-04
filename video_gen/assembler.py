@@ -182,6 +182,35 @@ class Assembler:
         self._run(args)
         return starts
 
+    # ---------------- 画幅裁剪 ----------------
+
+    def crop_to_aspect(self, video: Path, aspect: str, out_path: Path) -> bool:
+        """把成片居中裁剪到目标画幅(如 3:4 / 4:3),失败时沿用原画幅。
+
+        Kling 端点不原生支持这类画幅,片段按相邻原生画幅生成,
+        在拼接后一次性裁剪(需在烧录字幕之前,避免字幕被裁掉)。
+        """
+        try:
+            w, h = (int(v) for v in str(aspect).split(":"))
+        except ValueError:
+            return False
+        # 居中裁剪到 w:h,trunc(x/2)*2 保证宽高为偶数(libx264 要求)
+        vf = (
+            f"crop=trunc(min(iw\\,ih*{w}/{h})/2)*2"
+            f":trunc(min(ih\\,iw*{h}/{w})/2)*2"
+        )
+        try:
+            self._log(f"居中裁剪画幅到 {aspect} …")
+            self._run(
+                ["-i", str(video), "-vf", vf,
+                 "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                 "-pix_fmt", "yuv420p", "-c:a", "copy", str(out_path)]
+            )
+            return True
+        except subprocess.CalledProcessError:
+            self._log(f"裁剪到 {aspect} 失败,保留原生成画幅输出(不影响成片)。")
+            return False
+
     # ---------------- 旁白配音 ----------------
 
     def mix_narration(
