@@ -33,6 +33,19 @@ _POLL_INTERVAL = 5  # 轮询任务状态的间隔(秒)
 _MAX_MULTI_PROMPT_CHARS = 512   # multi_prompt 内单条分镜提示词
 _MAX_SINGLE_PROMPT_CHARS = 2500  # 单 prompt 与 negative_prompt
 
+# Kling 视频端点原生支持的画幅;3:4 / 4:3 不被原生支持,
+# 按相邻原生画幅生成,拼接成片时再居中裁剪出目标画幅
+_NATIVE_ASPECTS = ("16:9", "9:16", "1:1")
+_GENERATION_ASPECT = {"3:4": "9:16", "4:3": "16:9"}
+
+
+def generation_aspect(aspect: str) -> str:
+    """返回 Kling 端点实际使用的生成画幅:非原生画幅映射到相邻原生画幅。"""
+    aspect = str(aspect).strip()
+    if aspect in _NATIVE_ASPECTS:
+        return aspect
+    return _GENERATION_ASPECT.get(aspect, "16:9")
+
 
 def clip_is_valid(path: Path) -> bool:
     return path.exists() and path.stat().st_size >= _MIN_CLIP_BYTES
@@ -99,7 +112,9 @@ class KlingGenerator:
         aspect = str(self._config["kling"]["aspect_ratio"])
         arguments = {
             "prompt": prompt,
-            "aspect_ratio": aspect if aspect in ("16:9", "9:16", "1:1") else "auto",
+            # 文生图端点原生支持 3:4 / 4:3,无需映射
+            "aspect_ratio": aspect
+            if aspect in ("16:9", "9:16", "1:1", "3:4", "4:3") else "auto",
             "num_images": 1,
             "output_format": "png",
         }
@@ -140,10 +155,11 @@ class KlingGenerator:
             "@element" in combined or "@image" in combined
         )
 
+        aspect = generation_aspect(str(kling["aspect_ratio"]))
         if use_reference:
             endpoint = str(kling["reference_endpoint"])
             arguments: dict = {
-                "aspect_ratio": kling["aspect_ratio"],
+                "aspect_ratio": aspect,
                 "generate_audio": bool(kling["generate_audio"]),
             }
             if "@element" in combined:
@@ -162,7 +178,7 @@ class KlingGenerator:
                 "negative_prompt": fit_prompt(
                     shot.negative_prompt, _MAX_SINGLE_PROMPT_CHARS
                 ),
-                "aspect_ratio": kling["aspect_ratio"],
+                "aspect_ratio": aspect,
                 "generate_audio": bool(kling["generate_audio"]),
             }
             prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
