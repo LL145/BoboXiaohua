@@ -18,6 +18,18 @@ from .config import Config
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 _RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504, 524}
 
+# Kling 3 支持的单镜头时长范围(秒)
+_MIN_SHOT_SECONDS = 3
+_MAX_SHOT_SECONDS = 15
+
+
+def _clamp_duration(value, fallback: int) -> int:
+    """把模型给出的镜头时长钳制到 Kling 支持的范围;缺失/非法时用回退值。"""
+    try:
+        return max(_MIN_SHOT_SECONDS, min(_MAX_SHOT_SECONDS, int(value)))
+    except (TypeError, ValueError):
+        return fallback
+
 
 @dataclass
 class Shot:
@@ -99,8 +111,15 @@ _STORYBOARD_SCHEMA = {
                         "type": "string",
                         "description": "English negative prompt (artifacts to avoid)",
                     },
+                    "duration": {
+                        "type": "integer",
+                        "description": (
+                            "Shot duration in seconds (integer 3-15), chosen "
+                            "for narrative pacing"
+                        ),
+                    },
                 },
-                "required": ["title", "prompt", "negative_prompt"],
+                "required": ["title", "prompt", "negative_prompt", "duration"],
                 "additionalProperties": False,
             },
         },
@@ -116,8 +135,12 @@ _SYSTEM_PROMPT = """\
 逐镜头生成的分镜脚本。用户只提供简短创意,其余全部由你专业决定,不要留下待用户选择的空间。
 
 ## 产出要求
-严格产出 {num_shots} 个镜头。每个镜头将被独立生成为 {clip_duration} 秒的片段,\
-最后按顺序拼接为约 {total} 秒的成片,因此镜头顺序即叙事顺序,要有清晰的起承转合。
+成片目标总时长约 {target} 秒。镜头数量与每个镜头的时长(duration 字段)由你按叙事需要决定:
+- 每个镜头的 duration 为 3~15 之间的整数(秒),该镜头将被独立生成为对应长度的片段;
+- 全部镜头时长之和必须落在 {total_min}~{total_max} 秒之间,尽量接近 {target} 秒;
+- 按节奏分配时长,不要让所有镜头等长:动作、冲突、快切用短镜头(3~6 秒),\
+常规叙事用中等镜头(7~10 秒),氛围铺陈、情绪高潮、收尾用长镜头(11~15 秒);
+- 镜头将按顺序拼接为成片,顺序即叙事顺序,要有清晰的起承转合。
 
 ## 风格一致性(最重要)
 1. 先确定 style_anchor:一段英文风格签名,固定描述色调、光线方案、胶片/渲染风格\
@@ -142,7 +165,7 @@ style_anchor 的风格词。该参考图会随每个镜头一起送入视频模�
 1. Setting:环境、时间、天气、氛围;
 2. Subject:主体及关键外观细节(复用固定描述);
 3. Action:一个简单连贯的动作,可用 "First ... then ..." 描述顺序,\
-   但幅度必须能在 {clip_duration} 秒内自然完成,禁止复杂多事件序列;
+   但幅度必须能在该镜头的 duration 秒内自然完成,禁止复杂多事件序列;
 4. Camera:一种明确的镜头运动 + 镜别(如 "slow dolly-in, medium close-up" / \
    "aerial tracking shot, wide angle"),每镜头只用一种镜头运动;
 5. Lighting 与 style_anchor 风格词。
@@ -157,7 +180,7 @@ watermark, extra limbs, deformed hands, flickering)。
 ## 输出格式
 只输出一个 JSON 对象(不要 Markdown 代码块、不要任何解释文字),字段为:
 title(string)、logline(string)、style_anchor(string)、reference_prompt(string)、\
-shots(数组,每项含 title、prompt、negative_prompt);\
+shots(数组,每项含 title、prompt、negative_prompt、duration);\
 若用户消息中提供了背景音乐列表,则额外包含 bgm_file(string)。
 """
 
@@ -218,15 +241,19 @@ class Director:
         bgm_options: list[str] | None = None,
         aspect_ratio: str = "",
     ) -> Storyboard:
-        kling = self._config["kling"]
-        clip_duration = int(kling["clip_duration"])
+        # 镜头数量与每镜头时长(3~15 秒)由导演模型按叙事节奏决定,
+        # 只约束总时长落在目标值 ±15% 内;clip_duration 仅作缺省回退值。
+        fallback_duration = int(self._config["kling"]["clip_duration"])
         target = int(self._config["video"]["target_duration"])
-        num_shots = max(1, round(target / clip_duration))
+        total_min = max(_MIN_SHOT_SECONDS, round(target * 0.85))
+        total_max = round(target * 1.15)
+        # 防御模型跑飞:即使全用最短镜头,也不该超过这个镜头数
+        max_shots = max(1, -(-total_max // _MIN_SHOT_SECONDS))
 
         system = _SYSTEM_PROMPT.format(
-            num_shots=num_shots,
-            clip_duration=clip_duration,
-            total=num_shots * clip_duration,
+            target=target,
+            total_min=total_min,
+            total_max=total_max,
         )
 
         user_message = f"请为以下创意撰写分镜脚本:\n\n{description}"
@@ -310,13 +337,13 @@ class Director:
 
         content = message.get("content") or ""
         parsed = _extract_json(content)
-        return self._build_storyboard(parsed, num_shots, clip_duration)
+        return self._build_storyboard(parsed, max_shots, fallback_duration)
 
     # ---------------- 结果组装 ----------------
 
     @staticmethod
-    def _build_storyboard(data: dict, num_shots: int, clip_duration: int) -> Storyboard:
-        raw_shots = data["shots"][:num_shots]
+    def _build_storyboard(data: dict, max_shots: int, fallback_duration: int) -> Storyboard:
+        raw_shots = data["shots"][:max_shots]
         if not raw_shots:
             raise KeyError("shots 为空")
         shots = [
@@ -325,7 +352,7 @@ class Director:
                 title=str(raw["title"]),
                 prompt=str(raw["prompt"]),
                 negative_prompt=str(raw.get("negative_prompt", "")),
-                duration=clip_duration,
+                duration=_clamp_duration(raw.get("duration"), fallback_duration),
             )
             for i, raw in enumerate(raw_shots)
         ]
