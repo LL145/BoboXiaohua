@@ -6,10 +6,12 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import requests
 
@@ -24,6 +26,29 @@ _MIN_GROUP_SECONDS = 3
 _MAX_GROUP_SECONDS = 15
 _MIN_CUT_SECONDS = 1
 _MAX_CUTS_PER_GROUP = 6  # Kling multi_prompt 上限
+# Kling 对 multi_prompt 单条分镜提示词有 512 字符硬上限(超长直接 422 拒绝),
+# 要求模型控制在 450 以内留出余量;kling.py 提交前还会做最终钳制兜底
+_MAX_PROMPT_CHARS = 450
+
+# 用户上传主角参考图时,随创意一起发给导演模型的图片格式
+_IMAGE_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".gif": "image/gif",
+}
+
+
+def _encode_image(path: Path) -> str | None:
+    """把本地图片编码为 data URL,作为多模态消息发给导演模型;失败返回 None。"""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return None
+    mime = _IMAGE_MIME.get(Path(path).suffix.lower(), "image/png")
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
 
 
 def _clamp_duration(value, fallback: int, minimum: int = _MIN_GROUP_SECONDS) -> int:
@@ -132,7 +157,9 @@ _STORYBOARD_SCHEMA = {
             "type": "string",
             "description": (
                 "English style signature reused verbatim in every shot prompt: "
-                "color palette, lighting scheme, film stock / rendering style"
+                "color palette, lighting scheme, film stock / rendering style. "
+                "Keep it compact (under 120 characters) — it is repeated in "
+                "every cut prompt, which has a strict length budget"
             ),
         },
         "reference_prompt": {
@@ -182,7 +209,10 @@ _STORYBOARD_SCHEMA = {
                                         "text-to-video prompt for this cut: "
                                         "setting, subject, action, camera "
                                         "movement + lens, lighting, style "
-                                        "keywords; may embed dialogue lines"
+                                        "keywords; may embed dialogue lines. "
+                                        "HARD LIMIT: at most 450 characters "
+                                        "including spaces — longer prompts "
+                                        "are rejected by the video model"
                                     ),
                                 },
                                 "duration": {
@@ -263,6 +293,11 @@ narration 字段撰写中文旁白。要求:口语自然、贴合画面;语速�
    "aerial tracking shot, wide angle"),每分镜只用一种镜头运动;
 5. Lighting 与 style_anchor 风格词。
 
+**长度硬约束**:每条分镜 prompt(含 style_anchor、角色外观描述与 @Element1 占位符)\
+总长必须不超过 450 个字符(英文字符数,含空格)——视频模型对单条分镜提示词有 512 \
+字符硬上限,超长会被直接拒绝。为此 style_anchor 与外观描述都要精炼(各控制在 120 \
+字符以内),动作与环境描述抓重点,不堆砌同义词。
+
 ## 其他
 - 画面中不得出现文字、字幕、logo、水印。
 - negative_prompt 按镜头组撰写,用英文,列出需规避项(如 blur, distortion, warping, \
@@ -307,16 +342,33 @@ class Director:
         description: str,
         bgm_options: list[str] | None = None,
         aspect_ratio: str = "",
+        reference_image: Path | None = None,
     ) -> Storyboard:
-        """根据用户一句话描述生成分镜脚本(含瞬时错误重试)。"""
+        """根据用户一句话描述生成分镜脚本(含瞬时错误重试)。
+
+        reference_image 为用户上传的主角参考图:随创意一起发给导演模型,
+        让它照图写出固定的角色外观描述(@Element1)。
+        """
+        image_data_url = _encode_image(reference_image) if reference_image else None
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                return self._write_once(description, bgm_options, aspect_ratio)
+                return self._write_once(
+                    description, bgm_options, aspect_ratio,
+                    image_data_url=image_data_url,
+                    has_user_image=reference_image is not None,
+                )
             except (requests.ConnectionError, requests.Timeout,
                     json.JSONDecodeError, KeyError, _RetryableHTTPError) as exc:
                 last_error = exc
                 time.sleep(2 * (attempt + 1))
+            except RuntimeError as exc:
+                # 携带图片时失败可能是模型不支持图片输入:去掉图片降级重试
+                # (文字说明仍会告知模型存在用户参考图)
+                if image_data_url is None:
+                    raise
+                image_data_url = None
+                last_error = exc
         raise RuntimeError(f"分镜脚本生成失败: {last_error}") from last_error
 
     # ---------------- OpenRouter 调用 ----------------
@@ -332,6 +384,8 @@ class Director:
         description: str,
         bgm_options: list[str] | None = None,
         aspect_ratio: str = "",
+        image_data_url: str | None = None,
+        has_user_image: bool = False,
     ) -> Storyboard:
         # 镜头组数量与各分镜时长由导演模型按叙事节奏决定,
         # 只约束总时长落在目标值 ±15% 内;clip_duration 仅作缺省回退值。
@@ -352,6 +406,16 @@ class Director:
         note = self._ASPECT_NOTES.get(str(aspect_ratio).strip())
         if note:
             user_message += f"\n\n{note}"
+        if has_user_image:
+            user_message += (
+                "\n\n用户已上传主角参考图(消息附图即为该图,若你看不到图片则依据"
+                "创意内容推断主角外观)。该图会作为角色元素随每个镜头组送入视频模型"
+                "锁定主角外观,因此:\n"
+                "- 将该主角视为贯穿全片的固定主角;reference_prompt 置为空字符串"
+                "(参考图已由用户提供,无需再生成);\n"
+                "- 所有涉及主角的分镜 prompt 一律写成 \"@Element1 (外观描述)\" 形式,"
+                "外观描述需与参考图一致,写成一段固定英文描述并逐字重复。"
+            )
         schema = _STORYBOARD_SCHEMA
         if bgm_options:
             schema = json.loads(json.dumps(_STORYBOARD_SCHEMA))
@@ -366,13 +430,22 @@ class Director:
                 + "\n".join(f"- {name}" for name in bgm_options)
             )
 
+        # 携带用户参考图时按多模态格式发送;模型不支持图片输入的情况由
+        # write_storyboard 捕获后去图重试
+        user_content: str | list = user_message
+        if image_data_url:
+            user_content = [
+                {"type": "text", "text": user_message},
+                {"type": "image_url", "image_url": {"url": image_data_url}},
+            ]
+
         llm = self._config["llm"]
         body: dict = {
             "model": llm["model"],
             "max_tokens": int(llm["max_tokens"]),
             "messages": [
                 {"role": "system", "content": system},
-                {"role": "user", "content": user_message},
+                {"role": "user", "content": user_content},
             ],
             # 支持结构化输出的模型会严格遵守;不支持的模型由 _extract_json 兜底
             "response_format": {

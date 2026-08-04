@@ -28,6 +28,11 @@ _MIN_CLIP_BYTES = 10 * 1024
 _MIN_IMAGE_BYTES = 5 * 1024
 _POLL_INTERVAL = 5  # 轮询任务状态的间隔(秒)
 
+# fal.ai Kling 端点的提示词长度硬上限(字符):超长会被 422 直接拒绝,
+# 且同样参数重试必然再失败,所以提交前在本地钳制
+_MAX_MULTI_PROMPT_CHARS = 512   # multi_prompt 内单条分镜提示词
+_MAX_SINGLE_PROMPT_CHARS = 2500  # 单 prompt 与 negative_prompt
+
 
 def clip_is_valid(path: Path) -> bool:
     return path.exists() and path.stat().st_size >= _MIN_CLIP_BYTES
@@ -43,6 +48,19 @@ def strip_reference_tokens(prompt: str) -> str:
     @Image1 是旧版脚本的参考图占位符,保留以兼容旧 manifest 的断点续传。
     """
     return re.sub(r"@(?:Element|Image)\d+\s*", "", prompt).strip()
+
+
+def fit_prompt(prompt: str, limit: int) -> str:
+    """把提示词裁剪到长度上限内:尽量在句号/逗号等分句边界截断,避免拦腰斩词。"""
+    prompt = prompt.strip()
+    if len(prompt) <= limit:
+        return prompt
+    head = prompt[:limit]
+    # 取最靠后的分句边界截断,尽量少丢内容(尾部通常是 style_anchor 风格词)
+    pos = max(head.rfind(sep) for sep in (". ", "; ", ", "))
+    if pos >= limit // 2:
+        return head[:pos + 1].rstrip(" ,;")
+    return head.rsplit(" ", 1)[0].rstrip(" ,;.")
 
 
 class FatalGenerationError(RuntimeError):
@@ -141,11 +159,24 @@ class KlingGenerator:
         else:
             endpoint = str(kling["text_endpoint"])
             arguments = {
-                "negative_prompt": shot.negative_prompt,
+                "negative_prompt": fit_prompt(
+                    shot.negative_prompt, _MAX_SINGLE_PROMPT_CHARS
+                ),
                 "aspect_ratio": kling["aspect_ratio"],
                 "generate_audio": bool(kling["generate_audio"]),
             }
             prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
+
+        limit = (
+            _MAX_MULTI_PROMPT_CHARS if len(shot.cuts) > 1 else _MAX_SINGLE_PROMPT_CHARS
+        )
+        for i, prompt in enumerate(prompts):
+            if len(prompt) > limit:
+                self._log(
+                    f"  ⚠ 镜头组 {shot.index} 分镜 {i + 1} 提示词超长"
+                    f"({len(prompt)} 字符),已裁剪到 {limit} 字符内"
+                )
+                prompts[i] = fit_prompt(prompt, limit)
 
         if len(shot.cuts) > 1:
             arguments["multi_prompt"] = [
@@ -193,6 +224,10 @@ class KlingGenerator:
             except Exception as exc:  # noqa: BLE001 - 逐镜头组重试,最终仍会抛出
                 last_error = exc
                 self._log(f"  镜头组 {shot.index} 第 {attempt} 次尝试失败: {exc}")
+                if getattr(exc, "status_code", None) == 422:
+                    # 参数校验错误是确定性的,同样参数重试必然再失败
+                    self._log(f"  镜头组 {shot.index} 请求参数被拒,跳过重试 …")
+                    break
                 if attempt <= max_retries:
                     self._sleep(min(3 * attempt, 15))
 
