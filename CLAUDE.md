@@ -15,7 +15,7 @@ Tkinter 桌面小工具,跨平台(Windows / macOS / Linux),面向无技术背景
 ## 运行与打包
 
 ```bash
-pip install -r requirements.txt   # fal-client / PyYAML / requests(GUI 用标准库 tkinter)
+pip install -r requirements.txt   # fal-client / PyYAML / requests / edge-tts(GUI 用标准库 tkinter)
 python main.py                    # 桌面界面
 python main.py "一句话描述"        # 命令行模式,直接生成
 python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 dist/ 发布包
@@ -31,19 +31,30 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
 一次生成 = `Pipeline.run()`(pipeline.py)串起以下阶段,数据流单向:
 
 1. **director.py** — LLM 编剧+导演,经 OpenRouter(OpenAI 兼容接口)把一句话扩写为
-   `Storyboard`(含 `Shot` 列表)。镜头数量与每镜头时长(3~15 秒整数)由模型按叙事
-   节奏决定,代码只约束总时长在 `video.target_duration` ±15% 内并用 `_clamp_duration`
-   钳制;`kling.clip_duration` 仅是模型未给时长时的回退值。
-   请求带 `response_format: json_schema`,不支持结构化输出的模型由 `_extract_json` 容错兜底。
-2. **kling.py** — `KlingGenerator` 调 fal.ai 逐镜头生成视频。有固定主角时先文生图出参考图,
-   走 reference-to-video 锁定角色外观;参考图任何一步失败自动降级纯文生视频。
-   `FatalGenerationError`(KEY 无效/余额不足/端点不存在)立即终止全部镜头,其余错误逐镜头重试。
-3. **assembler.py** — ffmpeg 拼接:优先 xfade 交叉溶解 + 首尾淡入淡出(需重编码),
-   失败回退 concat 无损拼接;`music/` 目录有音频时由导演挑选一首混入(bgm)。
-4. **config.py** — 读取程序目录 `config.yaml`,与 `_DEFAULTS` 深合并;`app_dir()` 兼容
+   `Storyboard`(含镜头组 `Shot` 列表,每组内含 1~6 个分镜 `Cut`)。组内分镜由 Kling
+   一次连续生成(multi_prompt,组总长 3~15 秒、单分镜 1~15 秒),组间才用转场;
+   代码约束总时长在 `video.target_duration` ±15% 内并用 `_clamp_duration`/`_build_cuts`
+   钳制;`kling.clip_duration` 仅是模型未给时长时的回退值。导演同时决定声音形态:
+   解说型逐组写中文旁白(`narration` 字段),沉浸型全部置空;角色台词直接写进分镜
+   prompt(中文引号台词),由 Kling 原生配音。请求带 `response_format: json_schema`,
+   不支持结构化输出的模型由 `_extract_json` 容错兜底。
+2. **kling.py** — `KlingGenerator` 调 fal.ai 逐镜头组生成视频。有固定主角时先文生图出
+   参考图,作为 `elements` 角色元素(prompt 中 `@Element1`)送入 reference-to-video
+   锁定角色外观;参考图任何一步失败自动降级纯文生视频(`strip_reference_tokens`
+   去掉占位符,兼容旧 manifest 的 `@Image1`/`image_urls`)。`FatalGenerationError`
+   (KEY 无效/余额不足/端点不存在)立即终止全部镜头组,其余错误逐组重试。
+3. **tts.py** — Edge TTS(免费)合成导演写的中文旁白,逐组落盘
+   `narration_XX.mp3`(断点续传复用);并提供 SRT 字幕生成(旁白按句读
+   与字数比例分配时间轴)。edge-tts 缺失/网络失败只丢旁白,不影响成片。
+4. **assembler.py** — ffmpeg 拼接:优先 xfade 交叉溶解 + 首尾淡入淡出(需重编码),
+   失败回退 concat 无损拼接;`concat()` 返回各镜头组在成片时间轴上的偏移,供旁白
+   与字幕定位。旁白按偏移 adelay+amix 混入(超长自动 atempo 加速≤1.4 并截断);
+   字幕优先烧录(libass),失败退 mp4 软字幕;`music/` 目录有音频时由导演挑选
+   一首混入(bgm)。每级失败都沿用上一级产物。
+5. **config.py** — 读取程序目录 `config.yaml`,与 `_DEFAULTS` 深合并;`app_dir()` 兼容
    PyInstaller 冻结与 macOS .app 布局。**新增配置项必须同时更新 `_DEFAULTS`、
    `config.yaml` 的中文注释,必要时补 `validate()`。**
-5. **gui.py** — Tkinter 界面;工作线程经队列把日志/进度转回主线程,不直接碰控件。
+6. **gui.py** — Tkinter 界面;工作线程经队列把日志/进度转回主线程,不直接碰控件。
 
 ## 关键约定
 
@@ -51,9 +62,10 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
   (描述、画幅、storyboard)与各 `shot_XX.mp4`。同一描述再次生成时复用已有脚本与片段,
   只补缺失镜头——所以 `Shot`/`Storyboard` 字段变更要保持 `from_dict` 对旧 manifest 兼容
   (用 `.get()` + 默认值)。
-- **提示词一致性**:分镜脚本要求每镜头 prompt 逐字重复 style_anchor 与角色外观描述,
-  禁止跨镜头指代(各镜头独立生成);有主角时 prompt 用 `@Image1 (外观描述)` 引用参考图,
-  降级纯文生时由 `strip_reference_tokens` 去掉占位符。
+- **提示词一致性**:分镜脚本要求每个分镜 prompt 逐字重复 style_anchor 与角色外观描述,
+  禁止跨组/跨分镜指代(镜头组之间相互独立生成);有主角时 prompt 用
+  `@Element1 (外观描述)` 引用角色元素,降级纯文生时由 `strip_reference_tokens`
+  去掉占位符(同时兼容旧脚本的 `@Image1`)。
 - **JSON schema 保守化**:`_STORYBOARD_SCHEMA` 会被 OpenRouter 透传给任意上游模型,
   只用各家 strict 模式普遍支持的关键字(type/description/required 等),
   数值范围等约束写进 description 并在 Python 侧钳制。
