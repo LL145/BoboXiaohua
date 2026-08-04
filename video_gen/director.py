@@ -455,6 +455,9 @@ class Director:
         if len(cuts) == 1:
             cuts[0].duration = max(_MIN_GROUP_SECONDS, cuts[0].duration)
             return cuts
+        # 组总长不足 Kling 下限时,逐秒补齐最短的分镜
+        while sum(c.duration for c in cuts) < _MIN_GROUP_SECONDS:
+            min(cuts, key=lambda c: c.duration).duration += 1
         # 组总长超过 Kling 上限时按比例压缩,再逐一削减到不超过 15 秒
         total = sum(c.duration for c in cuts)
         if total > _MAX_GROUP_SECONDS:

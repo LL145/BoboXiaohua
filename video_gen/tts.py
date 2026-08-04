@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -56,11 +57,16 @@ def load_timeline(audio_path: Path) -> list[tuple[float, float, str]] | None:
 
 
 def synthesize_all(
-    storyboard: Storyboard, run_dir: Path, voice: str, log: LogFn
+    storyboard: Storyboard,
+    run_dir: Path,
+    voice: str,
+    log: LogFn,
+    cancel: threading.Event | None = None,
 ) -> dict[int, Path]:
     """逐镜头组合成旁白,返回 {镜头组序号: 音频路径};失败的组被跳过。
 
-    已存在的有效音频直接复用(断点续传)。
+    已存在的有效音频直接复用(断点续传);cancel 置位时停止合成后续组,
+    是否终止整个任务由调用方决定。
     """
     pending = [s for s in storyboard.shots if s.narration.strip()]
     if not pending:
@@ -73,6 +79,8 @@ def synthesize_all(
 
     results: dict[int, Path] = {}
     for shot in pending:
+        if cancel is not None and cancel.is_set():
+            break
         out_path = narration_path(run_dir, shot.index)
         if narration_is_valid(out_path):
             results[shot.index] = out_path

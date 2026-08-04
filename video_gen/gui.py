@@ -35,7 +35,9 @@ class App:
         self.root.geometry("880x580")
         self.root.minsize(760, 480)
 
-        self._log_queue: queue.Queue[str] = queue.Queue()
+        # 工作线程 → 主线程的消息队列,消息为 (类型, *参数) 元组:
+        # ("log", 文本) / ("prog", 百分比, 阶段) / ("done", 成片路径) / ("fail",) / ("cancel",)
+        self._log_queue: queue.Queue[tuple] = queue.Queue()
         self._worker: threading.Thread | None = None
         self._final_path: Path | None = None
         self._cancel_event: threading.Event | None = None
@@ -156,13 +158,13 @@ class App:
                     progress=self._on_progress, cancel_event=cancel_event,
                 )
                 final_path = pipeline.run(description)
-                self._log_queue.put(f"__DONE__{final_path}")
+                self._log_queue.put(("done", final_path))
             except GenerationCancelled:
                 self._log("⏹ 已取消。已完成的镜头已保存,不会重复扣费。")
-                self._log_queue.put("__CANCEL__")
+                self._log_queue.put(("cancel",))
             except Exception as exc:  # noqa: BLE001 - 汇总展示给用户
                 self._log(f"❌ 出错: {exc}")
-                self._log_queue.put("__FAIL__")
+                self._log_queue.put(("fail",))
 
         self._worker = threading.Thread(target=work, daemon=True)
         self._worker.start()
@@ -204,11 +206,11 @@ class App:
     # ---------------- 日志 ----------------
 
     def _log(self, message: str) -> None:
-        self._log_queue.put(message)
+        self._log_queue.put(("log", message))
 
     def _on_progress(self, percent: int, stage: str) -> None:
         """总进度与当前阶段(由工作线程调用,经队列转到主线程)。"""
-        self._log_queue.put(f"__PROG__{percent}|{stage}")
+        self._log_queue.put(("prog", percent, stage))
 
     def _clear_log(self) -> None:
         self.log_box.config(state="normal")
@@ -218,22 +220,22 @@ class App:
     def _poll_log_queue(self) -> None:
         try:
             while True:
-                message = self._log_queue.get_nowait()
-                if message.startswith("__DONE__"):
-                    self._final_path = Path(message[len("__DONE__"):])
+                kind, *payload = self._log_queue.get_nowait()
+                if kind == "done":
+                    self._final_path = Path(payload[0])
                     self._finish("完成!点击「打开成片」查看视频。", step="✅ 全部完成")
                     self.open_btn.config(state="normal")
-                elif message == "__FAIL__":
+                elif kind == "fail":
                     self._finish("生成失败,详见日志。", step="❌ 已中止")
-                elif message == "__CANCEL__":
+                elif kind == "cancel":
                     self._finish("已取消。再次生成相同描述可从断点继续。", step="⏹ 已取消")
-                elif message.startswith("__PROG__"):
-                    percent, stage = message[len("__PROG__"):].split("|", 1)
+                elif kind == "prog":
+                    percent, stage = payload
                     self.progress["value"] = int(percent)
                     self.step_var.set(f"当前步骤:{stage}({percent}%)")
                 else:
                     self.log_box.config(state="normal")
-                    self.log_box.insert("end", message + "\n")
+                    self.log_box.insert("end", str(payload[0]) + "\n")
                     self.log_box.see("end")
                     self.log_box.config(state="disabled")
         except queue.Empty:

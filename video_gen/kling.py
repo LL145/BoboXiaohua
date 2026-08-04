@@ -62,6 +62,17 @@ class KlingGenerator:
         # fal_client 通过 FAL_KEY 环境变量读取凭证
         os.environ["FAL_KEY"] = config.fal_api_key
 
+    def _check_cancel(self) -> None:
+        if self._cancel is not None and self._cancel.is_set():
+            raise FatalGenerationError("已取消生成")
+
+    def _sleep(self, seconds: float) -> None:
+        """可被「取消」立即打断的等待。"""
+        if self._cancel is not None:
+            self._cancel.wait(seconds)
+        else:
+            time.sleep(seconds)
+
     # ---------------- 主角参考图 ----------------
 
     def generate_reference(self, prompt: str, out_path: Path) -> str | None:
@@ -161,6 +172,7 @@ class KlingGenerator:
 
         last_error: Exception | None = None
         for attempt in range(1, max_retries + 2):
+            self._check_cancel()
             try:
                 self._log(
                     f"  镜头组 {shot.index} 提交 Kling 生成"
@@ -182,7 +194,7 @@ class KlingGenerator:
                 last_error = exc
                 self._log(f"  镜头组 {shot.index} 第 {attempt} 次尝试失败: {exc}")
                 if attempt <= max_retries:
-                    time.sleep(min(3 * attempt, 15))
+                    self._sleep(min(3 * attempt, 15))
 
         if use_reference:
             # 参考图模式反复失败 → 降级为纯文生视频(该组一致性略降,但保住成片)
@@ -234,7 +246,7 @@ class KlingGenerator:
                 except Exception:  # noqa: BLE001
                     pass
                 raise RuntimeError(f"{label} 生成超时(超过 {int(timeout)} 秒)")
-            time.sleep(_POLL_INTERVAL)
+            self._sleep(_POLL_INTERVAL)
 
         try:
             return handle.get()
@@ -262,10 +274,15 @@ class KlingGenerator:
     def _download(self, url: str, out_path: Path) -> None:
         """先写临时文件再原子改名,避免半截文件被断点续传误认为有效。"""
         tmp_path = out_path.with_suffix(".part")
-        with requests.get(url, stream=True, timeout=300) as resp:
-            resp.raise_for_status()
-            with open(tmp_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=1 << 20):
-                    f.write(chunk)
+        try:
+            with requests.get(url, stream=True, timeout=300) as resp:
+                resp.raise_for_status()
+                with open(tmp_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=1 << 20):
+                        self._check_cancel()
+                        f.write(chunk)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
         tmp_path.replace(out_path)
         self._log(f"  已下载 → {out_path.name}")
