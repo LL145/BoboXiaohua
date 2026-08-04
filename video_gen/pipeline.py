@@ -2,7 +2,7 @@
 → 旁白配音 → 拼接成片(转场/旁白/背景音乐/字幕)。
 
 稳健性设计:
-- 生成前预检:先校验 OpenRouter KEY 与磁盘空间,配错即刻提示,不浪费费用;
+- 生成前预检:先校验 OpenRouter KEY、fal KEY 与磁盘空间,配错即刻提示,不浪费费用;
 - 断点续传:同一描述的未完成任务会复用已有分镜脚本、参考图、旁白音频和
   已生成片段,失败后再次点击「生成」只补齐缺失部分,不重复扣费;
 - 主角参考图:导演模型判断有固定主角时自动生成参考图并作为角色元素
@@ -14,8 +14,9 @@
 - 运行日志同步写入任务目录 log.txt,便于排查问题;
 - 背景音乐:程序目录 music/ 下有音频文件时,由导演模型按影片情绪挑选混入;
 - 费用预估:生成前按待生成镜头秒数估算 fal 费用并展示;
-- 可取消:界面「取消」按钮置位 cancel_event,各阶段与 Kling 轮询检查后
-  以 GenerationCancelled 停止,已完成产物保留、可断点续传。
+- 可取消:界面「取消」按钮置位 cancel_event,Kling 轮询/等待/片段下载、
+  旁白合成循环与拼接各阶段之间均及时检查,以 GenerationCancelled 停止,
+  已完成产物保留、可断点续传。
 """
 
 from __future__ import annotations
@@ -192,7 +193,8 @@ class Pipeline:
             log("④ 合成旁白配音(Edge TTS)…")
             self._report_progress(82, "合成旁白配音")
             narration_audio = tts.synthesize_all(
-                storyboard, run_dir, str(narration_cfg["voice"]), log
+                storyboard, run_dir, str(narration_cfg["voice"]), log,
+                cancel=self._cancel,
             )
             step = 5
 
@@ -210,6 +212,7 @@ class Pipeline:
 
         srt_path: Path | None = None
         if narration_audio:
+            self._check_cancel()
             self._report_progress(90, "混入旁白与生成字幕")
             current, srt_path = self._apply_narration(
                 assembler, storyboard, narration_audio, offsets, current, run_dir
@@ -217,6 +220,7 @@ class Pipeline:
 
         bgm = self._pick_bgm(storyboard, bgm_tracks)
         if bgm is not None:
+            self._check_cancel()
             self._report_progress(93, "混入背景音乐")
             duration = assembler.probe_duration(current) or float(
                 storyboard.total_duration
@@ -226,6 +230,7 @@ class Pipeline:
             current = bgm_path
 
         if srt_path is not None and bool(narration_cfg["subtitles"]):
+            self._check_cancel()
             self._report_progress(96, "烧录字幕")
             subtitled_path = run_dir / "_stage_subtitled.mp4"
             if assembler.embed_subtitles(current, srt_path, subtitled_path):
@@ -339,6 +344,24 @@ class Pipeline:
                 )
         except requests.RequestException:
             pass  # 网络抖动不拦截,后续请求失败时会再给出明确提示
+
+        # fal key 探测:查询一个不存在的任务,零费用;key 无效时 fal 返回 401/403,
+        # 有效时仅是任务不存在(404 等),其余状态一律放行
+        try:
+            endpoint = str(self._config["kling"]["text_endpoint"])
+            app_root = "/".join(endpoint.split("/")[:2])
+            resp = requests.get(
+                f"https://queue.fal.run/{app_root}/requests/"
+                "00000000-0000-0000-0000-000000000000/status",
+                headers={"Authorization": f"Key {self._config.fal_api_key}"},
+                timeout=10,
+            )
+            if resp.status_code in (401, 403):
+                raise RuntimeError(
+                    "fal.ai API KEY 无效,请检查 config.yaml 中的 fal_api_key"
+                )
+        except requests.RequestException:
+            pass
 
         try:
             free_gb = shutil.disk_usage(self._config.output_dir).free / 2**30

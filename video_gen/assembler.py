@@ -225,24 +225,31 @@ class Assembler:
         n = len(segments)
         tail = ["-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac",
                 str(out_path)]
+        # 先探测原片有无音轨,直接选对混音方案;探测不可用(ffprobe 缺失)时
+        # 才退回"先试混音、失败再按无音轨处理"的两步走
+        has_audio = self._has_audio(video)
         try:
             self._log(f"混入旁白配音({n} 段)…")
-            try:
-                # 与原片音轨(环境音/台词)混音
-                mix = f"[0:a]{''.join(labels)}amix=inputs={n + 1}:duration=first:normalize=0[a]"
-                self._run([*inputs, "-filter_complex", ";".join([*filters, mix]), *tail])
-            except subprocess.CalledProcessError:
-                # 原片无音轨:仅旁白,时长对齐画面
-                video_dur = self.probe_duration(video) or (
-                    segments[-1][0] + segments[-1][2]
-                )
-                mix = (
-                    f"{''.join(labels)}amix=inputs={n}:duration=longest:normalize=0,"
-                    f"apad,atrim=0:{video_dur:.3f}[a]"
-                ) if n > 1 else (
-                    f"{labels[0]}apad,atrim=0:{video_dur:.3f}[a]"
-                )
-                self._run([*inputs, "-filter_complex", ";".join([*filters, mix]), *tail])
+            if has_audio is not False:
+                try:
+                    # 与原片音轨(环境音/台词)混音
+                    mix = f"[0:a]{''.join(labels)}amix=inputs={n + 1}:duration=first:normalize=0[a]"
+                    self._run([*inputs, "-filter_complex", ";".join([*filters, mix]), *tail])
+                    return timeline
+                except subprocess.CalledProcessError:
+                    if has_audio:
+                        raise  # 确认有音轨仍失败,是真失败,不再按无音轨重试
+            # 原片无音轨:仅旁白,时长对齐画面
+            video_dur = self.probe_duration(video) or (
+                segments[-1][0] + segments[-1][2]
+            )
+            mix = (
+                f"{''.join(labels)}amix=inputs={n}:duration=longest:normalize=0,"
+                f"apad,atrim=0:{video_dur:.3f}[a]"
+            ) if n > 1 else (
+                f"{labels[0]}apad,atrim=0:{video_dur:.3f}[a]"
+            )
+            self._run([*inputs, "-filter_complex", ";".join([*filters, mix]), *tail])
             return timeline
         except subprocess.CalledProcessError:
             self._log("旁白混入失败,输出无旁白版本(不影响画面)。")
@@ -324,20 +331,26 @@ class Assembler:
         tail = ["-map", "0:v", "-c:v", "copy", "-c:a", "aac",
                 "-t", f"{duration:.3f}", str(out_path)]
 
+        # 与 mix_narration 同理:先探测音轨,免去一次注定失败的尝试
+        has_audio = self._has_audio(video)
         try:
             self._log(f"混入背景音乐: {bgm.name}")
-            try:
-                # 与原片音轨混音
-                self._run(
-                    [*common,
-                     "-filter_complex", f"{bgm_filter};[0:a][bg]amix=inputs=2:duration=first[a]",
-                     "-map", "[a]", *tail]
-                )
-            except subprocess.CalledProcessError:
-                # 原片无音轨,仅用背景音乐
-                self._run(
-                    [*common, "-filter_complex", bgm_filter, "-map", "[bg]", *tail]
-                )
+            if has_audio is not False:
+                try:
+                    # 与原片音轨混音
+                    self._run(
+                        [*common,
+                         "-filter_complex", f"{bgm_filter};[0:a][bg]amix=inputs=2:duration=first[a]",
+                         "-map", "[a]", *tail]
+                    )
+                    return out_path
+                except subprocess.CalledProcessError:
+                    if has_audio:
+                        raise
+            # 原片无音轨,仅用背景音乐
+            self._run(
+                [*common, "-filter_complex", bgm_filter, "-map", "[bg]", *tail]
+            )
             return out_path
         except subprocess.CalledProcessError:
             self._log("背景音乐混入失败,输出无音乐版本。")
