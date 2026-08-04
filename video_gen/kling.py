@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -49,9 +50,15 @@ class FatalGenerationError(RuntimeError):
 
 
 class KlingGenerator:
-    def __init__(self, config: Config, log: LogFn):
+    def __init__(
+        self,
+        config: Config,
+        log: LogFn,
+        cancel_event: threading.Event | None = None,
+    ):
         self._config = config
         self._log = log
+        self._cancel = cancel_event
         # fal_client 通过 FAL_KEY 环境变量读取凭证
         os.environ["FAL_KEY"] = config.fal_api_key
 
@@ -199,6 +206,12 @@ class KlingGenerator:
         deadline = time.monotonic() + timeout
         last_position = -1
         while True:
+            if self._cancel is not None and self._cancel.is_set():
+                try:
+                    handle.cancel()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise FatalGenerationError("已取消生成")
             try:
                 status = handle.status(with_logs=False)
             except Exception as exc:  # noqa: BLE001
