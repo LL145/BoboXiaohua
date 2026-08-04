@@ -1,8 +1,10 @@
-"""调用 fal.ai 生成素材:主角参考图(文生图)与各镜头视频片段(Kling)。
+"""调用 fal.ai 生成素材:主角参考图(文生图)与各镜头组视频片段(Kling)。
 
-有固定主角时走 reference-to-video:参考图随每个镜头一起送入模型,
-主角外观在整段片段中保持一致(优于仅锁首帧的 image-to-video)。
-任一环节失败都会自动降级为纯文生视频,绝不因参考图问题导致整体失败。
+- 多分镜镜头组:一个镜头组内含多个分镜时,走 Kling 的 multi_prompt 一次性
+  连续生成,组内画面衔接由模型原生保证(优于事后转场拼接);
+- 有固定主角时走 reference-to-video 的 elements 角色元素:参考图作为
+  @Element1 随每个镜头组送入模型,主角外观全片一致(优于仅锁首帧);
+- 任一环节失败都会自动降级为纯文生视频,绝不因参考图问题导致整体失败。
 """
 
 from __future__ import annotations
@@ -35,8 +37,11 @@ def image_is_valid(path: Path) -> bool:
 
 
 def strip_reference_tokens(prompt: str) -> str:
-    """去掉 @Image1 之类的参考图占位符(括号内的外观描述保留),用于降级纯文生。"""
-    return re.sub(r"@Image\d+\s*", "", prompt).strip()
+    """去掉 @Element1/@Image1 之类的占位符(括号内的外观描述保留),用于降级纯文生。
+
+    @Image1 是旧版脚本的参考图占位符,保留以兼容旧 manifest 的断点续传。
+    """
+    return re.sub(r"@(?:Element|Image)\d+\s*", "", prompt).strip()
 
 
 class FatalGenerationError(RuntimeError):
@@ -89,49 +94,76 @@ class KlingGenerator:
 
     # ---------------- 镜头片段 ----------------
 
+    def _build_arguments(
+        self, shot: Shot, reference_url: str | None
+    ) -> tuple[str, dict, bool]:
+        """按镜头组构造 Kling 请求:多分镜走 multi_prompt,有主角走 elements。"""
+        kling = self._config["kling"]
+        combined = shot.combined_prompt.lower()
+        use_reference = bool(reference_url) and (
+            "@element" in combined or "@image" in combined
+        )
+
+        if use_reference:
+            endpoint = str(kling["reference_endpoint"])
+            arguments: dict = {
+                "aspect_ratio": kling["aspect_ratio"],
+                "generate_audio": bool(kling["generate_audio"]),
+            }
+            if "@element" in combined:
+                # elements 角色元素:正面图 + 参考角度图(同图即可满足要求)
+                arguments["elements"] = [{
+                    "frontal_image_url": reference_url,
+                    "reference_image_urls": [reference_url],
+                }]
+            else:
+                # 旧 manifest 的 @Image1 走 image_urls 参考图,保持断点续传兼容
+                arguments["image_urls"] = [reference_url]
+            prompts = [cut.prompt for cut in shot.cuts]
+        else:
+            endpoint = str(kling["text_endpoint"])
+            arguments = {
+                "negative_prompt": shot.negative_prompt,
+                "aspect_ratio": kling["aspect_ratio"],
+                "generate_audio": bool(kling["generate_audio"]),
+            }
+            prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
+
+        if len(shot.cuts) > 1:
+            arguments["multi_prompt"] = [
+                {"prompt": prompt, "duration": str(cut.duration)}
+                for prompt, cut in zip(prompts, shot.cuts)
+            ]
+        else:
+            arguments["prompt"] = prompts[0]
+            arguments["duration"] = str(max(3, shot.duration))
+        return endpoint, arguments, use_reference
+
     def generate_clip(
         self, shot: Shot, out_path: Path, reference_url: str | None = None
     ) -> Path:
-        """生成单个镜头并下载到 out_path;已有有效片段时直接复用(断点续传)。"""
+        """生成单个镜头组并下载到 out_path;已有有效片段时直接复用(断点续传)。"""
         if clip_is_valid(out_path):
-            self._log(f"  镜头 {shot.index} 已存在,跳过生成 ↺")
+            self._log(f"  镜头组 {shot.index} 已存在,跳过生成 ↺")
             return out_path
 
         kling = self._config["kling"]
         max_retries = int(kling["max_retries"])
         timeout = float(kling["shot_timeout"])
-        use_reference = bool(reference_url) and "@image" in shot.prompt.lower()
-
-        if use_reference:
-            endpoint = str(kling["reference_endpoint"])
-            arguments = {
-                "prompt": shot.prompt,
-                "duration": str(shot.duration),
-                "aspect_ratio": kling["aspect_ratio"],
-                "generate_audio": bool(kling["generate_audio"]),
-                "image_urls": [reference_url],
-            }
-        else:
-            endpoint = str(kling["text_endpoint"])
-            arguments = {
-                "prompt": strip_reference_tokens(shot.prompt),
-                "negative_prompt": shot.negative_prompt,
-                "duration": str(shot.duration),
-                "aspect_ratio": kling["aspect_ratio"],
-                "generate_audio": bool(kling["generate_audio"]),
-            }
+        endpoint, arguments, use_reference = self._build_arguments(shot, reference_url)
 
         last_error: Exception | None = None
         for attempt in range(1, max_retries + 2):
             try:
                 self._log(
-                    f"  镜头 {shot.index} 提交 Kling 生成"
+                    f"  镜头组 {shot.index} 提交 Kling 生成"
+                    + (f"({len(shot.cuts)} 个分镜连续生成)" if len(shot.cuts) > 1 else "")
                     + ("(带主角参考图)" if use_reference else "")
                     + (f"(第 {attempt} 次尝试)" if attempt > 1 else "")
                     + " …"
                 )
                 result = self._submit_and_wait(
-                    endpoint, arguments, timeout, label=f"镜头 {shot.index}"
+                    endpoint, arguments, timeout, label=f"镜头组 {shot.index}"
                 )
                 self._download(result["video"]["url"], out_path)
                 if not clip_is_valid(out_path):
@@ -139,17 +171,17 @@ class KlingGenerator:
                 return out_path
             except FatalGenerationError:
                 raise
-            except Exception as exc:  # noqa: BLE001 - 逐镜头重试,最终仍会抛出
+            except Exception as exc:  # noqa: BLE001 - 逐镜头组重试,最终仍会抛出
                 last_error = exc
-                self._log(f"  镜头 {shot.index} 第 {attempt} 次尝试失败: {exc}")
+                self._log(f"  镜头组 {shot.index} 第 {attempt} 次尝试失败: {exc}")
                 if attempt <= max_retries:
                     time.sleep(min(3 * attempt, 15))
 
         if use_reference:
-            # 参考图模式反复失败 → 降级为纯文生视频(该镜头一致性略降,但保住成片)
-            self._log(f"  镜头 {shot.index} 参考图模式多次失败,降级为纯文生视频重试 …")
+            # 参考图模式反复失败 → 降级为纯文生视频(该组一致性略降,但保住成片)
+            self._log(f"  镜头组 {shot.index} 参考图模式多次失败,降级为纯文生视频重试 …")
             return self.generate_clip(shot, out_path, reference_url=None)
-        raise RuntimeError(f"镜头 {shot.index} 多次生成失败: {last_error}") from last_error
+        raise RuntimeError(f"镜头组 {shot.index} 多次生成失败: {last_error}") from last_error
 
     # ---------------- fal 任务提交与等待 ----------------
 

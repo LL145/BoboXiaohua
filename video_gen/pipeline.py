@@ -1,13 +1,16 @@
-"""生成流水线:一句话描述 → 分镜脚本 → 主角参考图 → 并行逐镜头生成 → 拼接成片。
+"""生成流水线:一句话描述 → 分镜脚本 → 主角参考图 → 并行逐镜头组生成
+→ 旁白配音 → 拼接成片(转场/旁白/背景音乐/字幕)。
 
 稳健性设计:
 - 生成前预检:先校验 OpenRouter KEY 与磁盘空间,配错即刻提示,不浪费费用;
-- 断点续传:同一描述的未完成任务会复用已有分镜脚本、参考图和已生成片段,
-  失败后再次点击「生成」只补齐缺失的镜头,不重复扣费;
-- 主角参考图:导演模型判断有固定主角时自动生成参考图并走 reference-to-video,
-  锁定全片角色外观;参考图任何一步失败都自动降级为纯文生视频;
-- 并行生成:多个镜头同时提交 Kling,总耗时约等于单个镜头;
-- 单镜头独立重试 + 超时看门狗,KEY 无效等致命错误立即终止,不空耗重试;
+- 断点续传:同一描述的未完成任务会复用已有分镜脚本、参考图、旁白音频和
+  已生成片段,失败后再次点击「生成」只补齐缺失部分,不重复扣费;
+- 主角参考图:导演模型判断有固定主角时自动生成参考图并作为角色元素
+  (@Element1)送入每个镜头组;参考图任何一步失败都自动降级为纯文生视频;
+- 并行生成:多个镜头组同时提交 Kling,总耗时约等于单个镜头组;
+- 单镜头组独立重试 + 超时看门狗,KEY 无效等致命错误立即终止,不空耗重试;
+- 旁白与字幕:导演判断影片需要解说时,用 Edge TTS 合成旁白并生成字幕;
+  TTS 不可用、混音或字幕失败,都只是放弃对应环节,绝不影响画面成片;
 - 运行日志同步写入任务目录 log.txt,便于排查问题;
 - 背景音乐:程序目录 music/ 下有音频文件时,由导演模型按影片情绪挑选混入。
 """
@@ -26,6 +29,7 @@ from typing import Callable
 
 import requests
 
+from . import tts
 from .assembler import Assembler
 from .config import Config, app_dir
 from .director import Director, Storyboard
@@ -78,9 +82,16 @@ class Pipeline:
         )
         self._logfile = run_dir / "log.txt"
         log(f"《{storyboard.title}》—— {storyboard.logline}")
-        log(f"共 {len(storyboard.shots)} 个镜头,预计总时长约 {storyboard.total_duration} 秒:")
+        log(f"共 {len(storyboard.shots)} 个镜头组,预计总时长约 {storyboard.total_duration} 秒:")
         for shot in storyboard.shots:
-            log(f"  {shot.index}. {shot.title}({shot.duration}s)")
+            detail = f",{len(shot.cuts)} 个分镜" if len(shot.cuts) > 1 else ""
+            if shot.narration.strip():
+                detail += ",含旁白"
+            log(f"  {shot.index}. {shot.title}({shot.duration}s{detail})")
+        log(
+            "  声音设计:解说型(旁白 + 字幕)" if storyboard.has_narration
+            else "  声音设计:沉浸型(原生音效与台词)"
+        )
 
         pending = [
             s for s in storyboard.shots
@@ -136,23 +147,98 @@ class Pipeline:
 
         clips = [run_dir / f"shot_{s.index:02d}.mp4" for s in storyboard.shots]
 
-        # 4. ffmpeg 拼接 + 背景音乐
-        log("④ 正在拼接成片 …")
+        # 4. 旁白配音(导演判断影片需要解说时;失败只丢旁白,不影响成片)
+        narration_cfg = config["narration"]
+        narration_audio: dict[int, Path] = {}
+        step = 4
+        if storyboard.has_narration and bool(narration_cfg["enabled"]):
+            log("④ 合成旁白配音(Edge TTS)…")
+            narration_audio = tts.synthesize_all(
+                storyboard, run_dir, str(narration_cfg["voice"]), log
+            )
+            step = 5
+
+        # 5. ffmpeg 拼接:转场 → 旁白 → 背景音乐 → 字幕,逐级可降级
+        log(f"{'④⑤⑥⑦⑧'[step - 4]} 正在拼接成片 …")
         final_path = run_dir / f"{_safe_name(storyboard.title)}.mp4"
+        stage_path = run_dir / "_stage_concat.mp4"
+        _, offsets = assembler.concat(
+            clips, stage_path,
+            fallback_durations=[float(s.duration) for s in storyboard.shots],
+        )
+        current = stage_path
+
+        srt_path: Path | None = None
+        if narration_audio:
+            current, srt_path = self._apply_narration(
+                assembler, storyboard, narration_audio, offsets, current, run_dir
+            )
+
         bgm = self._pick_bgm(storyboard, bgm_tracks)
-        if bgm is None:
-            assembler.concat(clips, final_path)
-        else:
-            concat_path = run_dir / "_concat.mp4"
-            assembler.concat(clips, concat_path)
-            duration = assembler.probe_duration(concat_path) or float(
+        if bgm is not None:
+            duration = assembler.probe_duration(current) or float(
                 storyboard.total_duration
             )
-            assembler.add_bgm(concat_path, bgm, duration, final_path)
-            concat_path.unlink(missing_ok=True)
+            bgm_path = run_dir / "_stage_bgm.mp4"
+            assembler.add_bgm(current, bgm, duration, bgm_path)
+            current = bgm_path
+
+        if srt_path is not None and bool(narration_cfg["subtitles"]):
+            subtitled_path = run_dir / "_stage_subtitled.mp4"
+            if assembler.embed_subtitles(current, srt_path, subtitled_path):
+                current = subtitled_path
+
+        current.replace(final_path)
+        for leftover in run_dir.glob("_stage_*.mp4"):
+            leftover.unlink(missing_ok=True)
 
         log(f"✅ 完成!成片已保存: {final_path}")
         return final_path
+
+    # ---------------- 旁白混音与字幕 ----------------
+
+    def _apply_narration(
+        self,
+        assembler: Assembler,
+        storyboard: Storyboard,
+        narration_audio: dict[int, Path],
+        offsets: list[float],
+        current: Path,
+        run_dir: Path,
+    ) -> tuple[Path, Path | None]:
+        """把旁白混入成片并生成字幕文件;失败时沿用无旁白版本。"""
+        total = assembler.probe_duration(current) or float(storyboard.total_duration)
+        segments: list[tuple[float, Path, float]] = []
+        segment_shots = []
+        for i, shot in enumerate(storyboard.shots):
+            audio = narration_audio.get(shot.index)
+            if audio is None:
+                continue
+            start = offsets[i]
+            end = offsets[i + 1] if i + 1 < len(offsets) else total
+            slot = max(1.0, end - start - 0.3)  # 留 0.3 秒呼吸,避免串到下一组
+            segments.append((start, audio, slot))
+            segment_shots.append(shot)
+
+        narration_path = run_dir / "_stage_narration.mp4"
+        timeline = assembler.mix_narration(
+            current, segments, narration_path,
+            volume=float(self._config["narration"]["volume"]),
+        )
+        if timeline is None:
+            return current, None
+
+        entries: list[tuple[float, float, str]] = []
+        for (start, effective), shot in zip(timeline, segment_shots):
+            entries += tts.narration_srt_entries(
+                shot.narration.strip(), start, effective
+            )
+        srt_path = run_dir / f"{_safe_name(storyboard.title)}.srt"
+        try:
+            srt_path.write_text(tts.build_srt(entries), encoding="utf-8")
+        except OSError:
+            return narration_path, None
+        return narration_path, srt_path
 
     # ---------------- 预检 ----------------
 
@@ -299,10 +385,11 @@ class Pipeline:
             lines.append(f"背景音乐: {storyboard.bgm_file}")
         lines.append("")
         for shot in storyboard.shots:
-            lines += [
-                f"—— 镜头 {shot.index}: {shot.title}({shot.duration}s)",
-                f"prompt: {shot.prompt}",
-                f"negative: {shot.negative_prompt}",
-                "",
-            ]
+            lines.append(f"—— 镜头组 {shot.index}: {shot.title}({shot.duration}s)")
+            if shot.narration.strip():
+                lines.append(f"旁白: {shot.narration.strip()}")
+            for j, cut in enumerate(shot.cuts, start=1):
+                prefix = f"分镜 {j}({cut.duration}s)" if len(shot.cuts) > 1 else "prompt"
+                lines.append(f"{prefix}: {cut.prompt}")
+            lines += [f"negative: {shot.negative_prompt}", ""]
         return "\n".join(lines)

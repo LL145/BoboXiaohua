@@ -62,6 +62,12 @@ _DEFAULTS: dict[str, Any] = {
         "shot_timeout": 1500,
     },
     "image": {"endpoint": "fal-ai/nano-banana-2"},
+    "narration": {
+        "enabled": True,
+        "voice": "zh-CN-XiaoxiaoNeural",
+        "volume": 1.0,
+        "subtitles": True,
+    },
     "video": {
         "target_duration": 60,
         "output_dir": "output",
@@ -126,6 +132,8 @@ class Config:
             problems.append("kling.clip_duration 需在 3~15 秒之间")
         if float(self._data["video"]["transition"]) < 0:
             problems.append("video.transition 不能为负数")
+        if not 0 <= float(self._data["narration"]["volume"]) <= 2:
+            problems.append("narration.volume 需在 0~2 之间")
         return problems
 
 

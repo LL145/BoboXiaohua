@@ -65,6 +65,18 @@ def ensure_pyinstaller() -> None:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller"])
 
 
+def ensure_requirements() -> None:
+    """确保运行依赖齐全(尤其 edge-tts),漏装会导致打包版缺少旁白配音功能。"""
+    if any(
+        importlib.util.find_spec(mod) is None
+        for mod in ("fal_client", "yaml", "requests", "edge_tts")
+    ):
+        print(">> 安装运行依赖 …")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "-r", str(ROOT / "requirements.txt")]
+        )
+
+
 def _download(url: str, dest: Path, attempts: int = 3) -> None:
     request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     for attempt in range(1, attempts + 1):
@@ -142,6 +154,7 @@ def _platform_tag() -> str:
 
 
 def main() -> None:
+    ensure_requirements()
     ensure_pyinstaller()
     bundle_ffmpeg = ensure_ffmpeg()
     sep = ";" if sys.platform == "win32" else ":"
