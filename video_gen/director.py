@@ -1,7 +1,7 @@
 """LLM 担任编剧 + 导演:把一句话描述扩写成完整的分镜脚本。
 
 通过 OpenRouter(OpenAI 兼容接口)调用,可在 config.yaml 中切换任意模型;
-默认使用 anthropic/claude-fable-5(reasoning effort: high)。
+默认使用 qwen/qwen3.8-max(reasoning effort: high)。
 """
 
 from __future__ import annotations
@@ -20,12 +20,18 @@ from .config import Config
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 _RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504, 524}
 
-# Kling 3 的时长约束(秒):一个镜头组一次生成,总长 3~15;
-# 组内单个分镜(multi_prompt 元素)最短可到 1 秒
+# 镜头组时长约束(秒):一个镜头组一次生成,总长下限随引擎而异
+# (Kling 3 为 3 秒,Seedance 2.0 为 4 秒),上限均为 15;
+# 组内单个分镜最短可到 1 秒
 _MIN_GROUP_SECONDS = 3
+_SEEDANCE_MIN_GROUP_SECONDS = 4
 _MAX_GROUP_SECONDS = 15
 _MIN_CUT_SECONDS = 1
-_MAX_CUTS_PER_GROUP = 6  # Kling multi_prompt 上限
+_MAX_CUTS_PER_GROUP = 6  # Kling multi_prompt 上限,Seedance 沿用同一节奏约束
+
+
+def _engine_min_group(engine: str) -> int:
+    return _SEEDANCE_MIN_GROUP_SECONDS if engine == "seedance" else _MIN_GROUP_SECONDS
 # Kling 对 multi_prompt 单条分镜提示词有 512 字符硬上限(超长直接 422 拒绝),
 # 要求模型控制在 450 以内留出余量;kling.py 提交前还会做最终钳制兜底
 _MAX_PROMPT_CHARS = 450
@@ -197,7 +203,8 @@ _STORYBOARD_SCHEMA = {
                         "type": "array",
                         "description": (
                             "Cuts inside this group, 1-6 items; sum of durations "
-                            "must be 3-15 seconds"
+                            "must stay within the group-length range given in "
+                            "the system prompt"
                         ),
                         "items": {
                             "type": "object",
@@ -237,11 +244,12 @@ _STORYBOARD_SCHEMA = {
     "additionalProperties": False,
 }
 
-# 按 Kling 3 多分镜(multi_prompt)最佳实践设计:
+# 按视频模型多镜头最佳实践设计:
 # 影片 = 镜头组序列;每组一次连续生成(组内衔接由模型原生保证),组间交叉溶解。
 _SYSTEM_PROMPT = """\
-你是一位资深短视频编剧兼导演,擅长把一两句话的创意扩写成适合 AI 文生视频模型(Kling 3)\
-生成的分镜脚本。用户只提供简短创意,其余全部由你专业决定,不要留下待用户选择的空间。
+你是一位资深短视频编剧兼导演,擅长把一两句话的创意扩写成适合 AI 文生视频模型\
+({engine_name})生成的分镜脚本。用户只提供简短创意,其余全部由你专业决定,\
+不要留下待用户选择的空间。
 
 ## 结构:镜头组(shots)与分镜(cuts)
 成片目标总时长约 {target} 秒。影片由若干"镜头组"顺序拼接而成:
@@ -249,7 +257,8 @@ _SYSTEM_PROMPT = """\
 组内分镜之间的画面衔接、运动连续性由模型原生保证——因此同一场景内的连续动作、\
 景别推进、正反打应放进同一组;切换场景、时间跳跃、叙事段落转折时才另起一组;
 - 组间拼接使用交叉溶解转场,适合承担章节感的切换;
-- 每个分镜 duration 为 1~15 的整数(秒);一个组内全部分镜时长之和必须为 3~15 秒;
+- 每个分镜 duration 为 1~15 的整数(秒);一个组内全部分镜时长之和必须为 \
+{group_min}~15 秒;
 - 全部镜头组时长之和必须落在 {total_min}~{total_max} 秒之间,尽量接近 {target} 秒;
 - 节奏由你掌控:动作、冲突、快切用 1~3 秒的短分镜(放在同一组内连续快切),\
 常规叙事用 4~8 秒,氛围铺陈、情绪高潮、收尾用 9~15 秒的单分镜组;不要所有分镜等长。
@@ -377,8 +386,12 @@ class Director:
         "9:16": "本片为竖屏 9:16(手机短视频),请按竖屏构图设计画面与镜头运动。",
         "16:9": "本片为横屏 16:9,请按横屏电影感构图设计画面与镜头运动。",
         "1:1": "本片为方形 1:1 画幅,请按居中构图设计画面。",
-        # 3:4 / 4:3 由相邻原生画幅生成后居中裁剪(见 kling.generation_aspect),
-        # 因此提醒导演把关键内容放在画面中部,避免被裁掉
+        "3:4": "本片为竖幅 3:4 画幅,请按竖幅居中构图设计画面与镜头运动。",
+        "4:3": "本片为横幅 4:3 画幅,请按经典横幅构图设计画面与镜头运动。",
+    }
+    # Kling 端点不原生支持 3:4 / 4:3:由相邻原生画幅生成后居中裁剪
+    # (见 kling.kling_generation_aspect),提醒导演把关键内容放在画面中部
+    _KLING_CROP_NOTES = {
         "3:4": (
             "本片为竖幅 3:4 画幅(先按 9:16 生成,成片时上下居中裁剪出 3:4),"
             "请把主体与关键动作放在画面竖直方向的中部,不要依赖画面顶部与底部边缘。"
@@ -399,21 +412,29 @@ class Director:
     ) -> Storyboard:
         # 镜头组数量与各分镜时长由导演模型按叙事节奏决定,
         # 只约束总时长落在目标值 ±15% 内;clip_duration 仅作缺省回退值。
-        fallback_duration = int(self._config["kling"]["clip_duration"])
-        target = int(self._config["video"]["target_duration"])
-        total_min = max(_MIN_GROUP_SECONDS, round(target * 0.85))
+        config = self._config
+        fallback_duration = int(config["video"]["clip_duration"])
+        engine = config.engine
+        min_group = _engine_min_group(engine)
+        target = int(config["video"]["target_duration"])
+        total_min = max(min_group, round(target * 0.85))
         total_max = round(target * 1.15)
         # 防御模型跑飞:即使全用最短镜头组,也不该超过这个组数
-        max_shots = max(1, -(-total_max // _MIN_GROUP_SECONDS))
+        max_shots = max(1, -(-total_max // min_group))
 
         system = _SYSTEM_PROMPT.format(
+            engine_name=config.engine_name,
+            group_min=min_group,
             target=target,
             total_min=total_min,
             total_max=total_max,
         )
 
         user_message = f"请为以下创意撰写分镜脚本:\n\n{description}"
-        note = self._ASPECT_NOTES.get(str(aspect_ratio).strip())
+        aspect = str(aspect_ratio).strip()
+        note = self._ASPECT_NOTES.get(aspect)
+        if engine == "kling":  # Kling 的 3:4/4:3 经裁剪实现,构图提示不同
+            note = self._KLING_CROP_NOTES.get(aspect, note)
         if note:
             user_message += f"\n\n{note}"
         if has_user_image:
@@ -512,19 +533,23 @@ class Director:
 
         content = message.get("content") or ""
         parsed = _extract_json(content)
-        return self._build_storyboard(parsed, max_shots, fallback_duration)
+        return self._build_storyboard(parsed, max_shots, fallback_duration, min_group)
 
     # ---------------- 结果组装 ----------------
 
     @staticmethod
-    def _build_cuts(raw: dict, fallback_duration: int) -> list[Cut]:
-        """解析并钳制一个镜头组的分镜:单分镜 1~15 秒,组总长 3~15 秒。"""
+    def _build_cuts(
+        raw: dict, fallback_duration: int, min_group: int = _MIN_GROUP_SECONDS
+    ) -> list[Cut]:
+        """解析并钳制一个镜头组的分镜:单分镜 1~15 秒,组总长 min_group~15 秒。"""
         raw_cuts = raw.get("cuts")
         if not isinstance(raw_cuts, list) or not raw_cuts:
             # 模型未按新结构输出时,兼容平铺的 prompt/duration
             return [Cut(
                 prompt=str(raw.get("prompt", "")),
-                duration=_clamp_duration(raw.get("duration"), fallback_duration),
+                duration=_clamp_duration(
+                    raw.get("duration"), fallback_duration, minimum=min_group
+                ),
             )]
         cuts = [
             Cut(
@@ -536,12 +561,12 @@ class Director:
             for c in raw_cuts[:_MAX_CUTS_PER_GROUP]
         ]
         if len(cuts) == 1:
-            cuts[0].duration = max(_MIN_GROUP_SECONDS, cuts[0].duration)
+            cuts[0].duration = max(min_group, cuts[0].duration)
             return cuts
-        # 组总长不足 Kling 下限时,逐秒补齐最短的分镜
-        while sum(c.duration for c in cuts) < _MIN_GROUP_SECONDS:
+        # 组总长不足引擎下限时,逐秒补齐最短的分镜
+        while sum(c.duration for c in cuts) < min_group:
             min(cuts, key=lambda c: c.duration).duration += 1
-        # 组总长超过 Kling 上限时按比例压缩,再逐一削减到不超过 15 秒
+        # 组总长超过上限时按比例压缩,再逐一削减到不超过 15 秒
         total = sum(c.duration for c in cuts)
         if total > _MAX_GROUP_SECONDS:
             scale = _MAX_GROUP_SECONDS / total
@@ -555,7 +580,13 @@ class Director:
         return cuts
 
     @classmethod
-    def _build_storyboard(cls, data: dict, max_shots: int, fallback_duration: int) -> Storyboard:
+    def _build_storyboard(
+        cls,
+        data: dict,
+        max_shots: int,
+        fallback_duration: int,
+        min_group: int = _MIN_GROUP_SECONDS,
+    ) -> Storyboard:
         raw_shots = data["shots"][:max_shots]
         if not raw_shots:
             raise KeyError("shots 为空")
@@ -565,7 +596,7 @@ class Director:
                 title=str(raw["title"]),
                 negative_prompt=str(raw.get("negative_prompt", "")),
                 narration=str(raw.get("narration", "")).strip(),
-                cuts=cls._build_cuts(raw, fallback_duration),
+                cuts=cls._build_cuts(raw, fallback_duration, min_group),
             )
             for i, raw in enumerate(raw_shots)
         ]

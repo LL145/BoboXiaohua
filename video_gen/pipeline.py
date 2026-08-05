@@ -8,7 +8,8 @@
 - 主角参考图:用户可上传主角图片(随创意发给导演模型照图写外观描述),
   未上传时导演模型判断有固定主角则自动文生图;参考图作为角色元素
   (@Element1)送入每个镜头组,任何一步失败都自动降级为纯文生视频;
-- 并行生成:多个镜头组同时提交 Kling,总耗时约等于单个镜头组;
+- 并行生成:多个镜头组同时提交视频引擎(默认 Seedance 2.0,可切 Kling),
+  总耗时约等于单个镜头组;
 - 单镜头组独立重试 + 超时看门狗,KEY 无效等致命错误立即终止,不空耗重试;
 - 旁白与字幕:导演判断影片需要解说时,用 Edge TTS 合成旁白并生成字幕;
   TTS 不可用、混音或字幕失败,都只是放弃对应环节,绝不影响画面成片;
@@ -91,7 +92,7 @@ class Pipeline:
         """
         if reference_image is not None:
             reference_image = Path(reference_image)
-        from .kling import FatalGenerationError, KlingGenerator, clip_is_valid
+        from .kling import FatalGenerationError, clip_is_valid, create_generator
 
         config = self._config
         log = self._log
@@ -130,7 +131,7 @@ class Pipeline:
         done_before = len(storyboard.shots) - len(pending)
 
         # 费用预估:只计待生成的镜头秒数,已复用的镜头不重复计费
-        price = float(config["kling"]["price_per_second"])
+        price = float(config.engine_section["price_per_second"])
         if pending and price > 0:
             seconds = sum(s.duration for s in pending)
             log(
@@ -139,7 +140,7 @@ class Pipeline:
             )
 
         self._check_cancel()
-        generator = KlingGenerator(config, log, cancel_event=self._cancel)
+        generator = create_generator(config, log, cancel_event=self._cancel)
 
         # 2. 主角参考图(用户上传优先;否则导演判断有固定主角时自动生成;
         # 失败自动降级纯文生)
@@ -150,12 +151,15 @@ class Pipeline:
                 generator, run_dir, storyboard, reference_image
             )
 
-        # 3. Kling 并行生成各镜头
-        concurrency = max(1, int(config["kling"]["concurrency"]))
+        # 3. 视频引擎并行生成各镜头
+        concurrency = max(1, int(config["video"]["concurrency"]))
         if done_before:
             log(f"③ 已有 {done_before} 个镜头可复用,补齐剩余 {len(pending)} 个 …")
         else:
-            log(f"③ Kling 并行生成 {len(pending)} 个镜头(并发 {concurrency},约需十几分钟)…")
+            log(
+                f"③ {config.engine_name} 并行生成 {len(pending)} 个镜头"
+                f"(并发 {concurrency},约需十几分钟)…"
+            )
         self._shot_progress(done_before, len(storyboard.shots))
 
         if pending:
@@ -220,12 +224,10 @@ class Pipeline:
         )
         current = stage_path
 
-        # 3:4 / 4:3 等 Kling 不原生支持的画幅:片段按相邻原生画幅生成,
+        # 引擎不原生支持的画幅(Kling 的 3:4 / 4:3):片段按相邻原生画幅生成,
         # 在此居中裁剪出目标画幅(须在字幕烧录前,失败沿用生成画幅)
-        from .kling import generation_aspect
-
-        aspect = str(config["kling"]["aspect_ratio"])
-        if generation_aspect(aspect) != aspect:
+        aspect = str(config["video"]["aspect_ratio"])
+        if generator.generation_aspect(aspect) != aspect:
             self._check_cancel()
             self._report_progress(88, "裁剪画幅")
             crop_path = run_dir / "_stage_crop.mp4"
@@ -370,7 +372,7 @@ class Pipeline:
         # fal key 探测:查询一个不存在的任务,零费用;key 无效时 fal 返回 401/403,
         # 有效时仅是任务不存在(404 等),其余状态一律放行
         try:
-            endpoint = str(self._config["kling"]["text_endpoint"])
+            endpoint = str(self._config.engine_section["text_endpoint"])
             app_root = "/".join(endpoint.split("/")[:2])
             resp = requests.get(
                 f"https://queue.fal.run/{app_root}/requests/"
@@ -452,8 +454,9 @@ class Pipeline:
     ) -> tuple[Path, Storyboard]:
         """同一描述且未产出成片的任务目录 → 恢复;否则新建目录并请 LLM 写分镜。"""
         key = _description_key(description)
-        aspect = str(self._config["kling"]["aspect_ratio"])
+        aspect = str(self._config["video"]["aspect_ratio"])
         target = int(self._config["video"]["target_duration"])
+        engine = self._config.engine
 
         for candidate in sorted(self._config.output_dir.glob(f"*_{key}*"), reverse=True):
             manifest_path = candidate / _MANIFEST_NAME
@@ -468,6 +471,10 @@ class Pipeline:
                     continue
                 # 目标时长不同的旧任务不续传(分镜脚本按旧时长设计)
                 if int(manifest.get("target_duration", target)) != target:
+                    continue
+                # 引擎不同的旧任务不续传(画质风格与分镜约束不同,不混拼;
+                # 旧 manifest 无 engine 字段,均为 Kling 时代的任务)
+                if manifest.get("engine", "kling") != engine:
                     continue
                 storyboard = Storyboard.from_dict(manifest["storyboard"])
             except Exception:  # noqa: BLE001 - 损坏的 manifest 直接忽略
@@ -495,6 +502,7 @@ class Pipeline:
             "description": description,
             "aspect_ratio": aspect,
             "target_duration": target,
+            "engine": engine,
             "storyboard": storyboard.to_dict(),
         }
         (run_dir / _MANIFEST_NAME).write_text(
