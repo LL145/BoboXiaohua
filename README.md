@@ -1,4 +1,4 @@
-# AI 短视频生成器(OpenRouter × Kling)
+# AI 短视频生成器(OpenRouter × fal.ai)
 
 跨平台桌面小工具(Windows / macOS / Linux):输入一句话描述,点击「生成」,自动产出一条约 **60 秒**的高质量短视频。
 
@@ -9,16 +9,17 @@
    │
    ▼
 ① LLM 导演(经 OpenRouter)     → 扩写为分镜脚本,镜头数量与每镜头时长
-   │                             (3~15 秒)由导演按叙事节奏决定
-   │  默认 Claude Fable 5 (high)     可换 OpenRouter 上任意模型
+   │                              由导演按叙事节奏决定
+   │  默认 Qwen3.8-Max (high)       可换 OpenRouter 上任意模型
    │                              并判断是否存在贯穿全片的主角
    ▼
 ② 主角参考图(Nano Banana 2)   → 有主角时自动生成一张参考图(约 $0.08)
    │                              无主角(纯风景等)则跳过
    ▼
-③ Kling 3(fal.ai)             → 多镜头并行生成,自带环境音效
+③ Seedance 2.0(fal.ai)        → 多镜头并行生成,自带音效与配音
    │  有主角: reference-to-video    参考图随每个镜头送入,全片角色外观一致
    │  无主角: text-to-video         失败自动降级/重试,断点续传
+   │  可切换 Kling 3 引擎(费用更低,config.yaml 一行切换)
    ▼
 ④ ffmpeg                        → 交叉溶解转场 + 首尾淡入淡出;
    │                              music/ 里有音频则由导演按情绪挑选混入
@@ -28,14 +29,14 @@ output/日期_标题/标题.mp4
 
 内部稳健性设计(用户无需任何设置):
 
-- **角色一致性**:业界公认做法——先生成主角参考图,再用 Kling 的 reference-to-video
+- **角色一致性**:业界公认做法——先生成主角参考图,再用 reference-to-video
   把参考图带入每个镜头,主角外观在整段片段中保持一致(优于仅锁首帧的 image-to-video)。
   是否需要参考图由导演模型自动判断;参考图任何一步失败都自动降级为纯文生视频,绝不影响出片;
 - **并行生成 + 看门狗**:多个镜头同时提交,单镜头独立重试并带超时保护;
   KEY 无效、余额不足等致命错误立即终止,不空耗等待;
 - **断点续传**:分镜脚本、参考图与已完成片段落盘保存,同一描述再次生成时自动续接,不重复扣费;
 - **生成前预检**:先校验 OpenRouter KEY 与磁盘空间,配错即刻提示;
-- **成片质感**:镜头间交叉溶解转场、首尾淡入淡出、Kling 3 原生环境音效;
+- **成片质感**:镜头间交叉溶解转场、首尾淡入淡出、视频模型原生音效与配音;
 - **背景音乐**:把 mp3 放进 `music/` 文件夹,导演模型会按影片情绪挑选一首混入
   (压低音量、结尾淡出),文件夹为空则不加;
 - **运行日志**:每次任务的完整日志写入任务目录 `log.txt`,便于排查问题。
@@ -81,10 +82,12 @@ openrouter_api_key: "sk-or-..."   # https://openrouter.ai/settings/keys
 fal_api_key: "..."                # https://fal.ai/dashboard/keys
 ```
 
-默认已选用各环节当前最强的模型:编剧/导演为 **Claude Fable 5**(思考深度 high),
-视频为 **Kling 3 Pro**(原生音效),参考图为 **Nano Banana 2**。
+默认已选用各环节当前先进的模型:编剧/导演为 **Qwen3.8-Max**(思考深度 high),
+视频为 **Seedance 2.0**(720p,原生音效与配音),参考图为 **Nano Banana 2**。
 想换模型只需改对应端点/模型 ID 一行,注释里有说明——例如 `llm.model` 支持
-OpenRouter 上的任意模型(如 `openai/gpt-5.2`、`google/gemini-3-pro`、`deepseek/deepseek-r2`)。
+OpenRouter 上的任意模型(如 `anthropic/claude-fable-5`、`openai/gpt-5.2`、
+`google/gemini-3-pro`);把 `video.engine` 改为 `kling` 即切换到 **Kling 3 Pro**
+视频引擎(费用约为 Seedance 的一半)。
 
 ## 使用
 
@@ -93,10 +96,11 @@ OpenRouter 上的任意模型(如 `openai/gpt-5.2`、`google/gemini-3-pro`、`de
 在窗口里输入一句话描述,选择画幅——**横屏 16:9**(B 站/YouTube)、**竖屏 9:16**
 (抖音/快手/视频号)、**方形 1:1**、**横幅 4:3** 或**竖幅 3:4**(小红书等),
 再选择大约时长(**30 秒 / 1 分钟 / 2 分钟**),点击「🎬 生成视频」。
-全程约十几分钟(Kling 每个镜头需要数分钟),进度条按镜头推进,日志实时显示,
+全程约十几分钟(视频模型每个镜头需要数分钟),进度条按镜头推进,日志实时显示,
 完成后点击「打开成片」。
-导演模型会按所选画幅与时长设计构图和节奏;4:3 与 3:4 由相邻画幅生成后自动居中裁剪。
-画幅或时长不同的未完成任务互相独立、各自断点续传。
+导演模型会按所选画幅与时长设计构图和节奏(Kling 引擎下 4:3 与 3:4 由相邻画幅
+生成后自动居中裁剪,Seedance 原生支持全部画幅)。
+画幅、时长或引擎不同的未完成任务互相独立、各自断点续传。
 
 想指定主角长相时,可点「🖼 上传主角图片(可选)」选择一张图片(如宠物照片、
 角色设定图):该图会作为参考图锁定全片主角外观,导演模型也会照着图撰写分镜;
@@ -130,14 +134,17 @@ output/20260803_153000_雨巷橘猫/
 - **macOS 提示"已损坏"或"无法验证开发者"** — 因为程序未做付费签名。首次启动请
   右键(按住 Control 点击)→ 打开;若仍被拦截,在终端执行
   `xattr -cr AI短视频生成器.app` 后再打开。
-- **想换 Kling 版本** — 修改 `config.yaml` 中 `kling.text_endpoint` / `kling.reference_endpoint`,
-  可选端点见 [fal.ai 模型页](https://fal.ai/models)。注意旧版 Kling(2.x)仅支持 5/10 秒镜头且无原生音效。
+- **想换视频引擎/版本** — `video.engine` 可选 `seedance`(默认)或 `kling`;
+  各引擎的端点在 `seedance.*` / `kling.*` 中修改,可选端点见
+  [fal.ai 模型页](https://fal.ai/models)。注意旧版 Kling(2.x)仅支持 5/10 秒镜头且无原生音效。
 - **想换编剧模型** — 修改 `config.yaml` 中 `llm.model` 为 OpenRouter 上的任意模型 ID;
   `llm.reasoning_effort` 控制思考深度(不支持思考的模型自动忽略)。
-- **想省钱** — `kling.generate_audio: false` 可关闭原生音效,视频费用约省 1/3;
-  也可把端点换成 Kling 3 Standard(`v3/standard/...`,约 75 折)或旧版 2.x。
-- **费用参考**(以 fal.ai 实时定价为准)— 60 秒成片:Kling 3 Pro 含音效约 $10,
-  关音效约 $6.7;参考图 $0.08;分镜脚本几美分到几十美分(视模型而定)。
+- **想省钱** — 把 `video.engine` 改为 `kling`(约 $0.168/秒,费用约为 Seedance 的一半),
+  或把 `seedance.resolution` 降到 `480p`;Kling 引擎下 `video.generate_audio: false`
+  还能再省约 1/3(Seedance 开关音效同价)。
+- **费用参考**(以 fal.ai 实时定价为准)— 60 秒成片:Seedance 2.0 标准档 720p 约
+  $18(1080p 约 $41);Kling 3 Pro 含音效约 $10,关音效约 $6.7;参考图 $0.08;
+  分镜脚本几美分到几十美分(视模型而定)。
 
 ## 发布新版本(维护者)
 

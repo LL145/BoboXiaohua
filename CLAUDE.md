@@ -30,28 +30,38 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
 
 一次生成 = `Pipeline.run()`(pipeline.py)串起以下阶段,数据流单向:
 
-1. **director.py** — LLM 编剧+导演,经 OpenRouter(OpenAI 兼容接口)把一句话扩写为
-   `Storyboard`(含镜头组 `Shot` 列表,每组内含 1~6 个分镜 `Cut`)。组内分镜由 Kling
-   一次连续生成(multi_prompt,组总长 3~15 秒、单分镜 1~15 秒),组间才用转场;
+1. **director.py** — LLM 编剧+导演(默认 `qwen/qwen3.8-max`),经 OpenRouter
+   (OpenAI 兼容接口)把一句话扩写为 `Storyboard`(含镜头组 `Shot` 列表,每组内含
+   1~6 个分镜 `Cut`)。组内分镜由视频引擎一次连续生成,组间才用转场;
+   组总长上限 15 秒、下限随引擎(Kling 3 秒、Seedance 4 秒,`_engine_min_group`),
    代码约束总时长在 `video.target_duration` ±15% 内并用 `_clamp_duration`/`_build_cuts`
-   钳制;`kling.clip_duration` 仅是模型未给时长时的回退值。单条分镜 prompt 要求模型
-   控制在 450 字符内(Kling multi_prompt 有 512 字符硬上限)。用户可上传主角图片:
+   钳制;`video.clip_duration` 仅是模型未给时长时的回退值。单条分镜 prompt 要求模型
+   控制在 450 字符内(Kling multi_prompt 有 512 字符硬上限)。系统提示词按引擎渲染
+   (`{engine_name}`/`{group_min}`);Kling 下 3:4/4:3 画幅用裁剪构图提示
+   (`_KLING_CROP_NOTES`)。用户可上传主角图片:
    随创意以多模态消息发给导演模型照图撰写 @Element1 外观描述,模型不支持图片输入时
    自动去图重试(文字说明仍告知存在用户参考图)。导演同时决定声音形态:
    解说型逐组写中文旁白(`narration` 字段),沉浸型全部置空;角色台词直接写进分镜
-   prompt(中文引号台词),由 Kling 原生配音。请求带 `response_format: json_schema`,
+   prompt(中文引号台词),由视频模型原生配音。请求带 `response_format: json_schema`,
    不支持结构化输出的模型由 `_extract_json` 容错兜底。
-2. **kling.py** — `KlingGenerator` 调 fal.ai 逐镜头组生成视频。参考图优先用用户上传的
-   主角图片(pipeline 复制进任务目录并上传),否则有固定主角时先文生图,作为
-   `elements` 角色元素(prompt 中 `@Element1`)送入 reference-to-video
-   锁定角色外观;参考图任何一步失败自动降级纯文生视频(`strip_reference_tokens`
-   去掉占位符,兼容旧 manifest 的 `@Image1`/`image_urls`)。提交前 `fit_prompt`
-   按分句边界把提示词钳制到端点硬上限内(multi_prompt 单条 512 字符,单
-   prompt/negative_prompt 2500)。`FatalGenerationError`(KEY 无效/余额不足/端点
-   不存在)立即终止全部镜头组;422 参数校验错误是确定性的,跳过重试直接降级/报错;
-   其余错误逐组重试。画幅上 Kling 端点原生仅支持 16:9/9:16/1:1;3:4、4:3 经
-   `generation_aspect` 映射为 9:16/16:9 生成,拼接后由 `assembler.crop_to_aspect`
-   居中裁剪出目标画幅(在字幕烧录之前;导演 prompt 会提示把主体放画面中部)。
+2. **kling.py** — fal.ai 生成模块,双引擎:`_FalGenerator` 基类承载提交/轮询/下载/
+   看门狗/取消/降级重试等公共逻辑,`create_generator` 按 `video.engine` 实例化
+   `SeedanceGenerator`(默认)或 `KlingGenerator`,子类只实现 `_build_arguments`。
+   参考图优先用用户上传的主角图片(pipeline 复制进任务目录并上传),否则有固定主角时
+   先文生图;参考图任何一步失败自动降级纯文生视频(`strip_reference_tokens`
+   去掉占位符,兼容旧 manifest 的 `@Image1`/`image_urls`)。
+   - **Seedance 2.0**(默认):多分镜用 `join_cut_prompts` 以 "Cut scene to" 语法
+     拼成单条 prompt 一次生成,时长取组总长(钳到 4~15);参考图走
+     reference-to-video 的 `image_urls`,prompt 中 `@Element1` 经
+     `element_to_image_tokens` 转为 `@Image1`;原生支持全部画幅与
+     `resolution`(默认 720p);不支持 negative_prompt。
+   - **Kling 3**:多分镜走 multi_prompt 结构化参数;有主角走 `elements` 角色元素
+     (prompt 中 `@Element1`);提交前 `fit_prompt` 按分句边界钳制到端点硬上限
+     (multi_prompt 单条 512 字符,单 prompt/negative_prompt 2500)。画幅原生仅
+     16:9/9:16/1:1,3:4、4:3 经 `kling_generation_aspect` 映射生成,拼接后由
+     `assembler.crop_to_aspect` 居中裁剪(在字幕烧录之前)。
+   `FatalGenerationError`(KEY 无效/余额不足/端点不存在)立即终止全部镜头组;
+   422 参数校验错误是确定性的,跳过重试直接降级/报错;其余错误逐组重试。
 3. **tts.py** — Edge TTS(免费)合成导演写的中文旁白,逐组落盘
    `narration_XX.mp3`(断点续传复用),同步记录逐句精确时间轴
    `narration_XX.timeline.json`(SentenceBoundary 事件)供字幕对齐,
@@ -71,13 +81,17 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
 ## 关键约定
 
 - **断点续传**:任务目录(`output/日期_标题_<描述哈希>/`)落盘 `manifest.json`
-  (描述、画幅、目标时长、storyboard)与各 `shot_XX.mp4`。同一描述再次生成时复用
-  已有脚本与片段,只补缺失镜头;画幅或目标时长不同的旧任务不续传——所以 `Shot`/`Storyboard` 字段变更要保持 `from_dict` 对旧 manifest 兼容
-  (用 `.get()` + 默认值)。
+  (描述、画幅、目标时长、引擎、storyboard)与各 `shot_XX.mp4`。同一描述再次生成时
+  复用已有脚本与片段,只补缺失镜头;画幅、目标时长或引擎不同的旧任务不续传
+  (无 `engine` 字段的旧 manifest 视为 kling 任务)——所以 `Shot`/`Storyboard`
+  字段变更要保持 `from_dict` 对旧 manifest 兼容(用 `.get()` + 默认值)。
+- **配置兼容**:引擎无关参数(画幅/音效/重试/并发/超时等)在 `video` 节,引擎专属
+  参数在 `seedance`/`kling` 节;`load_config` 会把旧版配置中 kling 节里的引擎无关
+  参数自动迁移到 video 节。
 - **提示词一致性**:分镜脚本要求每个分镜 prompt 逐字重复 style_anchor 与角色外观描述,
-  禁止跨组/跨分镜指代(镜头组之间相互独立生成);有主角时 prompt 用
-  `@Element1 (外观描述)` 引用角色元素,降级纯文生时由 `strip_reference_tokens`
-  去掉占位符(同时兼容旧脚本的 `@Image1`)。
+  禁止跨组/跨分镜指代(镜头组之间相互独立生成);有主角时 prompt 统一用
+  `@Element1 (外观描述)` 引用角色(Seedance 提交前自动转成 `@Image1`),
+  降级纯文生时由 `strip_reference_tokens` 去掉占位符(同时兼容旧脚本的 `@Image1`)。
 - **JSON schema 保守化**:`_STORYBOARD_SCHEMA` 会被 OpenRouter 透传给任意上游模型,
   只用各家 strict 模式普遍支持的关键字(type/description/required 等),
   数值范围等约束写进 description 并在 Python 侧钳制。

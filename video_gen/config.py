@@ -60,19 +60,19 @@ _DEFAULTS: dict[str, Any] = {
     "openrouter_api_key": "",
     "fal_api_key": "",
     "llm": {
-        "model": "anthropic/claude-fable-5",
+        "model": "qwen/qwen3.8-max",
         "reasoning_effort": "high",
         "max_tokens": 32000,
+    },
+    "seedance": {
+        "text_endpoint": "bytedance/seedance-2.0/text-to-video",
+        "reference_endpoint": "bytedance/seedance-2.0/reference-to-video",
+        "resolution": "720p",
+        "price_per_second": 0.3034,
     },
     "kling": {
         "text_endpoint": "fal-ai/kling-video/v3/pro/text-to-video",
         "reference_endpoint": "fal-ai/kling-video/o3/pro/reference-to-video",
-        "clip_duration": 10,
-        "aspect_ratio": "16:9",
-        "generate_audio": True,
-        "max_retries": 2,
-        "concurrency": 3,
-        "shot_timeout": 1500,
         "price_per_second": 0.168,
     },
     "image": {"endpoint": "fal-ai/nano-banana-2"},
@@ -83,6 +83,13 @@ _DEFAULTS: dict[str, Any] = {
         "subtitles": True,
     },
     "video": {
+        "engine": "seedance",
+        "aspect_ratio": "16:9",
+        "generate_audio": True,
+        "clip_duration": 10,
+        "max_retries": 2,
+        "concurrency": 3,
+        "shot_timeout": 1500,
         "target_duration": 60,
         "output_dir": "output",
         "transition": 0.5,
@@ -90,6 +97,12 @@ _DEFAULTS: dict[str, Any] = {
     },
     "ffmpeg": {"path": "ffmpeg"},
 }
+
+# 旧版配置把这些引擎无关参数放在 kling 节;读取时迁移到 video 节保持兼容
+_LEGACY_KLING_KEYS = (
+    "aspect_ratio", "generate_audio", "clip_duration",
+    "max_retries", "concurrency", "shot_timeout",
+)
 
 
 def _merge(base: dict, override: dict) -> dict:
@@ -118,6 +131,21 @@ class Config:
         return (self._data.get("fal_api_key") or "").strip()
 
     @property
+    def engine(self) -> str:
+        """视频生成引擎:seedance(默认)或 kling。"""
+        return str(self._data["video"].get("engine") or "seedance").strip().lower()
+
+    @property
+    def engine_name(self) -> str:
+        """引擎的展示名(日志用)。"""
+        return "Seedance 2.0" if self.engine == "seedance" else "Kling"
+
+    @property
+    def engine_section(self) -> dict[str, Any]:
+        """当前引擎的专属配置节(端点、单价等)。"""
+        return self._data["seedance" if self.engine == "seedance" else "kling"]
+
+    @property
     def ffmpeg_path(self) -> str:
         """ffmpeg 可执行文件:用户显式配置优先,否则优先随程序分发的版本。"""
         configured = str(self._data["ffmpeg"]["path"]).strip()
@@ -142,20 +170,29 @@ class Config:
             problems.append("config.yaml 中缺少 openrouter_api_key")
         if not self.fal_api_key:
             problems.append("config.yaml 中缺少 fal_api_key")
-        if not 3 <= int(self._data["kling"]["clip_duration"]) <= 15:
-            problems.append("kling.clip_duration 需在 3~15 秒之间")
-        if str(self._data["kling"]["aspect_ratio"]) not in (
+        if self.engine not in ("seedance", "kling"):
+            problems.append("video.engine 需为 seedance 或 kling")
+        if not 3 <= int(self._data["video"]["clip_duration"]) <= 15:
+            problems.append("video.clip_duration 需在 3~15 秒之间")
+        if str(self._data["video"]["aspect_ratio"]) not in (
             "16:9", "9:16", "1:1", "3:4", "4:3"
         ):
-            problems.append("kling.aspect_ratio 需为 16:9 / 9:16 / 1:1 / 3:4 / 4:3 之一")
+            problems.append("video.aspect_ratio 需为 16:9 / 9:16 / 1:1 / 3:4 / 4:3 之一")
+        if str(self._data["seedance"]["resolution"]) not in (
+            "480p", "720p", "1080p", "4k"
+        ):
+            problems.append("seedance.resolution 需为 480p / 720p / 1080p / 4k 之一")
         if not 10 <= int(self._data["video"]["target_duration"]) <= 600:
             problems.append("video.target_duration 需在 10~600 秒之间")
         if float(self._data["video"]["transition"]) < 0:
             problems.append("video.transition 不能为负数")
         if not 0 <= float(self._data["narration"]["volume"]) <= 2:
             problems.append("narration.volume 需在 0~2 之间")
-        if float(self._data["kling"]["price_per_second"]) < 0:
-            problems.append("kling.price_per_second 不能为负数(设 0 可关闭费用预估)")
+        for section in ("seedance", "kling"):
+            if float(self._data[section]["price_per_second"]) < 0:
+                problems.append(
+                    f"{section}.price_per_second 不能为负数(设 0 可关闭费用预估)"
+                )
         return problems
 
 
@@ -172,4 +209,12 @@ def load_config() -> Config:
             )
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         user_data = yaml.safe_load(f) or {}
+    # 兼容旧版配置:kling 节里的引擎无关参数迁移到 video 节
+    legacy = user_data.get("kling") or {}
+    if isinstance(legacy, dict):
+        for key in _LEGACY_KLING_KEYS:
+            if key in legacy:
+                video_section = user_data.setdefault("video", {}) or {}
+                user_data["video"] = video_section
+                video_section.setdefault(key, legacy.pop(key))
     return Config(_merge(_DEFAULTS, user_data))

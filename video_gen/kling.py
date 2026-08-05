@@ -1,10 +1,16 @@
-"""调用 fal.ai 生成素材:主角参考图(文生图)与各镜头组视频片段(Kling)。
+"""调用 fal.ai 生成素材:主角参考图(文生图)与各镜头组视频片段。
 
-- 多分镜镜头组:一个镜头组内含多个分镜时,走 Kling 的 multi_prompt 一次性
-  连续生成,组内画面衔接由模型原生保证(优于事后转场拼接);
-- 有固定主角时走 reference-to-video 的 elements 角色元素:参考图作为
-  @Element1 随每个镜头组送入模型,主角外观全片一致(优于仅锁首帧);
-- 任一环节失败都会自动降级为纯文生视频,绝不因参考图问题导致整体失败。
+支持两个视频引擎(config.yaml 的 video.engine 切换,默认 seedance):
+- **Seedance 2.0**(字节跳动):多分镜用 "Cut scene to" 语法拼进单条 prompt
+  一次连续生成;有固定主角时走 reference-to-video,参考图经 image_urls 送入、
+  prompt 中以 @Image1 引用(导演脚本统一写 @Element1,提交前自动转换);
+  原生支持 16:9/9:16/1:1/3:4/4:3 全部画幅与音频。
+- **Kling 3**:多分镜走 multi_prompt 结构化参数;有固定主角时走
+  reference-to-video 的 elements 角色元素(@Element1);3:4/4:3 画幅按相邻
+  原生画幅生成、成片时居中裁剪。
+
+公共稳健性(两个引擎一致):提交/轮询/下载/超时看门狗/取消,任一环节失败
+自动降级为纯文生视频,绝不因参考图问题导致整体失败。
 """
 
 from __future__ import annotations
@@ -33,13 +39,19 @@ _POLL_INTERVAL = 5  # 轮询任务状态的间隔(秒)
 _MAX_MULTI_PROMPT_CHARS = 512   # multi_prompt 内单条分镜提示词
 _MAX_SINGLE_PROMPT_CHARS = 2500  # 单 prompt 与 negative_prompt
 
+# Seedance 未公布 prompt 硬上限,取与 Kling 单 prompt 相同的保守值
+_MAX_SEEDANCE_PROMPT_CHARS = 2500
+# Seedance 单次生成时长范围(秒)
+_SEEDANCE_MIN_SECONDS = 4
+_SEEDANCE_MAX_SECONDS = 15
+
 # Kling 视频端点原生支持的画幅;3:4 / 4:3 不被原生支持,
 # 按相邻原生画幅生成,拼接成片时再居中裁剪出目标画幅
 _NATIVE_ASPECTS = ("16:9", "9:16", "1:1")
 _GENERATION_ASPECT = {"3:4": "9:16", "4:3": "16:9"}
 
 
-def generation_aspect(aspect: str) -> str:
+def kling_generation_aspect(aspect: str) -> str:
     """返回 Kling 端点实际使用的生成画幅:非原生画幅映射到相邻原生画幅。"""
     aspect = str(aspect).strip()
     if aspect in _NATIVE_ASPECTS:
@@ -63,6 +75,26 @@ def strip_reference_tokens(prompt: str) -> str:
     return re.sub(r"@(?:Element|Image)\d+\s*", "", prompt).strip()
 
 
+def element_to_image_tokens(prompt: str) -> str:
+    """把导演脚本统一使用的 @Element1 占位符转换为 Seedance 的 @Image1 引用。"""
+    return re.sub(r"@Element(\d+)", r"@Image\1", prompt)
+
+
+def join_cut_prompts(prompts: list[str]) -> str:
+    """按 Seedance 的多镜头语法把各分镜 prompt 拼成一条:镜头间用 "Cut scene to" 衔接。"""
+    parts: list[str] = []
+    for prompt in prompts:
+        prompt = prompt.strip()
+        if not prompt:
+            continue
+        if parts:
+            prompt = "Cut scene to " + prompt
+        if not prompt.endswith((".", "!", "?")):
+            prompt += "."
+        parts.append(prompt)
+    return " ".join(parts)
+
+
 def fit_prompt(prompt: str, limit: int) -> str:
     """把提示词裁剪到长度上限内:尽量在句号/逗号等分句边界截断,避免拦腰斩词。"""
     prompt = prompt.strip()
@@ -80,7 +112,14 @@ class FatalGenerationError(RuntimeError):
     """重试无意义的错误(KEY 无效、余额不足等),应立即终止全部镜头。"""
 
 
-class KlingGenerator:
+class _FalGenerator:
+    """fal.ai 生成器公共实现:提交/轮询/下载/看门狗/取消与降级重试。
+
+    子类只需实现 `_build_arguments`(构造端点与请求参数)并设置引擎展示名。
+    """
+
+    _ENGINE_LABEL = "视频模型"
+
     def __init__(
         self,
         config: Config,
@@ -106,10 +145,14 @@ class KlingGenerator:
 
     # ---------------- 主角参考图 ----------------
 
+    def generation_aspect(self, aspect: str) -> str:
+        """引擎实际使用的生成画幅;与目标画幅不同,成片阶段会居中裁剪。"""
+        return str(aspect).strip()
+
     def generate_reference(self, prompt: str, out_path: Path) -> str | None:
         """文生图生成主角参考图,下载到 out_path 并返回其 URL;失败返回 None。"""
         endpoint = str(self._config["image"]["endpoint"])
-        aspect = str(self._config["kling"]["aspect_ratio"])
+        aspect = str(self._config["video"]["aspect_ratio"])
         arguments = {
             "prompt": prompt,
             # 文生图端点原生支持 3:4 / 4:3,无需映射
@@ -148,61 +191,8 @@ class KlingGenerator:
     def _build_arguments(
         self, shot: Shot, reference_url: str | None
     ) -> tuple[str, dict, bool]:
-        """按镜头组构造 Kling 请求:多分镜走 multi_prompt,有主角走 elements。"""
-        kling = self._config["kling"]
-        combined = shot.combined_prompt.lower()
-        use_reference = bool(reference_url) and (
-            "@element" in combined or "@image" in combined
-        )
-
-        aspect = generation_aspect(str(kling["aspect_ratio"]))
-        if use_reference:
-            endpoint = str(kling["reference_endpoint"])
-            arguments: dict = {
-                "aspect_ratio": aspect,
-                "generate_audio": bool(kling["generate_audio"]),
-            }
-            if "@element" in combined:
-                # elements 角色元素:正面图 + 参考角度图(同图即可满足要求)
-                arguments["elements"] = [{
-                    "frontal_image_url": reference_url,
-                    "reference_image_urls": [reference_url],
-                }]
-            else:
-                # 旧 manifest 的 @Image1 走 image_urls 参考图,保持断点续传兼容
-                arguments["image_urls"] = [reference_url]
-            prompts = [cut.prompt for cut in shot.cuts]
-        else:
-            endpoint = str(kling["text_endpoint"])
-            arguments = {
-                "negative_prompt": fit_prompt(
-                    shot.negative_prompt, _MAX_SINGLE_PROMPT_CHARS
-                ),
-                "aspect_ratio": aspect,
-                "generate_audio": bool(kling["generate_audio"]),
-            }
-            prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
-
-        limit = (
-            _MAX_MULTI_PROMPT_CHARS if len(shot.cuts) > 1 else _MAX_SINGLE_PROMPT_CHARS
-        )
-        for i, prompt in enumerate(prompts):
-            if len(prompt) > limit:
-                self._log(
-                    f"  ⚠ 镜头组 {shot.index} 分镜 {i + 1} 提示词超长"
-                    f"({len(prompt)} 字符),已裁剪到 {limit} 字符内"
-                )
-                prompts[i] = fit_prompt(prompt, limit)
-
-        if len(shot.cuts) > 1:
-            arguments["multi_prompt"] = [
-                {"prompt": prompt, "duration": str(cut.duration)}
-                for prompt, cut in zip(prompts, shot.cuts)
-            ]
-        else:
-            arguments["prompt"] = prompts[0]
-            arguments["duration"] = str(max(3, shot.duration))
-        return endpoint, arguments, use_reference
+        """构造 (端点, 请求参数, 是否参考图模式),由具体引擎实现。"""
+        raise NotImplementedError
 
     def generate_clip(
         self, shot: Shot, out_path: Path, reference_url: str | None = None
@@ -212,9 +202,9 @@ class KlingGenerator:
             self._log(f"  镜头组 {shot.index} 已存在,跳过生成 ↺")
             return out_path
 
-        kling = self._config["kling"]
-        max_retries = int(kling["max_retries"])
-        timeout = float(kling["shot_timeout"])
+        video_cfg = self._config["video"]
+        max_retries = int(video_cfg["max_retries"])
+        timeout = float(video_cfg["shot_timeout"])
         endpoint, arguments, use_reference = self._build_arguments(shot, reference_url)
 
         last_error: Exception | None = None
@@ -222,7 +212,7 @@ class KlingGenerator:
             self._check_cancel()
             try:
                 self._log(
-                    f"  镜头组 {shot.index} 提交 Kling 生成"
+                    f"  镜头组 {shot.index} 提交 {self._ENGINE_LABEL} 生成"
                     + (f"({len(shot.cuts)} 个分镜连续生成)" if len(shot.cuts) > 1 else "")
                     + ("(带主角参考图)" if use_reference else "")
                     + (f"(第 {attempt} 次尝试)" if attempt > 1 else "")
@@ -337,3 +327,127 @@ class KlingGenerator:
             raise
         tmp_path.replace(out_path)
         self._log(f"  已下载 → {out_path.name}")
+
+
+class SeedanceGenerator(_FalGenerator):
+    """Seedance 2.0(字节跳动,经 fal.ai):默认视频引擎。"""
+
+    _ENGINE_LABEL = "Seedance"
+
+    def _build_arguments(
+        self, shot: Shot, reference_url: str | None
+    ) -> tuple[str, dict, bool]:
+        """多分镜以 "Cut scene to" 语法拼成单条 prompt,有主角走 image_urls 参考图。"""
+        seedance = self._config["seedance"]
+        video_cfg = self._config["video"]
+        combined = shot.combined_prompt.lower()
+        use_reference = bool(reference_url) and (
+            "@element" in combined or "@image" in combined
+        )
+
+        if use_reference:
+            endpoint = str(seedance["reference_endpoint"])
+            # Seedance 在 prompt 中用 @Image1 引用 image_urls 里的参考图;
+            # 导演脚本统一写 @Element1,在此转换(旧脚本的 @Image1 原样可用)
+            prompts = [element_to_image_tokens(cut.prompt) for cut in shot.cuts]
+        else:
+            endpoint = str(seedance["text_endpoint"])
+            prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
+
+        prompt = join_cut_prompts(prompts)
+        if len(prompt) > _MAX_SEEDANCE_PROMPT_CHARS:
+            self._log(
+                f"  ⚠ 镜头组 {shot.index} 提示词超长({len(prompt)} 字符),"
+                f"已裁剪到 {_MAX_SEEDANCE_PROMPT_CHARS} 字符内"
+            )
+            prompt = fit_prompt(prompt, _MAX_SEEDANCE_PROMPT_CHARS)
+
+        duration = min(_SEEDANCE_MAX_SECONDS, max(_SEEDANCE_MIN_SECONDS, shot.duration))
+        arguments: dict = {
+            "prompt": prompt,
+            "duration": str(duration),
+            # Seedance 原生支持 16:9/9:16/1:1/3:4/4:3 全部画幅,无需映射裁剪
+            "aspect_ratio": str(video_cfg["aspect_ratio"]),
+            "resolution": str(seedance["resolution"]),
+            "generate_audio": bool(video_cfg["generate_audio"]),
+        }
+        if use_reference:
+            arguments["image_urls"] = [reference_url]
+        return endpoint, arguments, use_reference
+
+
+class KlingGenerator(_FalGenerator):
+    """Kling 3(快手,经 fal.ai):可选视频引擎(video.engine: kling)。"""
+
+    _ENGINE_LABEL = "Kling"
+
+    def generation_aspect(self, aspect: str) -> str:
+        return kling_generation_aspect(aspect)
+
+    def _build_arguments(
+        self, shot: Shot, reference_url: str | None
+    ) -> tuple[str, dict, bool]:
+        """多分镜走 multi_prompt,有主角走 elements 角色元素。"""
+        kling = self._config["kling"]
+        video_cfg = self._config["video"]
+        combined = shot.combined_prompt.lower()
+        use_reference = bool(reference_url) and (
+            "@element" in combined or "@image" in combined
+        )
+
+        aspect = kling_generation_aspect(str(video_cfg["aspect_ratio"]))
+        if use_reference:
+            endpoint = str(kling["reference_endpoint"])
+            arguments: dict = {
+                "aspect_ratio": aspect,
+                "generate_audio": bool(video_cfg["generate_audio"]),
+            }
+            if "@element" in combined:
+                # elements 角色元素:正面图 + 参考角度图(同图即可满足要求)
+                arguments["elements"] = [{
+                    "frontal_image_url": reference_url,
+                    "reference_image_urls": [reference_url],
+                }]
+            else:
+                # 旧 manifest 的 @Image1 走 image_urls 参考图,保持断点续传兼容
+                arguments["image_urls"] = [reference_url]
+            prompts = [cut.prompt for cut in shot.cuts]
+        else:
+            endpoint = str(kling["text_endpoint"])
+            arguments = {
+                "negative_prompt": fit_prompt(
+                    shot.negative_prompt, _MAX_SINGLE_PROMPT_CHARS
+                ),
+                "aspect_ratio": aspect,
+                "generate_audio": bool(video_cfg["generate_audio"]),
+            }
+            prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
+
+        limit = (
+            _MAX_MULTI_PROMPT_CHARS if len(shot.cuts) > 1 else _MAX_SINGLE_PROMPT_CHARS
+        )
+        for i, prompt in enumerate(prompts):
+            if len(prompt) > limit:
+                self._log(
+                    f"  ⚠ 镜头组 {shot.index} 分镜 {i + 1} 提示词超长"
+                    f"({len(prompt)} 字符),已裁剪到 {limit} 字符内"
+                )
+                prompts[i] = fit_prompt(prompt, limit)
+
+        if len(shot.cuts) > 1:
+            arguments["multi_prompt"] = [
+                {"prompt": prompt, "duration": str(cut.duration)}
+                for prompt, cut in zip(prompts, shot.cuts)
+            ]
+        else:
+            arguments["prompt"] = prompts[0]
+            arguments["duration"] = str(max(3, shot.duration))
+        return endpoint, arguments, use_reference
+
+
+def create_generator(
+    config: Config, log: LogFn, cancel_event: threading.Event | None = None
+) -> _FalGenerator:
+    """按 video.engine 创建对应引擎的生成器(默认 seedance)。"""
+    cls = SeedanceGenerator if config.engine == "seedance" else KlingGenerator
+    return cls(config, log, cancel_event=cancel_event)

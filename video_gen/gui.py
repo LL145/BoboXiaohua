@@ -15,7 +15,8 @@ from .pipeline import GenerationCancelled, Pipeline
 
 _PLACEHOLDER = "例如:一只橘猫在雨后的东京街头漫步,霓虹灯倒映在水洼里,电影感画面"
 
-# 画幅选项:显示文案 → 配置值(3:4 / 4:3 由相邻画幅生成后自动居中裁剪)
+# 画幅选项:显示文案 → 配置值(Seedance 原生支持全部画幅;
+# Kling 引擎下 3:4 / 4:3 由相邻画幅生成后自动居中裁剪)
 _ASPECT_CHOICES = {
     "🖥 横屏 16:9": "16:9",
     "📱 竖屏 9:16": "9:16",
@@ -46,7 +47,7 @@ def _open_path(path: Path) -> None:
 class App:
     def __init__(self) -> None:
         self.root = tk.Tk()
-        self.root.title("AI 短视频生成器 — LLM × Kling")
+        self.root.title("AI 短视频生成器")
         self.root.geometry("880x580")
         self.root.minsize(760, 480)
 
@@ -177,7 +178,7 @@ class App:
         aspect, duration, subtitles = "", 60, True
         try:
             config = load_config()
-            aspect = str(config["kling"]["aspect_ratio"])
+            aspect = str(config["video"]["aspect_ratio"])
             duration = int(config["video"]["target_duration"])
             subtitles = bool(config["narration"]["subtitles"])
         except Exception:  # noqa: BLE001 - 首次启动可能还没有配置文件
@@ -210,7 +211,7 @@ class App:
             messagebox.showerror("配置错误", "\n".join(problems))
             return
         # 界面上选择的画幅、时长与字幕开关优先于 config.yaml
-        config["kling"]["aspect_ratio"] = _ASPECT_CHOICES.get(
+        config["video"]["aspect_ratio"] = _ASPECT_CHOICES.get(
             self.aspect_var.get(), "16:9"
         )
         config["video"]["target_duration"] = _DURATION_CHOICES.get(
