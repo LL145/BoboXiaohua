@@ -52,6 +52,13 @@ _SEEDANCE_MAX_SECONDS = 15
 _ARK_MIN_SECONDS = 4
 _ARK_MAX_SECONDS = 30
 
+# 各引擎支持的参考图张数上限(超出部分按顺序丢弃,pipeline 会提前告知用户)
+MAX_REFERENCE_IMAGES = {
+    "seedance25": 30,  # 方舟官方:单次最多 30 张参考图
+    "seedance": 9,     # fal reference-to-video:最多 9 张
+    "kling": 4,        # elements 单角色的多角度参考,保守取 4 张
+}
+
 # Kling 视频端点原生支持的画幅;3:4 / 4:3 不被原生支持,
 # 按相邻原生画幅生成,拼接成片时再居中裁剪出目标画幅
 _NATIVE_ASPECTS = ("16:9", "9:16", "1:1")
@@ -115,6 +122,45 @@ def join_cut_prompts(prompts: list[str]) -> str:
             prompt += "。" if is_cjk else "."
         parts.append(prompt)
     return " ".join(parts)
+
+
+def join_cut_prompts_timed(prompts_durations: list[tuple[str, int]]) -> str:
+    """按时间戳分块把各分镜 prompt 拼成一条(Seedance 2.5 官方推荐写法)。
+
+    30 秒长镜头组最常见的失败是"后半段漂移":没有时间轴引导时模型会用
+    不受控的内容填满剩余时长。时间戳块(如 `[0-4秒] …`)把每个分镜的时长
+    比例明确传给模型,节奏由导演脚本掌控;空 prompt 的分镜跳过但时长仍
+    计入时间轴,保证后续块的时间戳正确。
+    """
+    parts: list[str] = []
+    start = 0
+    for prompt, duration in prompts_durations:
+        end = start + max(0, int(duration))
+        text = prompt.strip()
+        if text:
+            is_cjk = bool(_CJK_RE.search(text))
+            if not text.endswith((".", "!", "?", "。", "!", "?")):
+                text += "。" if is_cjk else "."
+            label = f"[{start}-{end}秒] " if is_cjk else f"[{start}-{end}s] "
+            parts.append(label + text)
+        start = end
+    return " ".join(parts)
+
+
+def reference_usage_note(notes: list[str], token_format: str) -> str:
+    """生成参考素材的用途说明,附在 prompt 末尾。
+
+    社区经验:未标注用途的参考图是效果不佳的最常见原因——每个参考素材
+    都应说明用途,prompt 中用"参考图中的角色"式引用而非重新描述。
+    token_format 如 "@图片{}"(方舟)或 "@Image{}"(fal)。
+    """
+    if not notes:
+        return ""
+    parts = [
+        f"{token_format.format(i)}:{note.strip() or '主角形象参考'}"
+        for i, note in enumerate(notes, 1)
+    ]
+    return " 参考素材用途——" + ";".join(parts) + "。请保持画面中主角外观与参考图严格一致。"
 
 
 def fit_prompt(prompt: str, limit: int) -> str:
@@ -215,13 +261,19 @@ class _FalGenerator:
     # ---------------- 镜头片段 ----------------
 
     def _build_arguments(
-        self, shot: Shot, reference_url: str | None
+        self, shot: Shot, references: list[tuple[str, str]] | None
     ) -> tuple[str, dict, bool]:
-        """构造 (端点, 请求参数, 是否参考图模式),由具体引擎实现。"""
+        """构造 (端点, 请求参数, 是否参考图模式),由具体引擎实现。
+
+        references 为参考图列表 [(URL, 用途说明)];None/空表示纯文生。
+        """
         raise NotImplementedError
 
     def generate_clip(
-        self, shot: Shot, out_path: Path, reference_url: str | None = None
+        self,
+        shot: Shot,
+        out_path: Path,
+        references: list[tuple[str, str]] | None = None,
     ) -> Path:
         """生成单个镜头组并下载到 out_path;已有有效片段时直接复用(断点续传)。"""
         if clip_is_valid(out_path):
@@ -231,7 +283,7 @@ class _FalGenerator:
         video_cfg = self._config["video"]
         max_retries = int(video_cfg["max_retries"])
         timeout = float(video_cfg["shot_timeout"])
-        endpoint, arguments, use_reference = self._build_arguments(shot, reference_url)
+        endpoint, arguments, use_reference = self._build_arguments(shot, references)
 
         last_error: Exception | None = None
         for attempt in range(1, max_retries + 2):
@@ -266,7 +318,7 @@ class _FalGenerator:
         if use_reference:
             # 参考图模式反复失败 → 降级为纯文生视频(该组一致性略降,但保住成片)
             self._log(f"  镜头组 {shot.index} 参考图模式多次失败,降级为纯文生视频重试 …")
-            return self.generate_clip(shot, out_path, reference_url=None)
+            return self.generate_clip(shot, out_path, references=None)
         raise RuntimeError(f"镜头组 {shot.index} 多次生成失败: {last_error}") from last_error
 
     # ---------------- fal 任务提交与等待 ----------------
@@ -367,13 +419,13 @@ class SeedanceGenerator(_FalGenerator):
     _ENGINE_LABEL = "Seedance"
 
     def _build_arguments(
-        self, shot: Shot, reference_url: str | None
+        self, shot: Shot, references: list[tuple[str, str]] | None
     ) -> tuple[str, dict, bool]:
         """多分镜以 "Cut scene to" 语法拼成单条 prompt,有主角走 image_urls 参考图。"""
         seedance = self._config["seedance"]
         video_cfg = self._config["video"]
         combined = shot.combined_prompt.lower()
-        use_reference = bool(reference_url) and (
+        use_reference = bool(references) and (
             "@element" in combined or "@image" in combined
         )
 
@@ -387,6 +439,9 @@ class SeedanceGenerator(_FalGenerator):
             prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
 
         prompt = join_cut_prompts(prompts)
+        if use_reference:
+            refs = references[:MAX_REFERENCE_IMAGES["seedance"]]
+            prompt += reference_usage_note([note for _, note in refs], "@Image{}")
         if len(prompt) > _MAX_SEEDANCE_PROMPT_CHARS:
             self._log(
                 f"  ⚠ 镜头组 {shot.index} 提示词超长({len(prompt)} 字符),"
@@ -404,7 +459,7 @@ class SeedanceGenerator(_FalGenerator):
             "generate_audio": bool(video_cfg["generate_audio"]),
         }
         if use_reference:
-            arguments["image_urls"] = [reference_url]
+            arguments["image_urls"] = [url for url, _ in refs]
         return endpoint, arguments, use_reference
 
 
@@ -551,13 +606,13 @@ class ArkSeedanceGenerator(_FalGenerator):
     # ---------------- 请求参数 ----------------
 
     def _build_arguments(
-        self, shot: Shot, reference_url: str | None
+        self, shot: Shot, references: list[tuple[str, str]] | None
     ) -> tuple[str, dict, bool]:
-        """多分镜以 "Cut scene to" 语法拼成单条 prompt,有主角以 reference_image 送入。"""
+        """多分镜按时间戳分块拼成单条 prompt,有主角以 reference_image 送入。"""
         seedance25 = self._config["seedance25"]
         video_cfg = self._config["video"]
         combined = shot.combined_prompt.lower()
-        use_reference = bool(reference_url) and (
+        use_reference = bool(references) and (
             "@element" in combined or "@image" in combined or "@图片" in combined
         )
 
@@ -567,7 +622,18 @@ class ArkSeedanceGenerator(_FalGenerator):
         else:
             prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
 
-        prompt = join_cut_prompts(prompts)
+        if len(shot.cuts) > 1:
+            # 时间戳分块(官方推荐):把各分镜的时长比例明确传给模型,
+            # 避免 30 秒长镜头组的"后半段漂移"
+            prompt = join_cut_prompts_timed(
+                [(p, cut.duration) for p, cut in zip(prompts, shot.cuts)]
+            )
+        else:
+            prompt = join_cut_prompts(prompts)
+        refs: list[tuple[str, str]] = []
+        if use_reference:
+            refs = references[:MAX_REFERENCE_IMAGES["seedance25"]]
+            prompt += reference_usage_note([note for _, note in refs], "@图片{}")
         if len(prompt) > _MAX_SEEDANCE_PROMPT_CHARS:
             self._log(
                 f"  ⚠ 镜头组 {shot.index} 提示词超长({len(prompt)} 字符),"
@@ -576,10 +642,10 @@ class ArkSeedanceGenerator(_FalGenerator):
             prompt = fit_prompt(prompt, _MAX_SEEDANCE_PROMPT_CHARS)
 
         content: list[dict] = [{"type": "text", "text": prompt}]
-        if use_reference:
+        for url, _ in refs:
             content.append({
                 "type": "image_url",
-                "image_url": {"url": reference_url},
+                "image_url": {"url": url},
                 "role": "reference_image",
             })
         duration = min(_ARK_MAX_SECONDS, max(_ARK_MIN_SECONDS, shot.duration))
@@ -593,6 +659,15 @@ class ArkSeedanceGenerator(_FalGenerator):
             "generate_audio": bool(video_cfg["generate_audio"]),
             "watermark": False,
         }
+        negative = shot.negative_prompt.strip()
+        if negative:
+            arguments["negative_prompt"] = fit_prompt(negative, _MAX_SINGLE_PROMPT_CHARS)
+        try:
+            seed = int(seedance25.get("seed", -1))
+        except (TypeError, ValueError):
+            seed = -1
+        if seed >= 0:
+            arguments["seed"] = seed
         endpoint = f"{self._api_base()}/contents/generations/tasks"
         return endpoint, arguments, use_reference
 
@@ -606,32 +681,37 @@ class KlingGenerator(_FalGenerator):
         return kling_generation_aspect(aspect)
 
     def _build_arguments(
-        self, shot: Shot, reference_url: str | None
+        self, shot: Shot, references: list[tuple[str, str]] | None
     ) -> tuple[str, dict, bool]:
-        """多分镜走 multi_prompt,有主角走 elements 角色元素。"""
+        """多分镜走 multi_prompt,有主角走 elements 角色元素。
+
+        Kling 的 elements 只支持"同一主角的多角度参考图",不支持为每张图
+        单独指定用途(与 Seedance 系不同,pipeline 会提前告知用户)。
+        """
         kling = self._config["kling"]
         video_cfg = self._config["video"]
         combined = shot.combined_prompt.lower()
-        use_reference = bool(reference_url) and (
+        use_reference = bool(references) and (
             "@element" in combined or "@image" in combined
         )
 
         aspect = kling_generation_aspect(str(video_cfg["aspect_ratio"]))
         if use_reference:
+            urls = [url for url, _ in references[:MAX_REFERENCE_IMAGES["kling"]]]
             endpoint = str(kling["reference_endpoint"])
             arguments: dict = {
                 "aspect_ratio": aspect,
                 "generate_audio": bool(video_cfg["generate_audio"]),
             }
             if "@element" in combined:
-                # elements 角色元素:正面图 + 参考角度图(同图即可满足要求)
+                # elements 角色元素:第 1 张作正面图,全部图片作多角度参考
                 arguments["elements"] = [{
-                    "frontal_image_url": reference_url,
-                    "reference_image_urls": [reference_url],
+                    "frontal_image_url": urls[0],
+                    "reference_image_urls": urls,
                 }]
             else:
                 # 旧 manifest 的 @Image1 走 image_urls 参考图,保持断点续传兼容
-                arguments["image_urls"] = [reference_url]
+                arguments["image_urls"] = urls[:1]
             prompts = [cut.prompt for cut in shot.cuts]
         else:
             endpoint = str(kling["text_endpoint"])

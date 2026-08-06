@@ -49,6 +49,7 @@ ProgressFn = Callable[[int, str], None]
 
 _MANIFEST_NAME = "manifest.json"
 _REFERENCE_NAME = "reference.png"
+_REFERENCES_META = "references.json"  # 各参考图的用途说明(断点续传用)
 _BGM_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 
 
@@ -59,6 +60,26 @@ def _safe_name(title: str) -> str:
 
 def _description_key(description: str) -> str:
     return hashlib.sha1(description.strip().encode("utf-8")).hexdigest()[:8]
+
+
+def _normalize_references(value) -> list[tuple[Path, str]]:
+    """把调用方传入的参考图归一为 [(路径, 用途说明)] 列表。
+
+    兼容三种形态:None、单个路径、(路径, 用途) 或纯路径混排的列表。
+    """
+    if value is None:
+        return []
+    if isinstance(value, (str, Path)):
+        return [(Path(value), "")]
+    out: list[tuple[Path, str]] = []
+    for item in value:
+        if isinstance(item, (list, tuple)) and item:
+            path = Path(item[0])
+            note = str(item[1]).strip() if len(item) > 1 else ""
+        else:
+            path, note = Path(item), ""
+        out.append((path, note))
+    return out
 
 
 class GenerationCancelled(RuntimeError):
@@ -85,14 +106,18 @@ class Pipeline:
 
     # ---------------- 主流程 ----------------
 
-    def run(self, description: str, reference_image: Path | None = None) -> Path:
+    def run(
+        self,
+        description: str,
+        reference_images: list | Path | None = None,
+    ) -> Path:
         """执行完整流程,返回成片路径。
 
-        reference_image 为用户上传的主角图片(可选):作为角色元素锁定主角外观,
+        reference_images 为用户上传的参考图(可选,可多张):每项为
+        (图片路径, 用途说明) 或纯路径;作为角色/场景参考锁定画面元素,
         并随创意发给导演模型照图撰写外观描述;不提供时由导演判断是否自动生成。
         """
-        if reference_image is not None:
-            reference_image = Path(reference_image)
+        user_refs = _normalize_references(reference_images)
         from .kling import FatalGenerationError, clip_is_valid, create_generator
 
         config = self._config
@@ -110,7 +135,7 @@ class Pipeline:
         # 1. 分镜脚本:优先恢复未完成任务,否则请 LLM 新写
         bgm_tracks = self._bgm_tracks()
         run_dir, storyboard = self._resume_or_create(
-            description, [t.name for t in bgm_tracks], reference_image
+            description, [t.name for t in bgm_tracks], user_refs
         )
         self._logfile = run_dir / "log.txt"
         log(f"《{storyboard.title}》—— {storyboard.logline}")
@@ -143,13 +168,16 @@ class Pipeline:
         self._check_cancel()
         generator = create_generator(config, log, cancel_event=self._cancel)
 
-        # 2. 主角参考图(用户上传优先;否则导演判断有固定主角时自动生成;
-        # 失败自动降级纯文生)
-        reference_url: str | None = None
-        if pending and (reference_image or storyboard.reference_prompt):
+        # 2. 主角参考图(用户上传优先;断点续传复用已保存的参考图;
+        # 否则导演判断有固定主角时自动生成;失败自动降级纯文生)
+        references: list[tuple[str, str]] | None = None
+        if pending and (
+            user_refs or storyboard.reference_prompt
+            or self._existing_references(run_dir)
+        ):
             self._report_progress(8, "准备主角参考图")
-            reference_url = self._prepare_reference(
-                generator, run_dir, storyboard, reference_image
+            references = self._prepare_reference(
+                generator, run_dir, storyboard, user_refs
             )
 
         # 3. 视频引擎并行生成各镜头
@@ -171,7 +199,7 @@ class Pipeline:
                         generator.generate_clip,
                         shot,
                         run_dir / f"shot_{shot.index:02d}.mp4",
-                        reference_url,
+                        references,
                     ): shot
                     for shot in pending
                 }
@@ -422,51 +450,113 @@ class Pipeline:
 
     # ---------------- 主角参考图 ----------------
 
+    def _existing_references(self, run_dir: Path) -> list[tuple[Path, str]]:
+        """任务目录中已保存的参考图(断点续传):[(文件, 用途说明)]。"""
+        from .kling import image_is_valid
+
+        notes: dict[str, str] = {}
+        meta_path = run_dir / _REFERENCES_META
+        if meta_path.exists():
+            try:
+                for entry in json.loads(meta_path.read_text(encoding="utf-8")):
+                    notes[str(entry.get("file", ""))] = str(entry.get("note", ""))
+            except Exception:  # noqa: BLE001 - 用途说明损坏只影响提示词质量
+                pass
+        found = [
+            (p, notes.get(p.name, ""))
+            for p in sorted(run_dir.glob("reference*.*"))
+            if p.suffix.lower() != ".json" and image_is_valid(p)
+        ]
+        return found
+
+    def _log_reference_support(self, count: int) -> None:
+        """告知用户当前引擎对多参考图的支持程度(仅多图时)。"""
+        if count <= 1:
+            return
+        from .kling import MAX_REFERENCE_IMAGES
+
+        engine = self._config.engine
+        limit = MAX_REFERENCE_IMAGES.get(engine, 1)
+        if engine in ("seedance", "seedance25"):
+            self._log(
+                f"  当前引擎 {self._config.engine_name} 支持多参考图"
+                f"(最多 {limit} 张),各图的用途说明会写入提示词。"
+            )
+        else:
+            self._log(
+                "  ⚠ 当前引擎 Kling 仅把多张图片作为同一主角的多角度参考,"
+                "各图单独的用途说明不生效(需要按用途区分时请切换 Seedance 引擎)。"
+            )
+        if count > limit:
+            self._log(f"  ⚠ 参考图共 {count} 张,超出引擎上限,仅使用前 {limit} 张。")
+
     def _prepare_reference(
         self,
         generator,
         run_dir: Path,
         storyboard: Storyboard,
-        user_image: Path | None = None,
-    ):
-        """准备主角参考图并返回其 URL;失败返回 None(降级纯文生)。
+        user_images: list[tuple[Path, str]] | None = None,
+    ) -> list[tuple[str, str]] | None:
+        """准备主角参考图,返回 [(URL, 用途说明)];失败返回 None(降级纯文生)。
 
-        优先级:用户上传的图片 → 任务目录中已有的参考图(断点续传)→
-        按导演的 reference_prompt 文生图。
+        优先级:用户上传的图片(可多张,各带用途说明)→ 任务目录中已有的
+        参考图(断点续传,用途存于 references.json)→ 按导演的
+        reference_prompt 文生图。
         """
         from .kling import image_is_valid
 
-        if user_image is not None and image_is_valid(user_image):
-            # 复制进任务目录(保留原扩展名,保证上传时内容类型正确),断点续传可复用
-            local = run_dir / f"reference{user_image.suffix.lower()}"
-            try:
-                if user_image.resolve() != local.resolve():
-                    shutil.copyfile(user_image, local)
-            except OSError as exc:
-                self._log(f"  ⚠ 复制主角图片失败: {exc}")
-                local = user_image
-            self._log("② 使用用户上传的主角图片作为参考图,上传中 …")
-            url = generator.upload_image(local)
-            if url:
-                return url
-        elif user_image is not None:
-            self._log("  ⚠ 上传的主角图片无效(文件缺失或过小),忽略。")
+        locals_with_notes: list[tuple[Path, str]] = []
+        if user_images:
+            meta: list[dict] = []
+            for i, (image, note) in enumerate(user_images, 1):
+                if not image_is_valid(image):
+                    self._log(f"  ⚠ 参考图无效(文件缺失或过小),忽略: {image}")
+                    continue
+                # 复制进任务目录(保留原扩展名,保证上传时内容类型正确),
+                # 用途说明写入 references.json,断点续传可复用
+                local = run_dir / f"reference_{i:02d}{image.suffix.lower()}"
+                try:
+                    if image.resolve() != local.resolve():
+                        shutil.copyfile(image, local)
+                except OSError as exc:
+                    self._log(f"  ⚠ 复制参考图失败: {exc}")
+                    local = image
+                locals_with_notes.append((local, note))
+                meta.append({"file": local.name, "note": note})
+            if meta:
+                try:
+                    (run_dir / _REFERENCES_META).write_text(
+                        json.dumps(meta, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
+            if locals_with_notes:
+                self._log(
+                    f"② 使用用户上传的 {len(locals_with_notes)} 张参考图,上传中 …"
+                )
+        else:
+            locals_with_notes = self._existing_references(run_dir)
+            if locals_with_notes:
+                self._log("② 复用任务目录中已有的参考图,重新上传 …")
 
-        existing = next(
-            (p for p in sorted(run_dir.glob("reference.*")) if image_is_valid(p)), None
-        )
-        if existing is not None:
-            self._log("② 复用已有主角参考图,重新上传 …")
-            url = generator.upload_image(existing)
-            if url:
-                return url
+        if locals_with_notes:
+            self._log_reference_support(len(locals_with_notes))
+            references = []
+            for local, note in locals_with_notes:
+                url = generator.upload_image(local)
+                if url:
+                    references.append((url, note))
+            if references:
+                return references
+
         if storyboard.reference_prompt:
             self._log("② 正在生成主角参考图(锁定全片角色外观)…")
             url = generator.generate_reference(
                 storyboard.reference_prompt, run_dir / _REFERENCE_NAME
             )
             if url is not None:
-                return url
+                return [(url, "主角形象参考")]
         self._log("  参考图不可用,本次退回纯文字模式(角色一致性略降,不影响出片)。")
         return None
 
@@ -476,7 +566,7 @@ class Pipeline:
         self,
         description: str,
         bgm_options: list[str],
-        reference_image: Path | None = None,
+        reference_images: list[tuple[Path, str]] | None = None,
     ) -> tuple[Path, Storyboard]:
         """同一描述且未产出成片的任务目录 → 恢复;否则新建目录并请 LLM 写分镜。"""
         key = _description_key(description)
@@ -514,7 +604,7 @@ class Pipeline:
         self._log("① 导演模型正在撰写分镜脚本 …")
         storyboard = Director(self._config).write_storyboard(
             description, bgm_options, aspect_ratio=aspect,
-            reference_image=reference_image,
+            reference_images=reference_images,
         )
 
         base = f"{time.strftime('%Y%m%d_%H%M%S')}_{_safe_name(storyboard.title)}_{key}"

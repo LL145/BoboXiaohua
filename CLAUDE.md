@@ -41,10 +41,12 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
    钳制;`video.clip_duration` 仅是模型未给时长时的回退值。单条分镜 prompt 要求模型
    控制在语言对应的长度内(英文 450 字符,对应 Kling multi_prompt 512 字符硬上限;
    中文 220 字)。系统提示词按引擎渲染(`{engine_name}`/`{group_min}`/`{group_max}`/
-   `{prompt_language}` 及 `_LANG_PROMPT_PARTS` 的示例);Kling 下 3:4/4:3 画幅用
-   裁剪构图提示(`_KLING_CROP_NOTES`)。用户可上传主角图片:
-   随创意以多模态消息发给导演模型照图撰写 @Element1 外观描述,模型不支持图片输入时
-   自动去图重试(文字说明仍告知存在用户参考图)。导演同时决定声音形态:
+   `{prompt_language}` 及 `_LANG_PROMPT_PARTS` 的示例);分镜 prompt 结构要求
+   主体+核心动作放开头(模型优先锁定开头内容)、每分镜单一动作弧线、光影用单个
+   强关键词;Kling 下 3:4/4:3 画幅用裁剪构图提示(`_KLING_CROP_NOTES`)。
+   用户可上传参考图(可多张,各带用途说明):随创意以多模态消息(最多 4 张,
+   `_MAX_DIRECTOR_IMAGES`)发给导演模型照图撰写 @Element1 外观描述,
+   模型不支持图片输入时自动去图重试(文字说明仍列出各图用途)。导演同时决定声音形态:
    解说型逐组写中文旁白(`narration` 字段),沉浸型全部置空;角色台词直接写进分镜
    prompt(中文引号台词),由视频模型原生配音。请求带 `response_format: json_schema`,
    不支持结构化输出的模型由 `_extract_json` 容错兜底。
@@ -55,15 +57,22 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
    `ArkSeedanceGenerator` 另覆写 `_submit_and_wait`(HTTP 任务提交/轮询/取消,
    返回与 fal 相同形状的结果)、`upload_image`(base64 data URL,不走 fal 存储)
    与 `generate_reference`(文生图仍走 fal,无 fal KEY 时跳过降级)。
-   参考图优先用用户上传的主角图片(pipeline 复制进任务目录并上传),否则有固定主角时
-   先文生图;参考图任何一步失败自动降级纯文生视频(`strip_reference_tokens`
-   去掉占位符,兼容旧 manifest 的 `@Image1`/`image_urls`)。
+   参考图取 `generate_clip(references=[(URL, 用途说明), …])`:优先用用户上传的
+   参考图(pipeline 复制进任务目录并上传,用途持久化在 `references.json` 供断点
+   续传),否则有固定主角时先文生图;各引擎参考图张数上限见 `MAX_REFERENCE_IMAGES`
+   (2.5 30 张 / 2.0 9 张 / Kling 4 张,pipeline 会向用户提示当前引擎的多图支持
+   与超限截断);Seedance 系把各图用途经 `reference_usage_note` 写进 prompt 尾部;
+   参考图任何一步失败自动降级纯文生视频(`strip_reference_tokens` 去掉占位符,
+   兼容旧 manifest 的 `@Image1`/`image_urls`)。
    - **Seedance 2.5**(默认,`video.engine: seedance25`):fal.ai 未上线,直连
      火山方舟官方任务 API(`ark_api_key` 鉴权,POST `contents/generations/tasks`
-     → 轮询 → 下载,DELETE 取消);多分镜经 `join_cut_prompts` 拼接(中文脚本用
-     「镜头切换:」衔接语),prompt 中 `@Element1` 经 `element_to_ark_image_tokens`
-     转为方舟官方的 `@图片1`,参考图放 `content` 数组(`role: reference_image`,
-     base64 data URL);单组时长钳到 4~30,分辨率至 4K;方舟 400 参数/审核错误
+     → 轮询 → 下载,DELETE 取消);多分镜经 `join_cut_prompts_timed` 按时间戳
+     分块拼接(如 `[0-4秒] …`,把分镜时长比例传给模型,防 30 秒长组后半段
+     漂移;单分镜组仍走 `join_cut_prompts`),prompt 中 `@Element1` 经
+     `element_to_ark_image_tokens` 转为方舟官方的 `@图片1`,参考图放 `content`
+     数组(`role: reference_image`,base64 data URL,可多张);
+     `negative_prompt`/`seed`(`seedance25.seed`,-1 随机)为顶层字段;
+     单组时长钳到 4~30,分辨率至 4K;方舟 400 参数/审核错误
      标记 `status_code=422` 复用确定性跳过重试逻辑;此引擎下 fal KEY 可选
      (仅自动文生参考图用,缺失自动降级);BytePlus 经 `seedance25.api_base`/
      `model` 切换。
@@ -74,7 +83,8 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
      `@Image1`;原生支持全部画幅与 `resolution`(默认 720p);
      不支持 negative_prompt。
    - **Kling 3**:多分镜走 multi_prompt 结构化参数;有主角走 `elements` 角色元素
-     (prompt 中 `@Element1`);提交前 `fit_prompt` 按分句边界钳制到端点硬上限
+     (prompt 中 `@Element1`;多张参考图仅作同一主角的多角度参考,不支持
+     按用途区分);提交前 `fit_prompt` 按分句边界钳制到端点硬上限
      (multi_prompt 单条 512 字符,单 prompt/negative_prompt 2500)。画幅原生仅
      16:9/9:16/1:1,3:4、4:3 经 `kling_generation_aspect` 映射生成,拼接后由
      `assembler.crop_to_aspect` 居中裁剪(在字幕烧录之前)。

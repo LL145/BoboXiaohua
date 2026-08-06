@@ -8,12 +8,13 @@ import sys
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
 from .config import CONFIG_PATH, app_dir, load_config
 from .pipeline import GenerationCancelled, Pipeline
 
 _PLACEHOLDER = "例如:一只橘猫在雨后的东京街头漫步,霓虹灯倒映在水洼里,电影感画面"
+_REF_HINT_EMPTY = "未选择(有固定主角时将由 AI 自动生成形象)"
 
 # 画幅选项:显示文案 → 配置值(Seedance 原生支持全部画幅;
 # Kling 引擎下 3:4 / 4:3 由相邻画幅生成后自动居中裁剪)
@@ -57,7 +58,8 @@ class App:
         self._worker: threading.Thread | None = None
         self._final_path: Path | None = None
         self._cancel_event: threading.Event | None = None
-        self._ref_image: Path | None = None  # 用户上传的主角图片(可选)
+        # 用户上传的参考图(可选,可多张):[(路径, 用途说明)]
+        self._ref_images: list[tuple[Path, str]] = []
 
         self._build_ui()
         self._poll_log_queue()
@@ -77,17 +79,17 @@ class App:
         self.desc_text.insert("1.0", _PLACEHOLDER)
         self.desc_text.bind("<FocusIn>", self._clear_placeholder)
 
-        # 可选:上传主角图片,作为参考图锁定全片主角外观
+        # 可选:上传参考图(可多张,每张可注明用途),锁定主角外观/场景/风格
         ref_bar = ttk.Frame(top)
         ref_bar.pack(fill="x", pady=(4, 0))
         ttk.Button(
-            ref_bar, text="🖼 上传主角图片(可选)", command=self._pick_reference
+            ref_bar, text="🖼 上传参考图(可多选)", command=self._pick_reference
         ).pack(side="left")
         self.ref_clear_btn = ttk.Button(
             ref_bar, text="✕ 清除", command=self._clear_reference, state="disabled"
         )
         self.ref_clear_btn.pack(side="left", padx=(6, 0))
-        self.ref_var = tk.StringVar(value="未选择(有固定主角时将由 AI 自动生成形象)")
+        self.ref_var = tk.StringVar(value=_REF_HINT_EMPTY)
         ttk.Label(ref_bar, textvariable=self.ref_var, foreground="gray").pack(
             side="left", padx=(8, 0)
         )
@@ -154,22 +156,42 @@ class App:
             self.desc_text.delete("1.0", "end")
 
     def _pick_reference(self) -> None:
-        path = filedialog.askopenfilename(
-            title="选择主角图片",
+        paths = filedialog.askopenfilenames(
+            title="选择参考图(可多选;多图支持情况随引擎,详见生成日志)",
             filetypes=[
                 ("图片文件", "*.png *.jpg *.jpeg *.webp *.bmp"),
                 ("所有文件", "*.*"),
             ],
         )
-        if not path:
+        if not paths:
             return
-        self._ref_image = Path(path)
-        self.ref_var.set(f"主角图片:{self._ref_image.name}")
+        # 逐张询问用途:标注用途能显著提升参考图效果(未标注是效果不佳的
+        # 最常见原因);多图时 Kling 引擎仅作多角度参考、用途说明不生效
+        picked: list[tuple[Path, str]] = []
+        for i, raw in enumerate(paths, 1):
+            path = Path(raw)
+            note = simpledialog.askstring(
+                "参考图用途",
+                f"第 {i} 张:{path.name}\n\n"
+                "请注明这张图的用途(可留空,默认为主角形象参考),例如:\n"
+                "主角正面 / 主角侧面 / 场景参考 / 画面风格参考",
+                initialvalue="主角正面" if i == 1 and len(paths) > 1 else "",
+                parent=self.root,
+            )
+            picked.append((path, (note or "").strip()))
+        self._ref_images = picked
+        if len(picked) == 1:
+            self.ref_var.set(f"参考图:{picked[0][0].name}")
+        else:
+            self.ref_var.set(
+                f"参考图 {len(picked)} 张(用途已标注;Seedance 引擎支持多图,"
+                "Kling 仅作同一主角的多角度参考)"
+            )
         self.ref_clear_btn.config(state="normal")
 
     def _clear_reference(self) -> None:
-        self._ref_image = None
-        self.ref_var.set("未选择(有固定主角时将由 AI 自动生成形象)")
+        self._ref_images = []
+        self.ref_var.set(_REF_HINT_EMPTY)
         self.ref_clear_btn.config(state="disabled")
 
     @staticmethod
@@ -194,10 +216,11 @@ class App:
         if not description or description == _PLACEHOLDER:
             messagebox.showwarning("提示", "请先输入一句话描述。")
             return
-        ref_image = self._ref_image
-        if ref_image is not None and not ref_image.is_file():
+        ref_images = list(self._ref_images)
+        missing = [str(p) for p, _ in ref_images if not p.is_file()]
+        if missing:
             messagebox.showwarning(
-                "提示", f"主角图片不存在:{ref_image}\n请重新选择或清除。"
+                "提示", "参考图不存在:\n" + "\n".join(missing) + "\n请重新选择或清除。"
             )
             return
 
@@ -237,7 +260,7 @@ class App:
                     config, self._log,
                     progress=self._on_progress, cancel_event=cancel_event,
                 )
-                final_path = pipeline.run(description, reference_image=ref_image)
+                final_path = pipeline.run(description, reference_images=ref_images)
                 self._log_queue.put(("done", final_path))
             except GenerationCancelled:
                 self._log("⏹ 已取消。已完成的镜头已保存,不会重复扣费。")
