@@ -43,6 +43,12 @@ def _engine_max_group(engine: str) -> int:
         _SEEDANCE25_MAX_GROUP_SECONDS if engine == "seedance25"
         else _MAX_GROUP_SECONDS
     )
+
+
+def _engine_prompt_language(engine: str) -> str:
+    """分镜 prompt 的撰写语言:字节 Seedance 系对中文提示词有官方一等支持
+    (官方提示词指南即为中文),中文语义更准、台词更稳;Kling(经 fal)沿用英文。"""
+    return "中文" if engine.startswith("seedance") else "英文"
 # Kling 对 multi_prompt 单条分镜提示词有 512 字符硬上限(超长直接 422 拒绝),
 # 要求模型控制在 450 以内留出余量;kling.py 提交前还会做最终钳制兜底
 _MAX_PROMPT_CHARS = 450
@@ -176,18 +182,20 @@ _STORYBOARD_SCHEMA = {
         "style_anchor": {
             "type": "string",
             "description": (
-                "English style signature reused verbatim in every shot prompt: "
-                "color palette, lighting scheme, film stock / rendering style. "
-                "Keep it compact (under 120 characters) — it is repeated in "
-                "every cut prompt, which has a strict length budget"
+                "Style signature reused verbatim in every shot prompt, written "
+                "in the prompt language required by the system prompt: color "
+                "palette, lighting scheme, film stock / rendering style. "
+                "Keep it compact — it is repeated in every cut prompt, "
+                "which has a strict length budget"
             ),
         },
         "reference_prompt": {
             "type": "string",
             "description": (
-                "If the story has one recurring main subject: an English "
-                "text-to-image prompt for its reference portrait (frontal, "
-                "full body, clean neutral background, includes style_anchor). "
+                "If the story has one recurring main subject: a text-to-image "
+                "prompt (same language as shot prompts) for its reference "
+                "portrait (frontal, full body, clean neutral background, "
+                "includes style_anchor). "
                 "Empty string if there is no recurring subject."
             ),
         },
@@ -226,14 +234,15 @@ _STORYBOARD_SCHEMA = {
                                 "prompt": {
                                     "type": "string",
                                     "description": (
-                                        "Complete self-contained English "
-                                        "text-to-video prompt for this cut: "
-                                        "setting, subject, action, camera "
-                                        "movement + lens, lighting, style "
-                                        "keywords; may embed dialogue lines. "
-                                        "HARD LIMIT: at most 450 characters "
-                                        "including spaces — longer prompts "
-                                        "are rejected by the video model"
+                                        "Complete self-contained text-to-video "
+                                        "prompt for this cut, in the prompt "
+                                        "language required by the system "
+                                        "prompt: setting, subject, action, "
+                                        "camera movement + lens, lighting, "
+                                        "style keywords; may embed dialogue "
+                                        "lines (dialogue is always in "
+                                        "Chinese). Obey the length limit "
+                                        "given in the system prompt"
                                     ),
                                 },
                                 "duration": {
@@ -277,18 +286,21 @@ _SYSTEM_PROMPT = """\
 - 节奏由你掌控:动作、冲突、快切用 1~3 秒的短分镜(放在同一组内连续快切),\
 常规叙事用 4~8 秒,氛围铺陈、情绪高潮、收尾用 9~15 秒的单分镜组;不要所有分镜等长。
 
+## 提示词语言
+全部分镜 prompt、style_anchor、角色外观描述与 reference_prompt 一律用{prompt_language}\
+撰写(本视频模型对{prompt_language}提示词支持最佳)。
+
 ## 风格一致性(最重要)
-1. 先确定 style_anchor:一段英文风格签名,固定描述色调、光线方案、胶片/渲染风格\
-(例如 "muted teal-and-amber palette, soft diffused golden-hour light, shallow depth \
-of field, shot on 35mm film, cinematic color grading")。
+1. 先确定 style_anchor:一段{prompt_language}风格签名,固定描述色调、光线方案、\
+胶片/渲染风格(例如 {style_example})。
 2. 每个分镜的 prompt 都必须原封不动地包含这段 style_anchor。
-3. 出现相同角色/场景时,为其写一段固定的英文外观描述,并在涉及的每个分镜 prompt 中\
-逐字重复(如 "a ginger tabby cat with white paws and a red collar")。绝不使用 \
+3. 出现相同角色/场景时,为其写一段固定的{prompt_language}外观描述,并在涉及的每个\
+分镜 prompt 中逐字重复(如 {appearance_example})。绝不使用"还是刚才那只猫"/\
 "the same cat as before" 这类指代——每个分镜 prompt 必须自包含、可独立理解。
 
 ## 主角参考图(角色一致性)
 判断创意中是否存在贯穿多个镜头组的核心主体(人物、动物、物品等):
-- 存在:在 reference_prompt 字段写一段英文文生图提示词,用于生成该主体的参考图——\
+- 存在:在 reference_prompt 字段写一段{prompt_language}文生图提示词,用于生成该主体的参考图——\
 正面、完整主体、姿态自然、背景干净的纯色或简单环境、外观细节完整清晰,并包含 \
 style_anchor 的风格词。该参考图会作为角色元素随每个镜头组送入视频模型锁定外观。\
 同时,凡分镜 prompt 中提到该主体,必须写成 "@Element1 (完整的固定外观描述)" 的形式\
@@ -302,24 +314,20 @@ style_anchor 的风格词。该参考图会作为角色元素随每个镜头组�
 narration 字段撰写中文旁白。要求:口语自然、贴合画面;语速约每秒 4 个字,\
 每组字数不超过"组时长 × 4",宁短勿长;所有组的旁白连起来必须是一篇完整流畅的解说词。
 - 沉浸型(氛围片、MV、纯剧情等):所有镜头组的 narration 一律置空字符串。
-角色台词(两种形态下都可用):需要角色开口说话时,把台词直接写进对应分镜的 prompt,\
-格式如 ... the young woman looks up and says in Chinese: "我们出发吧" ...(中文台词\
-保留中文原文,模型会原生生成配音与口型)。解说型影片中,带台词的分镜要避免与旁白抢话,\
-该组旁白应留白或极简。环境音效由模型自动生成,无需描述。
+角色台词(两种形态下都可用):**所有角色台词一律使用中文普通话**(除非用户创意明确\
+要求其他语言),绝不写英文台词。需要角色开口说话时,把中文台词直接写进对应分镜的 \
+prompt,格式如 {dialogue_example}(模型会原生生成配音与口型)。解说型影片中,\
+带台词的分镜要避免与旁白抢话,该组旁白应留白或极简。环境音效由模型自动生成,无需描述。
 
-## 每个分镜 prompt 的结构(英文,按顺序)
+## 每个分镜 prompt 的结构({prompt_language},按顺序)
 1. Setting:环境、时间、天气、氛围;
 2. Subject:主体及关键外观细节(复用固定描述);
-3. Action:一个简单连贯的动作,可用 "First ... then ..." 描述顺序,\
+3. Action:一个简单连贯的动作,可按"先……然后……"描述顺序,\
    但幅度必须能在该分镜的 duration 秒内自然完成,禁止复杂多事件序列;
-4. Camera:一种明确的镜头运动 + 镜别(如 "slow dolly-in, medium close-up" / \
-   "aerial tracking shot, wide angle"),每分镜只用一种镜头运动;
+4. Camera:一种明确的镜头运动 + 镜别({camera_example}),每分镜只用一种镜头运动;
 5. Lighting 与 style_anchor 风格词。
 
-**长度硬约束**:每条分镜 prompt(含 style_anchor、角色外观描述与 @Element1 占位符)\
-总长必须不超过 450 个字符(英文字符数,含空格)——视频模型对单条分镜提示词有 512 \
-字符硬上限,超长会被直接拒绝。为此 style_anchor 与外观描述都要精炼(各控制在 120 \
-字符以内),动作与环境描述抓重点,不堆砌同义词。
+{length_rule}
 
 ## 其他
 - 画面中不得出现文字、字幕、logo、水印。
@@ -333,6 +341,45 @@ title(string)、logline(string)、style_anchor(string)、reference_prompt(string
 shots(数组,每项含 title、negative_prompt、narration、cuts;cuts 为数组,\
 每项含 prompt、duration);若用户消息中提供了背景音乐列表,则额外包含 bgm_file(string)。
 """
+
+# 系统提示词中随 prompt 语言变化的示例与长度规则
+# (Seedance 系引擎用中文撰写分镜,Kling 用英文,见 _engine_prompt_language)
+_LANG_PROMPT_PARTS = {
+    "中文": {
+        "style_example": (
+            '"冷青与琥珀的电影级配色,柔和的黄金时刻漫射光,浅景深,35mm 胶片质感"'
+        ),
+        "appearance_example": '"一只白色爪子、戴红色项圈的橘色虎斑猫"',
+        "camera_example": '如"缓慢推近,中近景"/"航拍跟随,广角"',
+        "dialogue_example": '……年轻女子抬起头,说:"我们出发吧"……',
+        "length_rule": (
+            "**长度约束**:每条分镜 prompt(含 style_anchor、角色外观描述与 "
+            "@Element1 占位符)总长控制在 220 个字以内;style_anchor 与外观描述"
+            "要精炼(各控制在 60 字以内),动作与环境描述抓重点,不堆砌同义词。"
+        ),
+    },
+    "英文": {
+        "style_example": (
+            '"muted teal-and-amber palette, soft diffused golden-hour light, '
+            'shallow depth of field, shot on 35mm film, cinematic color grading"'
+        ),
+        "appearance_example": '"a ginger tabby cat with white paws and a red collar"',
+        "camera_example": (
+            '如 "slow dolly-in, medium close-up" / "aerial tracking shot, wide angle"'
+        ),
+        "dialogue_example": (
+            '... the young woman looks up and says in Chinese: "我们出发吧" ...'
+            "(中文台词保留中文原文)"
+        ),
+        "length_rule": (
+            "**长度硬约束**:每条分镜 prompt(含 style_anchor、角色外观描述与 "
+            "@Element1 占位符)总长必须不超过 450 个字符(英文字符数,含空格)"
+            "——视频模型对单条分镜提示词有 512 字符硬上限,超长会被直接拒绝。"
+            "为此 style_anchor 与外观描述都要精炼(各控制在 120 字符以内),"
+            "动作与环境描述抓重点,不堆砌同义词。"
+        ),
+    },
+}
 
 
 def _extract_json(text: str) -> dict:
@@ -437,13 +484,16 @@ class Director:
         # 防御模型跑飞:即使全用最短镜头组,也不该超过这个组数
         max_shots = max(1, -(-total_max // min_group))
 
+        prompt_language = _engine_prompt_language(engine)
         system = _SYSTEM_PROMPT.format(
             engine_name=config.engine_name,
+            prompt_language=prompt_language,
             group_min=min_group,
             group_max=max_group,
             target=target,
             total_min=total_min,
             total_max=total_max,
+            **_LANG_PROMPT_PARTS[prompt_language],
         )
 
         user_message = f"请为以下创意撰写分镜脚本:\n\n{description}"

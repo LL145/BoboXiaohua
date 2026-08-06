@@ -1,14 +1,14 @@
 """调用视频引擎生成素材:主角参考图(文生图)与各镜头组视频片段。
 
-支持三个视频引擎(config.yaml 的 video.engine 切换,默认 seedance):
+支持三个视频引擎(config.yaml 的 video.engine 切换,默认 seedance25):
 - **Seedance 2.0**(字节跳动,经 fal.ai):多分镜用 "Cut scene to" 语法拼进
   单条 prompt 一次连续生成;有固定主角时走 reference-to-video,参考图经
   image_urls 送入、prompt 中以 @Image1 引用(导演脚本统一写 @Element1,
   提交前自动转换);原生支持 16:9/9:16/1:1/3:4/4:3 全部画幅与音频。
-- **Seedance 2.5**(字节跳动,经火山方舟官方 API):fal.ai 尚未上线 2.5,
+- **Seedance 2.5**(字节跳动,经火山方舟官方 API,默认):fal.ai 尚未上线 2.5,
   直连火山方舟(Volcengine Ark)的视频生成任务接口(需额外配 ark_api_key);
   单组最长 30 秒一次连续生成,参考图以 base64 data URL 随请求送入
-  (role: reference_image),prompt 引用方式与 Seedance 2.0 相同(@Image1)。
+  (role: reference_image),prompt 中按方舟官方语法以 @图片1 引用。
 - **Kling 3**(快手,经 fal.ai):多分镜走 multi_prompt 结构化参数;有固定
   主角时走 reference-to-video 的 elements 角色元素(@Element1);3:4/4:3
   画幅按相邻原生画幅生成、成片时居中裁剪。
@@ -74,30 +74,45 @@ def image_is_valid(path: Path) -> bool:
     return path.exists() and path.stat().st_size >= _MIN_IMAGE_BYTES
 
 
-def strip_reference_tokens(prompt: str) -> str:
-    """去掉 @Element1/@Image1 之类的占位符(括号内的外观描述保留),用于降级纯文生。
+# 中日韩统一表意文字:用于判断 prompt 语言,选择对应的多镜头衔接语法
+_CJK_RE = re.compile(r"[一-鿿]")
 
-    @Image1 是旧版脚本的参考图占位符,保留以兼容旧 manifest 的断点续传。
+
+def strip_reference_tokens(prompt: str) -> str:
+    """去掉 @Element1/@Image1/@图片1 之类的占位符(括号内的外观描述保留),用于降级纯文生。
+
+    @Image1/@图片1 是提交阶段或旧版脚本的参考图占位符,一并处理以兼容
+    旧 manifest 的断点续传。
     """
-    return re.sub(r"@(?:Element|Image)\d+\s*", "", prompt).strip()
+    return re.sub(r"@(?:Element|Image|图片)\d+\s*", "", prompt).strip()
 
 
 def element_to_image_tokens(prompt: str) -> str:
-    """把导演脚本统一使用的 @Element1 占位符转换为 Seedance 的 @Image1 引用。"""
+    """把导演脚本统一使用的 @Element1 占位符转换为 fal Seedance 的 @Image1 引用。"""
     return re.sub(r"@Element(\d+)", r"@Image\1", prompt)
 
 
+def element_to_ark_image_tokens(prompt: str) -> str:
+    """把 @Element1/@Image1 占位符转换为火山方舟官方的 @图片1 引用语法。"""
+    return re.sub(r"@(?:Element|Image)(\d+)", r"@图片\1", prompt)
+
+
 def join_cut_prompts(prompts: list[str]) -> str:
-    """按 Seedance 的多镜头语法把各分镜 prompt 拼成一条:镜头间用 "Cut scene to" 衔接。"""
+    """按 Seedance 的多镜头语法把各分镜 prompt 拼成一条。
+
+    镜头间衔接语按 prompt 语言选择:英文用 "Cut scene to",中文用「镜头切换:」
+    (与官方中文提示词指南一致);语言逐条判断,兼容旧 manifest 的英文脚本。
+    """
     parts: list[str] = []
     for prompt in prompts:
         prompt = prompt.strip()
         if not prompt:
             continue
+        is_cjk = bool(_CJK_RE.search(prompt))
         if parts:
-            prompt = "Cut scene to " + prompt
-        if not prompt.endswith((".", "!", "?")):
-            prompt += "."
+            prompt = ("镜头切换:" if is_cjk else "Cut scene to ") + prompt
+        if not prompt.endswith((".", "!", "?", "。", "!", "?")):
+            prompt += "。" if is_cjk else "."
         parts.append(prompt)
     return " ".join(parts)
 
@@ -108,11 +123,12 @@ def fit_prompt(prompt: str, limit: int) -> str:
     if len(prompt) <= limit:
         return prompt
     head = prompt[:limit]
-    # 取最靠后的分句边界截断,尽量少丢内容(尾部通常是 style_anchor 风格词)
-    pos = max(head.rfind(sep) for sep in (". ", "; ", ", "))
+    # 取最靠后的分句边界截断,尽量少丢内容(尾部通常是 style_anchor 风格词);
+    # 中英文标点都算边界
+    pos = max(head.rfind(sep) for sep in (". ", "; ", ", ", "。", ";", ",", "!", "?"))
     if pos >= limit // 2:
-        return head[:pos + 1].rstrip(" ,;")
-    return head.rsplit(" ", 1)[0].rstrip(" ,;.")
+        return head[:pos + 1].rstrip(" ,;,;")
+    return head.rsplit(" ", 1)[0].rstrip(" ,;.,;。")
 
 
 class FatalGenerationError(RuntimeError):
@@ -346,7 +362,7 @@ class _FalGenerator:
 
 
 class SeedanceGenerator(_FalGenerator):
-    """Seedance 2.0(字节跳动,经 fal.ai):默认视频引擎。"""
+    """Seedance 2.0(字节跳动,经 fal.ai):可选引擎(video.engine: seedance)。"""
 
     _ENGINE_LABEL = "Seedance"
 
@@ -393,7 +409,7 @@ class SeedanceGenerator(_FalGenerator):
 
 
 class ArkSeedanceGenerator(_FalGenerator):
-    """Seedance 2.5(字节跳动,经火山方舟官方 API):可选引擎(video.engine: seedance25)。
+    """Seedance 2.5(字节跳动,经火山方舟官方 API):默认视频引擎。
 
     fal.ai 尚未上线 Seedance 2.5,因此直连火山方舟(Volcengine Ark)的
     视频生成任务接口:POST 创建任务 → 轮询状态 → 下载成片,鉴权用 ark_api_key。
@@ -542,12 +558,12 @@ class ArkSeedanceGenerator(_FalGenerator):
         video_cfg = self._config["video"]
         combined = shot.combined_prompt.lower()
         use_reference = bool(reference_url) and (
-            "@element" in combined or "@image" in combined
+            "@element" in combined or "@image" in combined or "@图片" in combined
         )
 
         if use_reference:
-            # 与 Seedance 2.0 相同:prompt 中以 @Image1 引用第 1 张参考图
-            prompts = [element_to_image_tokens(cut.prompt) for cut in shot.cuts]
+            # 方舟官方语法:prompt 中以 @图片1 引用 content 里的第 1 张参考图
+            prompts = [element_to_ark_image_tokens(cut.prompt) for cut in shot.cuts]
         else:
             prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
 
@@ -653,7 +669,7 @@ class KlingGenerator(_FalGenerator):
 def create_generator(
     config: Config, log: LogFn, cancel_event: threading.Event | None = None
 ) -> _FalGenerator:
-    """按 video.engine 创建对应引擎的生成器(默认 seedance)。"""
+    """按 video.engine 创建对应引擎的生成器(默认 seedance25)。"""
     cls = {
         "seedance": SeedanceGenerator,
         "seedance25": ArkSeedanceGenerator,

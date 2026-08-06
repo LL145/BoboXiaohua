@@ -21,8 +21,9 @@ python main.py "一句话描述"        # 命令行模式,直接生成
 python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 dist/ 发布包
 ```
 
-- 运行依赖 `config.yaml`(程序目录下),需填 `openrouter_api_key` 与 `fal_api_key`
-  (`video.engine: seedance25` 时改为必填 `ark_api_key`,fal KEY 变为可选);
+- 运行依赖 `config.yaml`(程序目录下),需填 `openrouter_api_key` 与 `ark_api_key`
+  (默认引擎 seedance25 经火山方舟;fal KEY 此时可选,仅自动文生参考图用;
+  改用 fal 引擎 seedance/kling 时必填 `fal_api_key`);
   源码运行还需本机 ffmpeg/ffprobe(打包版已内置)。
 - 无测试套件、无 CI lint;改动后至少用 `python -c "import ast; ast.parse(open('...').read())"`
   或 `python -m py_compile` 做语法检查,纯逻辑可写临时脚本验证。
@@ -38,9 +39,10 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
    上限 Seedance 2.5 为 30 秒、其余 15 秒,`_engine_max_group`),
    代码约束总时长在 `video.target_duration` ±15% 内并用 `_clamp_duration`/`_build_cuts`
    钳制;`video.clip_duration` 仅是模型未给时长时的回退值。单条分镜 prompt 要求模型
-   控制在 450 字符内(Kling multi_prompt 有 512 字符硬上限)。系统提示词按引擎渲染
-   (`{engine_name}`/`{group_min}`);Kling 下 3:4/4:3 画幅用裁剪构图提示
-   (`_KLING_CROP_NOTES`)。用户可上传主角图片:
+   控制在语言对应的长度内(英文 450 字符,对应 Kling multi_prompt 512 字符硬上限;
+   中文 220 字)。系统提示词按引擎渲染(`{engine_name}`/`{group_min}`/`{group_max}`/
+   `{prompt_language}` 及 `_LANG_PROMPT_PARTS` 的示例);Kling 下 3:4/4:3 画幅用
+   裁剪构图提示(`_KLING_CROP_NOTES`)。用户可上传主角图片:
    随创意以多模态消息发给导演模型照图撰写 @Element1 外观描述,模型不支持图片输入时
    自动去图重试(文字说明仍告知存在用户参考图)。导演同时决定声音形态:
    解说型逐组写中文旁白(`narration` 字段),沉浸型全部置空;角色台词直接写进分镜
@@ -48,7 +50,7 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
    不支持结构化输出的模型由 `_extract_json` 容错兜底。
 2. **kling.py** — 视频生成模块,三引擎:`_FalGenerator` 基类承载提交/轮询/下载/
    看门狗/取消/降级重试等公共逻辑,`create_generator` 按 `video.engine` 实例化
-   `SeedanceGenerator`(默认)、`ArkSeedanceGenerator`(seedance25)或
+   `ArkSeedanceGenerator`(seedance25,默认)、`SeedanceGenerator`(seedance)或
    `KlingGenerator`;fal 引擎的子类只实现 `_build_arguments`,方舟直连的
    `ArkSeedanceGenerator` 另覆写 `_submit_and_wait`(HTTP 任务提交/轮询/取消,
    返回与 fal 相同形状的结果)、`upload_image`(base64 data URL,不走 fal 存储)
@@ -56,19 +58,21 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
    参考图优先用用户上传的主角图片(pipeline 复制进任务目录并上传),否则有固定主角时
    先文生图;参考图任何一步失败自动降级纯文生视频(`strip_reference_tokens`
    去掉占位符,兼容旧 manifest 的 `@Image1`/`image_urls`)。
-   - **Seedance 2.0**(默认):多分镜用 `join_cut_prompts` 以 "Cut scene to" 语法
-     拼成单条 prompt 一次生成,时长取组总长(钳到 4~15);参考图走
-     reference-to-video 的 `image_urls`,prompt 中 `@Element1` 经
-     `element_to_image_tokens` 转为 `@Image1`;原生支持全部画幅与
-     `resolution`(默认 720p);不支持 negative_prompt。
-   - **Seedance 2.5**(`video.engine: seedance25`):fal.ai 未上线,直连火山方舟
-     官方任务 API(`ark_api_key` 鉴权,POST `contents/generations/tasks` →
-     轮询 → 下载,DELETE 取消);prompt 拼接与 `@Image1` 引用同 Seedance 2.0,
-     参考图放 `content` 数组(`role: reference_image`,base64 data URL);
-     单组时长钳到 4~30,分辨率至 4K;方舟 400 参数/审核错误标记
-     `status_code=422` 复用确定性跳过重试逻辑;此引擎下 fal KEY 可选
+   - **Seedance 2.5**(默认,`video.engine: seedance25`):fal.ai 未上线,直连
+     火山方舟官方任务 API(`ark_api_key` 鉴权,POST `contents/generations/tasks`
+     → 轮询 → 下载,DELETE 取消);多分镜经 `join_cut_prompts` 拼接(中文脚本用
+     「镜头切换:」衔接语),prompt 中 `@Element1` 经 `element_to_ark_image_tokens`
+     转为方舟官方的 `@图片1`,参考图放 `content` 数组(`role: reference_image`,
+     base64 data URL);单组时长钳到 4~30,分辨率至 4K;方舟 400 参数/审核错误
+     标记 `status_code=422` 复用确定性跳过重试逻辑;此引擎下 fal KEY 可选
      (仅自动文生参考图用,缺失自动降级);BytePlus 经 `seedance25.api_base`/
      `model` 切换。
+   - **Seedance 2.0**(`video.engine: seedance`):多分镜用 `join_cut_prompts`
+     以 "Cut scene to" 语法(中文脚本自动用「镜头切换:」)拼成单条 prompt
+     一次生成,时长取组总长(钳到 4~15);参考图走 reference-to-video 的
+     `image_urls`,prompt 中 `@Element1` 经 `element_to_image_tokens` 转为
+     `@Image1`;原生支持全部画幅与 `resolution`(默认 720p);
+     不支持 negative_prompt。
    - **Kling 3**:多分镜走 multi_prompt 结构化参数;有主角走 `elements` 角色元素
      (prompt 中 `@Element1`);提交前 `fit_prompt` 按分句边界钳制到端点硬上限
      (multi_prompt 单条 512 字符,单 prompt/negative_prompt 2500)。画幅原生仅
@@ -102,10 +106,15 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
 - **配置兼容**:引擎无关参数(画幅/音效/重试/并发/超时等)在 `video` 节,引擎专属
   参数在 `seedance`/`seedance25`/`kling` 节;`load_config` 会把旧版配置中 kling 节里的引擎无关
   参数自动迁移到 video 节。
+- **提示词语言与台词**:分镜 prompt 语言随引擎(`_engine_prompt_language`):
+  Seedance 系用中文(官方一等支持),Kling 用英文;系统提示词的示例与长度规则
+  按语言取自 `_LANG_PROMPT_PARTS`。角色台词无论 prompt 语言一律默认中文普通话
+  (系统提示词硬性要求,除非用户创意明确要求其他语言)。
 - **提示词一致性**:分镜脚本要求每个分镜 prompt 逐字重复 style_anchor 与角色外观描述,
   禁止跨组/跨分镜指代(镜头组之间相互独立生成);有主角时 prompt 统一用
-  `@Element1 (外观描述)` 引用角色(Seedance 提交前自动转成 `@Image1`),
-  降级纯文生时由 `strip_reference_tokens` 去掉占位符(同时兼容旧脚本的 `@Image1`)。
+  `@Element1 (外观描述)` 引用角色(提交前自动转换:fal Seedance → `@Image1`,
+  方舟 Seedance 2.5 → `@图片1`),降级纯文生时由 `strip_reference_tokens`
+  去掉占位符(同时兼容旧脚本的 `@Image1`/`@图片1`)。
 - **JSON schema 保守化**:`_STORYBOARD_SCHEMA` 会被 OpenRouter 透传给任意上游模型,
   只用各家 strict 模式普遍支持的关键字(type/description/required 等),
   数值范围等约束写进 description 并在 Python 侧钳制。

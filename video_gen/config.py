@@ -90,7 +90,7 @@ _DEFAULTS: dict[str, Any] = {
         "subtitles": True,
     },
     "video": {
-        "engine": "seedance",
+        "engine": "seedance25",
         "aspect_ratio": "16:9",
         "generate_audio": True,
         "clip_duration": 10,
@@ -144,8 +144,8 @@ class Config:
 
     @property
     def engine(self) -> str:
-        """视频生成引擎:seedance(默认)、seedance25 或 kling。"""
-        return str(self._data["video"].get("engine") or "seedance").strip().lower()
+        """视频生成引擎:seedance25(默认)、seedance 或 kling。"""
+        return str(self._data["video"].get("engine") or "seedance25").strip().lower()
 
     @property
     def engine_name(self) -> str:
@@ -189,7 +189,9 @@ class Config:
             # fal KEY 仅用于自动文生主角参考图,缺失时自动降级,不拦截
             if not self.ark_api_key:
                 problems.append(
-                    "config.yaml 中缺少 ark_api_key(Seedance 2.5 需要火山方舟 API KEY)"
+                    "config.yaml 中缺少 ark_api_key(默认引擎 Seedance 2.5 需要"
+                    "火山方舟 API KEY;若想改用 fal.ai,把 video.engine 设为"
+                    " seedance 或 kling)"
                 )
         elif not self.fal_api_key:
             problems.append("config.yaml 中缺少 fal_api_key")
