@@ -617,8 +617,8 @@ class Pipeline:
             self._log(f"① 检测到未完成的任务,继续上次进度: {candidate.name}")
             return candidate, storyboard
 
-        self._log("① 导演模型正在撰写分镜脚本 …")
-        storyboard = Director(self._config).write_storyboard(
+        self._log(f"① 导演模型({self._config['llm']['model']})正在撰写分镜脚本 …")
+        storyboard = Director(self._config, log=self._log).write_storyboard(
             description, bgm_options, aspect_ratio=aspect,
             reference_images=reference_images,
         )

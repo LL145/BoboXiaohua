@@ -10,6 +10,7 @@ import base64
 import json
 import re
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -429,12 +430,16 @@ def _extract_json(text: str) -> dict:
     start, end = text.find("{"), text.rfind("}")
     if start != -1 and end > start:
         return json.loads(text[start:end + 1])
-    raise json.JSONDecodeError("未找到 JSON 对象", text, 0)
+    # 把模型输出开头附进报错,便于定位是空回复、散文还是其他格式问题
+    snippet = re.sub(r"\s+", " ", text)[:200]
+    detail = f"模型输出开头: {snippet}" if snippet else "模型输出为空"
+    raise json.JSONDecodeError(f"未找到 JSON 对象({detail})", text, 0)
 
 
 class Director:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, log: Callable[[str], None] | None = None):
         self._config = config
+        self._log = log or (lambda message: None)
 
     # 随创意发给导演模型的参考图上限(控制多模态消息体积;
     # 生成阶段送入视频模型的张数上限见 kling.MAX_REFERENCE_IMAGES)
@@ -459,7 +464,8 @@ class Director:
             if (url := _encode_image(path)) is not None
         ]
         last_error: Exception | None = None
-        for attempt in range(3):
+        attempts = 3
+        for attempt in range(attempts):
             try:
                 return self._write_once(
                     description, bgm_options, aspect_ratio,
@@ -469,12 +475,17 @@ class Director:
             except (requests.ConnectionError, requests.Timeout,
                     json.JSONDecodeError, KeyError, _RetryableHTTPError) as exc:
                 last_error = exc
-                time.sleep(2 * (attempt + 1))
+                self._log(f"  ⚠ 分镜脚本第 {attempt + 1}/{attempts} 次尝试失败: {exc}")
+                if attempt + 1 < attempts:
+                    delay = 2 * (attempt + 1)
+                    self._log(f"  {delay} 秒后自动重试 …")
+                    time.sleep(delay)
             except RuntimeError as exc:
                 # 携带图片时失败可能是模型不支持图片输入:去掉图片降级重试
                 # (文字说明仍会告知模型存在用户参考图)
                 if not image_data_urls:
                     raise
+                self._log(f"  ⚠ 携带参考图请求失败({exc}),去掉图片降级重试 …")
                 image_data_urls = []
                 last_error = exc
         raise RuntimeError(f"分镜脚本生成失败: {last_error}") from last_error
@@ -651,6 +662,10 @@ class Director:
             raise _RetryableHTTPError(str(data["error"].get("message", data["error"])))
 
         choice = data["choices"][0]
+        error = choice.get("error")  # 上游 provider 出错时,OpenRouter 也可能把错误挂在 choice 上
+        if error:
+            detail = error.get("message", error) if isinstance(error, dict) else error
+            raise _RetryableHTTPError(f"上游模型服务出错: {detail}")
         finish = choice.get("finish_reason")
         message = choice["message"]
         if message.get("refusal"):
@@ -661,6 +676,23 @@ class Director:
             raise RuntimeError("内容被安全策略拦截,请调整描述后重试")
 
         content = message.get("content") or ""
+        if isinstance(content, list):  # 个别 provider 以分段列表形式返回 content
+            content = "".join(
+                part.get("text", "") for part in content if isinstance(part, dict)
+            )
+        if not content.strip():
+            # 个别推理模型(或其提供方)会把全部输出算进 reasoning、content 留空:
+            # 尝试从推理过程中抢救 JSON,救不回来时报错并给出排查方向
+            reasoning = message.get("reasoning") or ""
+            if reasoning.strip():
+                self._log("  ⚠ 模型 content 为空,尝试从推理过程(reasoning)中提取脚本 …")
+                content = reasoning
+            else:
+                raise _RetryableHTTPError(
+                    f"模型返回了空内容(finish_reason={finish}),多为上游模型服务异常"
+                    "或当前模型不支持结构化输出;若反复出现,请更换 config.yaml 中的 "
+                    "llm.model 或调低 llm.reasoning_effort"
+                )
         parsed = _extract_json(content)
         storyboard = self._build_storyboard(
             parsed, max_shots, fallback_duration, min_group, max_group
