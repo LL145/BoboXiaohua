@@ -1,13 +1,21 @@
 # ============================================================
 #  AI 短视频生成器 配置文件
-#  首次使用只需填入下方两个 API KEY,其余保持默认即可
+#  首次使用只需填入 openrouter_api_key 与 ark_api_key(默认引擎
+#  Seedance 2.5 所需),其余保持默认即可
 # ============================================================
 
 # OpenRouter API Key (https://openrouter.ai/settings/keys 获取)
 # 通过 OpenRouter 可使用任意大模型撰写分镜脚本
 openrouter_api_key: ""
 
+# 火山方舟 API Key(默认引擎 Seedance 2.5 需要)
+# 在 https://console.volcengine.com/ark 的「API Key 管理」中创建,
+# 并在「开通管理」中开通 Seedance 2.5 模型
+ark_api_key: ""
+
 # fal.ai API Key (https://fal.ai/dashboard/keys 获取)
+# 默认引擎下为可选:仅在自动文生主角参考图时用到(缺失则自动跳过);
+# 把 video.engine 改为 seedance / kling(fal.ai 引擎)时必填
 fal_api_key: ""
 
 # ---------------- LLM(编剧 + 导演,经 OpenRouter) ----------------
@@ -25,7 +33,8 @@ llm:
   # 单次请求最大 token(含思考过程,不宜过小)
   max_tokens: 32000
 
-# ---------------- Seedance 2.0 视频引擎(fal.ai,默认) ----------------
+# ---------------- Seedance 2.0 视频引擎(fal.ai,可选) ----------------
+# 把下方 video.engine 改为 "seedance" 即启用(需 fal_api_key)
 seedance:
   # 文生视频端点:无固定主角的镜头组使用
   text_endpoint: "bytedance/seedance-2.0/text-to-video"
@@ -39,6 +48,24 @@ seedance:
   # 默认对应 Seedance 2.0 标准档 720p 的价格(1080p 约 0.682);
   # 更换端点或分辨率后请同步调整;设为 0 则不显示费用预估
   price_per_second: 0.3034
+
+# ---------------- Seedance 2.5 视频引擎(火山方舟官方 API,默认) ----------------
+# 字节最新的视频模型(fal.ai 暂未上线):单镜头组最长 30 秒一次连续生成,
+# 支持原生 4K。需填入上方 ark_api_key;fal_api_key 此时为可选
+# (仅用于自动文生主角参考图,缺失时自动跳过)
+seedance25:
+  # 火山方舟的模型 ID(需先在方舟控制台开通)。
+  # 海外用户可改用 BytePlus:api_base 填 https://ark.ap-southeast.bytepluses.com/api/v3,
+  # model 填 dreamina-seedance-2-5-260628,ark_api_key 填 BytePlus 的 API Key
+  model: "doubao-seedance-2-5-260628"
+  # 方舟 API 地址(中国区默认;BytePlus 见上)
+  api_base: "https://ark.cn-beijing.volces.com/api/v3"
+  # 输出分辨率: 480p / 720p / 1080p / 2k / 4k(分辨率越高价格越高)
+  resolution: "720p"
+  # 视频生成单价(美元/秒),用于生成前的费用预估(仅展示,不影响生成)。
+  # 方舟按 token 计费(约 ¥70/百万 token,720p 24fps 约 2.16 万 token/秒,
+  # 即约 ¥1.5/秒 ≈ $0.21/秒);分辨率不同请同步调整;设为 0 则不显示费用预估
+  price_per_second: 0.21
 
 # ---------------- Kling 视频引擎(fal.ai,可选) ----------------
 # 把下方 video.engine 改为 "kling" 即启用;费用较低(约 $0.168/秒)
@@ -74,8 +101,10 @@ narration:
 
 # ---------------- 成片与生成参数 ----------------
 video:
-  # 视频生成引擎: seedance(默认,Seedance 2.0)/ kling(Kling 3,较省钱)
-  engine: "seedance"
+  # 视频生成引擎: seedance25(默认,Seedance 2.5,火山方舟官方 API,
+  # 需 ark_api_key,单组最长 30 秒)/ seedance(Seedance 2.0,fal.ai)/
+  # kling(Kling 3,fal.ai,较省钱)
+  engine: "seedance25"
   # 默认画幅: 16:9(横屏)/ 9:16(竖屏)/ 1:1(方形)/ 4:3(横幅)/ 3:4(竖幅)
   # Seedance 原生支持全部画幅;Kling 原生仅支持前三种,4:3 与 3:4 会按
   # 16:9 / 9:16 生成、成片时自动居中裁剪(导演模型会相应把主体放画面中部)
@@ -85,7 +114,8 @@ video:
   # (Seedance 开关音效同价)
   generate_audio: true
   # 分镜时长回退值(秒),3~15。影片由若干"镜头组"构成,每组内含 1~6 个
-  # 分镜、总长 3~15 秒(Seedance 为 4~15 秒),一组由模型一次性连续生成
+  # 分镜、总长 3~15 秒(Seedance 2.0 为 4~15 秒,Seedance 2.5 为 4~30 秒),
+  # 一组由模型一次性连续生成
   # (组内衔接由模型原生保证);各分镜时长由导演模型按叙事节奏决定,
   # 仅当模型未给出时使用此值
   clip_duration: 10

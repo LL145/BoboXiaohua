@@ -59,6 +59,7 @@ CONFIG_PATH = app_dir() / "config.yaml"
 _DEFAULTS: dict[str, Any] = {
     "openrouter_api_key": "",
     "fal_api_key": "",
+    "ark_api_key": "",
     "llm": {
         "model": "qwen/qwen3.8-max",
         "reasoning_effort": "high",
@@ -69,6 +70,12 @@ _DEFAULTS: dict[str, Any] = {
         "reference_endpoint": "bytedance/seedance-2.0/reference-to-video",
         "resolution": "720p",
         "price_per_second": 0.3034,
+    },
+    "seedance25": {
+        "model": "doubao-seedance-2-5-260628",
+        "api_base": "https://ark.cn-beijing.volces.com/api/v3",
+        "resolution": "720p",
+        "price_per_second": 0.21,
     },
     "kling": {
         "text_endpoint": "fal-ai/kling-video/v3/pro/text-to-video",
@@ -83,7 +90,7 @@ _DEFAULTS: dict[str, Any] = {
         "subtitles": True,
     },
     "video": {
-        "engine": "seedance",
+        "engine": "seedance25",
         "aspect_ratio": "16:9",
         "generate_audio": True,
         "clip_duration": 10,
@@ -131,19 +138,28 @@ class Config:
         return (self._data.get("fal_api_key") or "").strip()
 
     @property
+    def ark_api_key(self) -> str:
+        """火山方舟(Volcengine Ark)API KEY,Seedance 2.5 引擎使用。"""
+        return (self._data.get("ark_api_key") or "").strip()
+
+    @property
     def engine(self) -> str:
-        """视频生成引擎:seedance(默认)或 kling。"""
-        return str(self._data["video"].get("engine") or "seedance").strip().lower()
+        """视频生成引擎:seedance25(默认)、seedance 或 kling。"""
+        return str(self._data["video"].get("engine") or "seedance25").strip().lower()
 
     @property
     def engine_name(self) -> str:
         """引擎的展示名(日志用)。"""
-        return "Seedance 2.0" if self.engine == "seedance" else "Kling"
+        return {
+            "seedance": "Seedance 2.0",
+            "seedance25": "Seedance 2.5",
+        }.get(self.engine, "Kling")
 
     @property
     def engine_section(self) -> dict[str, Any]:
         """当前引擎的专属配置节(端点、单价等)。"""
-        return self._data["seedance" if self.engine == "seedance" else "kling"]
+        section = self.engine if self.engine in ("seedance", "seedance25") else "kling"
+        return self._data[section]
 
     @property
     def ffmpeg_path(self) -> str:
@@ -168,10 +184,19 @@ class Config:
         problems = []
         if not self.openrouter_api_key:
             problems.append("config.yaml 中缺少 openrouter_api_key")
-        if not self.fal_api_key:
+        if self.engine == "seedance25":
+            # Seedance 2.5 经火山方舟官方 API 生成,需要方舟 KEY;
+            # fal KEY 仅用于自动文生主角参考图,缺失时自动降级,不拦截
+            if not self.ark_api_key:
+                problems.append(
+                    "config.yaml 中缺少 ark_api_key(默认引擎 Seedance 2.5 需要"
+                    "火山方舟 API KEY;若想改用 fal.ai,把 video.engine 设为"
+                    " seedance 或 kling)"
+                )
+        elif not self.fal_api_key:
             problems.append("config.yaml 中缺少 fal_api_key")
-        if self.engine not in ("seedance", "kling"):
-            problems.append("video.engine 需为 seedance 或 kling")
+        if self.engine not in ("seedance", "seedance25", "kling"):
+            problems.append("video.engine 需为 seedance / seedance25 / kling 之一")
         if not 3 <= int(self._data["video"]["clip_duration"]) <= 15:
             problems.append("video.clip_duration 需在 3~15 秒之间")
         if str(self._data["video"]["aspect_ratio"]) not in (
@@ -182,13 +207,19 @@ class Config:
             "480p", "720p", "1080p", "4k"
         ):
             problems.append("seedance.resolution 需为 480p / 720p / 1080p / 4k 之一")
+        if str(self._data["seedance25"]["resolution"]) not in (
+            "480p", "720p", "1080p", "2k", "4k"
+        ):
+            problems.append(
+                "seedance25.resolution 需为 480p / 720p / 1080p / 2k / 4k 之一"
+            )
         if not 10 <= int(self._data["video"]["target_duration"]) <= 600:
             problems.append("video.target_duration 需在 10~600 秒之间")
         if float(self._data["video"]["transition"]) < 0:
             problems.append("video.transition 不能为负数")
         if not 0 <= float(self._data["narration"]["volume"]) <= 2:
             problems.append("narration.volume 需在 0~2 之间")
-        for section in ("seedance", "kling"):
+        for section in ("seedance", "seedance25", "kling"):
             if float(self._data[section]["price_per_second"]) < 0:
                 problems.append(
                     f"{section}.price_per_second 不能为负数(设 0 可关闭费用预估)"

@@ -1,15 +1,19 @@
-"""调用 fal.ai 生成素材:主角参考图(文生图)与各镜头组视频片段。
+"""调用视频引擎生成素材:主角参考图(文生图)与各镜头组视频片段。
 
-支持两个视频引擎(config.yaml 的 video.engine 切换,默认 seedance):
-- **Seedance 2.0**(字节跳动):多分镜用 "Cut scene to" 语法拼进单条 prompt
-  一次连续生成;有固定主角时走 reference-to-video,参考图经 image_urls 送入、
-  prompt 中以 @Image1 引用(导演脚本统一写 @Element1,提交前自动转换);
-  原生支持 16:9/9:16/1:1/3:4/4:3 全部画幅与音频。
-- **Kling 3**:多分镜走 multi_prompt 结构化参数;有固定主角时走
-  reference-to-video 的 elements 角色元素(@Element1);3:4/4:3 画幅按相邻
-  原生画幅生成、成片时居中裁剪。
+支持三个视频引擎(config.yaml 的 video.engine 切换,默认 seedance25):
+- **Seedance 2.0**(字节跳动,经 fal.ai):多分镜用 "Cut scene to" 语法拼进
+  单条 prompt 一次连续生成;有固定主角时走 reference-to-video,参考图经
+  image_urls 送入、prompt 中以 @Image1 引用(导演脚本统一写 @Element1,
+  提交前自动转换);原生支持 16:9/9:16/1:1/3:4/4:3 全部画幅与音频。
+- **Seedance 2.5**(字节跳动,经火山方舟官方 API,默认):fal.ai 尚未上线 2.5,
+  直连火山方舟(Volcengine Ark)的视频生成任务接口(需额外配 ark_api_key);
+  单组最长 30 秒一次连续生成,参考图以 base64 data URL 随请求送入
+  (role: reference_image),prompt 中按方舟官方语法以 @图片1 引用。
+- **Kling 3**(快手,经 fal.ai):多分镜走 multi_prompt 结构化参数;有固定
+  主角时走 reference-to-video 的 elements 角色元素(@Element1);3:4/4:3
+  画幅按相邻原生画幅生成、成片时居中裁剪。
 
-公共稳健性(两个引擎一致):提交/轮询/下载/超时看门狗/取消,任一环节失败
+公共稳健性(全部引擎一致):提交/轮询/下载/超时看门狗/取消,任一环节失败
 自动降级为纯文生视频,绝不因参考图问题导致整体失败。
 """
 
@@ -41,9 +45,12 @@ _MAX_SINGLE_PROMPT_CHARS = 2500  # 单 prompt 与 negative_prompt
 
 # Seedance 未公布 prompt 硬上限,取与 Kling 单 prompt 相同的保守值
 _MAX_SEEDANCE_PROMPT_CHARS = 2500
-# Seedance 单次生成时长范围(秒)
+# Seedance 2.0 单次生成时长范围(秒)
 _SEEDANCE_MIN_SECONDS = 4
 _SEEDANCE_MAX_SECONDS = 15
+# Seedance 2.5(火山方舟)单次生成时长范围(秒):官方支持一次连续生成 30 秒
+_ARK_MIN_SECONDS = 4
+_ARK_MAX_SECONDS = 30
 
 # Kling 视频端点原生支持的画幅;3:4 / 4:3 不被原生支持,
 # 按相邻原生画幅生成,拼接成片时再居中裁剪出目标画幅
@@ -67,30 +74,45 @@ def image_is_valid(path: Path) -> bool:
     return path.exists() and path.stat().st_size >= _MIN_IMAGE_BYTES
 
 
-def strip_reference_tokens(prompt: str) -> str:
-    """去掉 @Element1/@Image1 之类的占位符(括号内的外观描述保留),用于降级纯文生。
+# 中日韩统一表意文字:用于判断 prompt 语言,选择对应的多镜头衔接语法
+_CJK_RE = re.compile(r"[一-鿿]")
 
-    @Image1 是旧版脚本的参考图占位符,保留以兼容旧 manifest 的断点续传。
+
+def strip_reference_tokens(prompt: str) -> str:
+    """去掉 @Element1/@Image1/@图片1 之类的占位符(括号内的外观描述保留),用于降级纯文生。
+
+    @Image1/@图片1 是提交阶段或旧版脚本的参考图占位符,一并处理以兼容
+    旧 manifest 的断点续传。
     """
-    return re.sub(r"@(?:Element|Image)\d+\s*", "", prompt).strip()
+    return re.sub(r"@(?:Element|Image|图片)\d+\s*", "", prompt).strip()
 
 
 def element_to_image_tokens(prompt: str) -> str:
-    """把导演脚本统一使用的 @Element1 占位符转换为 Seedance 的 @Image1 引用。"""
+    """把导演脚本统一使用的 @Element1 占位符转换为 fal Seedance 的 @Image1 引用。"""
     return re.sub(r"@Element(\d+)", r"@Image\1", prompt)
 
 
+def element_to_ark_image_tokens(prompt: str) -> str:
+    """把 @Element1/@Image1 占位符转换为火山方舟官方的 @图片1 引用语法。"""
+    return re.sub(r"@(?:Element|Image)(\d+)", r"@图片\1", prompt)
+
+
 def join_cut_prompts(prompts: list[str]) -> str:
-    """按 Seedance 的多镜头语法把各分镜 prompt 拼成一条:镜头间用 "Cut scene to" 衔接。"""
+    """按 Seedance 的多镜头语法把各分镜 prompt 拼成一条。
+
+    镜头间衔接语按 prompt 语言选择:英文用 "Cut scene to",中文用「镜头切换:」
+    (与官方中文提示词指南一致);语言逐条判断,兼容旧 manifest 的英文脚本。
+    """
     parts: list[str] = []
     for prompt in prompts:
         prompt = prompt.strip()
         if not prompt:
             continue
+        is_cjk = bool(_CJK_RE.search(prompt))
         if parts:
-            prompt = "Cut scene to " + prompt
-        if not prompt.endswith((".", "!", "?")):
-            prompt += "."
+            prompt = ("镜头切换:" if is_cjk else "Cut scene to ") + prompt
+        if not prompt.endswith((".", "!", "?", "。", "!", "?")):
+            prompt += "。" if is_cjk else "."
         parts.append(prompt)
     return " ".join(parts)
 
@@ -101,11 +123,12 @@ def fit_prompt(prompt: str, limit: int) -> str:
     if len(prompt) <= limit:
         return prompt
     head = prompt[:limit]
-    # 取最靠后的分句边界截断,尽量少丢内容(尾部通常是 style_anchor 风格词)
-    pos = max(head.rfind(sep) for sep in (". ", "; ", ", "))
+    # 取最靠后的分句边界截断,尽量少丢内容(尾部通常是 style_anchor 风格词);
+    # 中英文标点都算边界
+    pos = max(head.rfind(sep) for sep in (". ", "; ", ", ", "。", ";", ",", "!", "?"))
     if pos >= limit // 2:
-        return head[:pos + 1].rstrip(" ,;")
-    return head.rsplit(" ", 1)[0].rstrip(" ,;.")
+        return head[:pos + 1].rstrip(" ,;,;")
+    return head.rsplit(" ", 1)[0].rstrip(" ,;.,;。")
 
 
 class FatalGenerationError(RuntimeError):
@@ -163,7 +186,10 @@ class _FalGenerator:
         }
         for attempt in (1, 2):
             try:
-                result = self._submit_and_wait(endpoint, arguments, timeout=600, label="参考图")
+                # 参考图文生图固定走 fal(视频引擎为方舟直连时亦然)
+                result = self._fal_submit_and_wait(
+                    endpoint, arguments, timeout=600, label="参考图"
+                )
                 url = result["images"][0]["url"]
                 self._download(url, out_path)
                 if not image_is_valid(out_path):
@@ -248,7 +274,13 @@ class _FalGenerator:
     def _submit_and_wait(
         self, endpoint: str, arguments: dict, timeout: float, label: str
     ) -> dict:
-        """提交任务并轮询直至完成,带超时看门狗与排队进度提示。"""
+        """提交视频任务并轮询直至完成;方舟直连引擎会覆写本方法。"""
+        return self._fal_submit_and_wait(endpoint, arguments, timeout, label)
+
+    def _fal_submit_and_wait(
+        self, endpoint: str, arguments: dict, timeout: float, label: str
+    ) -> dict:
+        """提交 fal 任务并轮询直至完成,带超时看门狗与排队进度提示。"""
         import fal_client
 
         try:
@@ -330,7 +362,7 @@ class _FalGenerator:
 
 
 class SeedanceGenerator(_FalGenerator):
-    """Seedance 2.0(字节跳动,经 fal.ai):默认视频引擎。"""
+    """Seedance 2.0(字节跳动,经 fal.ai):可选引擎(video.engine: seedance)。"""
 
     _ENGINE_LABEL = "Seedance"
 
@@ -373,6 +405,195 @@ class SeedanceGenerator(_FalGenerator):
         }
         if use_reference:
             arguments["image_urls"] = [reference_url]
+        return endpoint, arguments, use_reference
+
+
+class ArkSeedanceGenerator(_FalGenerator):
+    """Seedance 2.5(字节跳动,经火山方舟官方 API):默认视频引擎。
+
+    fal.ai 尚未上线 Seedance 2.5,因此直连火山方舟(Volcengine Ark)的
+    视频生成任务接口:POST 创建任务 → 轮询状态 → 下载成片,鉴权用 ark_api_key。
+    复用基类的重试/降级/下载/取消逻辑,仅替换任务提交与参考图上传:
+    参考图无需对象存储,直接编码为 base64 data URL 随请求送入
+    (role: reference_image);主角参考图的自动文生图仍走 fal,
+    未配置 fal_api_key 时自动跳过并降级纯文生视频。
+    """
+
+    _ENGINE_LABEL = "Seedance 2.5"
+
+    # ---------------- 方舟请求要素 ----------------
+
+    def _api_base(self) -> str:
+        return str(self._config["seedance25"]["api_base"]).rstrip("/")
+
+    def _headers(self) -> dict:
+        return {
+            "Authorization": f"Bearer {self._config.ark_api_key}",
+            "Content-Type": "application/json",
+        }
+
+    # ---------------- 参考图 ----------------
+
+    def upload_image(self, path: Path) -> str | None:
+        """方舟接口直接接受 base64 data URL,无需上传到 fal 存储。"""
+        from .director import _encode_image
+
+        url = _encode_image(path)
+        if url is None:
+            self._log(f"  读取主角图片失败: {path}")
+        return url
+
+    def generate_reference(self, prompt: str, out_path: Path) -> str | None:
+        """自动文生主角参考图仍走 fal;未配 fal KEY 时跳过(降级纯文生)。"""
+        if not self._config.fal_api_key:
+            self._log(
+                "  未配置 fal_api_key,跳过自动生成主角参考图"
+                "(可在界面上传主角图片替代)。"
+            )
+            return None
+        # fal 返回的参考图 URL 是公网可访问的,方舟可直接引用;
+        # 为稳妥起见改用已下载的本地文件编码为 data URL(不依赖 fal 链接时效)
+        if super().generate_reference(prompt, out_path) is None:
+            return None
+        return self.upload_image(out_path)
+
+    # ---------------- 任务提交与轮询 ----------------
+
+    def _submit_and_wait(
+        self, endpoint: str, arguments: dict, timeout: float, label: str
+    ) -> dict:
+        """提交方舟视频生成任务并轮询,返回与 fal 相同形状的结果字典。"""
+        try:
+            resp = requests.post(
+                endpoint, headers=self._headers(), json=arguments, timeout=60
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(f"{label} 任务提交失败(网络错误): {exc}") from exc
+        if resp.status_code != 200:
+            raise self._classify_ark(resp)
+        task_id = str(resp.json().get("id") or "")
+        if not task_id:
+            raise RuntimeError(f"{label} 任务提交异常:方舟未返回任务 ID")
+
+        poll_url = f"{endpoint}/{task_id}"
+        deadline = time.monotonic() + timeout
+        queued_notified = False
+        while True:
+            if self._cancel is not None and self._cancel.is_set():
+                self._ark_cancel(poll_url)
+                raise FatalGenerationError("已取消生成")
+            if time.monotonic() > deadline:
+                self._ark_cancel(poll_url)
+                raise RuntimeError(f"{label} 生成超时(超过 {int(timeout)} 秒)")
+            self._sleep(_POLL_INTERVAL)
+            try:
+                resp = requests.get(poll_url, headers=self._headers(), timeout=30)
+            except requests.RequestException:
+                continue  # 瞬时网络错误,继续等待
+            if resp.status_code != 200:
+                classified = self._classify_ark(resp)
+                if isinstance(classified, FatalGenerationError):
+                    raise classified
+                continue
+            data = resp.json()
+            status = str(data.get("status") or "").lower()
+            if status == "succeeded":
+                url = str((data.get("content") or {}).get("video_url") or "")
+                if not url:
+                    raise RuntimeError(f"{label} 任务完成但方舟未返回视频地址")
+                return {"video": {"url": url}}
+            if status in ("failed", "cancelled", "canceled", "expired"):
+                error = data.get("error") or {}
+                raise RuntimeError(
+                    f"{label} 生成失败({error.get('code', status)}):"
+                    f" {error.get('message', '无详细信息')}"
+                )
+            if status == "queued" and not queued_notified:
+                queued_notified = True
+                self._log(f"  {label} 排队中 …")
+
+    def _ark_cancel(self, poll_url: str) -> None:
+        """尽力取消方舟任务(仅排队/运行中的任务可取消,失败不影响主流程)。"""
+        try:
+            requests.delete(poll_url, headers=self._headers(), timeout=15)
+        except requests.RequestException:
+            pass
+
+    def _classify_ark(self, resp: requests.Response) -> Exception:
+        """把方舟的 HTTP 错误翻译成用户能看懂的提示;致命错误不再重试。"""
+        try:
+            error = resp.json().get("error") or {}
+        except ValueError:
+            error = {}
+        code = str(error.get("code") or "")
+        message = str(error.get("message") or resp.text[:300])
+        if resp.status_code in (401, 403):
+            return FatalGenerationError(
+                "火山方舟 API KEY 无效或无权限,请检查 config.yaml 中的 ark_api_key"
+            )
+        if resp.status_code == 404 or code in ("ModelNotFound", "ModelNotOpen"):
+            model = str(self._config["seedance25"]["model"])
+            return FatalGenerationError(
+                f"火山方舟模型不可用: {model}。请确认已在方舟控制台开通该模型,"
+                "并检查 config.yaml 中的 seedance25.model / seedance25.api_base"
+            )
+        if resp.status_code == 402 or code in ("AccountOverdueError", "QuotaExceeded"):
+            return FatalGenerationError(
+                "火山方舟账户余额不足或额度用尽,请前往火山引擎控制台充值"
+            )
+        exc = RuntimeError(f"火山方舟请求失败({code or resp.status_code}): {message}")
+        if resp.status_code == 400 and code not in ("RateLimitExceeded",):
+            # 参数校验/内容审核类 400 是确定性的,标记为 422 语义:
+            # generate_clip 会跳过重试,直接降级/报错
+            exc.status_code = 422
+        return exc
+
+    # ---------------- 请求参数 ----------------
+
+    def _build_arguments(
+        self, shot: Shot, reference_url: str | None
+    ) -> tuple[str, dict, bool]:
+        """多分镜以 "Cut scene to" 语法拼成单条 prompt,有主角以 reference_image 送入。"""
+        seedance25 = self._config["seedance25"]
+        video_cfg = self._config["video"]
+        combined = shot.combined_prompt.lower()
+        use_reference = bool(reference_url) and (
+            "@element" in combined or "@image" in combined or "@图片" in combined
+        )
+
+        if use_reference:
+            # 方舟官方语法:prompt 中以 @图片1 引用 content 里的第 1 张参考图
+            prompts = [element_to_ark_image_tokens(cut.prompt) for cut in shot.cuts]
+        else:
+            prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
+
+        prompt = join_cut_prompts(prompts)
+        if len(prompt) > _MAX_SEEDANCE_PROMPT_CHARS:
+            self._log(
+                f"  ⚠ 镜头组 {shot.index} 提示词超长({len(prompt)} 字符),"
+                f"已裁剪到 {_MAX_SEEDANCE_PROMPT_CHARS} 字符内"
+            )
+            prompt = fit_prompt(prompt, _MAX_SEEDANCE_PROMPT_CHARS)
+
+        content: list[dict] = [{"type": "text", "text": prompt}]
+        if use_reference:
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": reference_url},
+                "role": "reference_image",
+            })
+        duration = min(_ARK_MAX_SECONDS, max(_ARK_MIN_SECONDS, shot.duration))
+        arguments = {
+            "model": str(seedance25["model"]),
+            "content": content,
+            # Seedance 2.5 原生支持 16:9/9:16/1:1/3:4/4:3 全部画幅,无需映射裁剪
+            "ratio": str(video_cfg["aspect_ratio"]),
+            "resolution": str(seedance25["resolution"]),
+            "duration": duration,
+            "generate_audio": bool(video_cfg["generate_audio"]),
+            "watermark": False,
+        }
+        endpoint = f"{self._api_base()}/contents/generations/tasks"
         return endpoint, arguments, use_reference
 
 
@@ -448,6 +669,9 @@ class KlingGenerator(_FalGenerator):
 def create_generator(
     config: Config, log: LogFn, cancel_event: threading.Event | None = None
 ) -> _FalGenerator:
-    """按 video.engine 创建对应引擎的生成器(默认 seedance)。"""
-    cls = SeedanceGenerator if config.engine == "seedance" else KlingGenerator
+    """按 video.engine 创建对应引擎的生成器(默认 seedance25)。"""
+    cls = {
+        "seedance": SeedanceGenerator,
+        "seedance25": ArkSeedanceGenerator,
+    }.get(config.engine, KlingGenerator)
     return cls(config, log, cancel_event=cancel_event)
