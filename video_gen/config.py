@@ -75,6 +75,7 @@ _DEFAULTS: dict[str, Any] = {
         "model": "doubao-seedance-2-5-260628",
         "api_base": "https://ark.cn-beijing.volces.com/api/v3",
         "resolution": "720p",
+        "seed": -1,
         "price_per_second": 0.21,
     },
     "kling": {
@@ -213,6 +214,10 @@ class Config:
             problems.append(
                 "seedance25.resolution 需为 480p / 720p / 1080p / 2k / 4k 之一"
             )
+        try:
+            int(self._data["seedance25"].get("seed", -1))
+        except (TypeError, ValueError):
+            problems.append("seedance25.seed 需为整数(-1 表示每次随机)")
         if not 10 <= int(self._data["video"]["target_duration"]) <= 600:
             problems.append("video.target_duration 需在 10~600 秒之间")
         if float(self._data["video"]["transition"]) < 0:

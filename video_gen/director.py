@@ -320,12 +320,14 @@ prompt,格式如 {dialogue_example}(模型会原生生成配音与口型)。解�
 带台词的分镜要避免与旁白抢话,该组旁白应留白或极简。环境音效由模型自动生成,无需描述。
 
 ## 每个分镜 prompt 的结构({prompt_language},按顺序)
-1. Setting:环境、时间、天气、氛围;
-2. Subject:主体及关键外观细节(复用固定描述);
-3. Action:一个简单连贯的动作,可按"先……然后……"描述顺序,\
-   但幅度必须能在该分镜的 duration 秒内自然完成,禁止复杂多事件序列;
-4. Camera:一种明确的镜头运动 + 镜别({camera_example}),每分镜只用一种镜头运动;
-5. Lighting 与 style_anchor 风格词。
+1. Subject + Action(放在最前):开头直接写主体(复用固定外观描述)及其核心动作\
+——模型优先锁定 prompt 开头的内容,主体与动作绝不放后面;每个分镜只写**一个**\
+连贯的动作弧线,可按"先……然后……"描述顺序,但幅度必须能在该分镜的 duration \
+秒内自然完成,禁止塞进多个不相关动作(动作越多出错概率越高);
+2. Setting:环境、时间、天气、氛围;
+3. Camera:一种明确的镜头运动 + 镜别({camera_example}),每分镜只用一种镜头运动;
+4. Lighting:用一个准确有力的光影关键词({lighting_example}),\
+胜过堆砌一串形容词;最后接 style_anchor 风格词。
 
 {length_rule}
 
@@ -351,6 +353,7 @@ _LANG_PROMPT_PARTS = {
         ),
         "appearance_example": '"一只白色爪子、戴红色项圈的橘色虎斑猫"',
         "camera_example": '如"缓慢推近,中近景"/"航拍跟随,广角"',
+        "lighting_example": '如"黄金时刻逆光"/"清晨薄雾漫射光"',
         "dialogue_example": '……年轻女子抬起头,说:"我们出发吧"……',
         "length_rule": (
             "**长度约束**:每条分镜 prompt(含 style_anchor、角色外观描述与 "
@@ -367,6 +370,7 @@ _LANG_PROMPT_PARTS = {
         "camera_example": (
             '如 "slow dolly-in, medium close-up" / "aerial tracking shot, wide angle"'
         ),
+        "lighting_example": '如 "golden-hour backlight" / "soft misty morning light"',
         "dialogue_example": (
             '... the young woman looks up and says in Chinese: "我们出发吧" ...'
             "(中文台词保留中文原文)"
@@ -407,26 +411,35 @@ class Director:
     def __init__(self, config: Config):
         self._config = config
 
+    # 随创意发给导演模型的参考图上限(控制多模态消息体积;
+    # 生成阶段送入视频模型的张数上限见 kling.MAX_REFERENCE_IMAGES)
+    _MAX_DIRECTOR_IMAGES = 4
+
     def write_storyboard(
         self,
         description: str,
         bgm_options: list[str] | None = None,
         aspect_ratio: str = "",
-        reference_image: Path | None = None,
+        reference_images: list[tuple[Path, str]] | None = None,
     ) -> Storyboard:
         """根据用户一句话描述生成分镜脚本(含瞬时错误重试)。
 
-        reference_image 为用户上传的主角参考图:随创意一起发给导演模型,
-        让它照图写出固定的角色外观描述(@Element1)。
+        reference_images 为用户上传的参考图 [(路径, 用途说明)]:随创意一起
+        发给导演模型,让它照图写出固定的角色外观描述(@Element1)。
         """
-        image_data_url = _encode_image(reference_image) if reference_image else None
+        notes = [note for _, note in (reference_images or [])]
+        image_data_urls = [
+            url
+            for path, _ in (reference_images or [])[:self._MAX_DIRECTOR_IMAGES]
+            if (url := _encode_image(path)) is not None
+        ]
         last_error: Exception | None = None
         for attempt in range(3):
             try:
                 return self._write_once(
                     description, bgm_options, aspect_ratio,
-                    image_data_url=image_data_url,
-                    has_user_image=reference_image is not None,
+                    image_data_urls=image_data_urls,
+                    user_image_notes=notes if reference_images else None,
                 )
             except (requests.ConnectionError, requests.Timeout,
                     json.JSONDecodeError, KeyError, _RetryableHTTPError) as exc:
@@ -435,9 +448,9 @@ class Director:
             except RuntimeError as exc:
                 # 携带图片时失败可能是模型不支持图片输入:去掉图片降级重试
                 # (文字说明仍会告知模型存在用户参考图)
-                if image_data_url is None:
+                if not image_data_urls:
                     raise
-                image_data_url = None
+                image_data_urls = []
                 last_error = exc
         raise RuntimeError(f"分镜脚本生成失败: {last_error}") from last_error
 
@@ -468,8 +481,8 @@ class Director:
         description: str,
         bgm_options: list[str] | None = None,
         aspect_ratio: str = "",
-        image_data_url: str | None = None,
-        has_user_image: bool = False,
+        image_data_urls: list[str] | None = None,
+        user_image_notes: list[str] | None = None,
     ) -> Storyboard:
         # 镜头组数量与各分镜时长由导演模型按叙事节奏决定,
         # 只约束总时长落在目标值 ±15% 内;clip_duration 仅作缺省回退值。
@@ -503,15 +516,23 @@ class Director:
             note = self._KLING_CROP_NOTES.get(aspect, note)
         if note:
             user_message += f"\n\n{note}"
-        if has_user_image:
+        if user_image_notes is not None:
+            count = len(user_image_notes)
+            listing = "".join(
+                f"\n  图{i}:{note.strip() or '(未注明用途,默认为主角形象参考)'}"
+                for i, note in enumerate(user_image_notes, 1)
+            )
             user_message += (
-                "\n\n用户已上传主角参考图(消息附图即为该图,若你看不到图片则依据"
-                "创意内容推断主角外观)。该图会作为角色元素随每个镜头组送入视频模型"
-                "锁定主角外观,因此:\n"
-                "- 将该主角视为贯穿全片的固定主角;reference_prompt 置为空字符串"
-                "(参考图已由用户提供,无需再生成);\n"
+                f"\n\n用户已上传 {count} 张参考图(消息附图即为这些图,按顺序对应;"
+                "若你看不到图片则依据创意内容与下述用途说明推断),各图用途:"
+                f"{listing}\n"
+                "这些图会作为参考素材随每个镜头组送入视频模型锁定画面元素,因此:\n"
+                "- 将参考图中的主角视为贯穿全片的固定主角;reference_prompt 置为"
+                "空字符串(参考图已由用户提供,无需再生成);\n"
                 "- 所有涉及主角的分镜 prompt 一律写成 \"@Element1 (外观描述)\" 形式,"
-                "外观描述需与参考图一致,写成一段固定英文描述并逐字重复。"
+                "外观描述需与参考图一致,写成一段固定描述并逐字重复;\n"
+                "- 场景/风格用途的参考图无需占位符,把对应场景与风格特征写进"
+                "相关分镜的 prompt 即可。"
             )
         schema = _STORYBOARD_SCHEMA
         if bgm_options:
@@ -530,10 +551,10 @@ class Director:
         # 携带用户参考图时按多模态格式发送;模型不支持图片输入的情况由
         # write_storyboard 捕获后去图重试
         user_content: str | list = user_message
-        if image_data_url:
-            user_content = [
-                {"type": "text", "text": user_message},
-                {"type": "image_url", "image_url": {"url": image_data_url}},
+        if image_data_urls:
+            user_content = [{"type": "text", "text": user_message}] + [
+                {"type": "image_url", "image_url": {"url": url}}
+                for url in image_data_urls
             ]
 
         llm = self._config["llm"]
