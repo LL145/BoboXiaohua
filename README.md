@@ -19,7 +19,8 @@
 ③ Seedance 2.0(fal.ai)        → 多镜头并行生成,自带音效与配音
    │  有主角: reference-to-video    参考图随每个镜头送入,全片角色外观一致
    │  无主角: text-to-video         失败自动降级/重试,断点续传
-   │  可切换 Kling 3 引擎(费用更低,config.yaml 一行切换)
+   │  可切换 Seedance 2.5(火山方舟官方 API,单镜头组最长 30 秒)
+   │  或 Kling 3 引擎(费用更低),config.yaml 一行切换
    ▼
 ④ ffmpeg                        → 交叉溶解转场 + 首尾淡入淡出;
    │                              music/ 里有音频则由导演按情绪挑选混入
@@ -89,6 +90,19 @@ OpenRouter 上的任意模型(如 `anthropic/claude-fable-5`、`openai/gpt-5.2`�
 `google/gemini-3-pro`);把 `video.engine` 改为 `kling` 即切换到 **Kling 3 Pro**
 视频引擎(费用约为 Seedance 的一半)。
 
+想用字节最新的 **Seedance 2.5**(fal.ai 暂未上线,经火山方舟官方 API;
+单镜头组最长 30 秒一次连续生成,支持原生 4K):把 `video.engine` 改为
+`seedance25`,并额外填入火山方舟的 API KEY(在
+[方舟控制台](https://console.volcengine.com/ark) 创建 KEY 并开通该模型):
+
+```yaml
+ark_api_key: "..."                # 火山方舟 API Key(仅 seedance25 引擎需要)
+```
+
+此时 `fal_api_key` 变为可选(仅在自动文生主角参考图时用到,缺失则自动跳过、
+改为纯文生视频或使用你上传的主角图片)。海外用户可在 `seedance25.*` 中改用
+BytePlus 的地址与模型 ID(见配置注释)。
+
 ## 使用
 
 打开免安装版程序(或源码运行 `python main.py`)。
@@ -134,16 +148,19 @@ output/20260803_153000_雨巷橘猫/
 - **macOS 提示"已损坏"或"无法验证开发者"** — 因为程序未做付费签名。首次启动请
   右键(按住 Control 点击)→ 打开;若仍被拦截,在终端执行
   `xattr -cr AI短视频生成器.app` 后再打开。
-- **想换视频引擎/版本** — `video.engine` 可选 `seedance`(默认)或 `kling`;
-  各引擎的端点在 `seedance.*` / `kling.*` 中修改,可选端点见
-  [fal.ai 模型页](https://fal.ai/models)。注意旧版 Kling(2.x)仅支持 5/10 秒镜头且无原生音效。
+- **想换视频引擎/版本** — `video.engine` 可选 `seedance`(默认)、`seedance25`
+  (Seedance 2.5,火山方舟官方 API,需 `ark_api_key`)或 `kling`;
+  各引擎的端点/模型在 `seedance.*` / `seedance25.*` / `kling.*` 中修改,
+  fal 引擎的可选端点见 [fal.ai 模型页](https://fal.ai/models)。
+  注意旧版 Kling(2.x)仅支持 5/10 秒镜头且无原生音效。
 - **想换编剧模型** — 修改 `config.yaml` 中 `llm.model` 为 OpenRouter 上的任意模型 ID;
   `llm.reasoning_effort` 控制思考深度(不支持思考的模型自动忽略)。
 - **想省钱** — 把 `video.engine` 改为 `kling`(约 $0.168/秒,费用约为 Seedance 的一半),
   或把 `seedance.resolution` 降到 `480p`;Kling 引擎下 `video.generate_audio: false`
   还能再省约 1/3(Seedance 开关音效同价)。
-- **费用参考**(以 fal.ai 实时定价为准)— 60 秒成片:Seedance 2.0 标准档 720p 约
-  $18(1080p 约 $41);Kling 3 Pro 含音效约 $10,关音效约 $6.7;参考图 $0.08;
+- **费用参考**(以各平台实时定价为准)— 60 秒成片:Seedance 2.0 标准档 720p 约
+  $18(1080p 约 $41);Seedance 2.5(方舟按 token 计费)720p 约 $13;
+  Kling 3 Pro 含音效约 $10,关音效约 $6.7;参考图 $0.08;
   分镜脚本几美分到几十美分(视模型而定)。
 
 ## 发布新版本(维护者)

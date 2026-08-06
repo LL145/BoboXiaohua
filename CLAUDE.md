@@ -21,7 +21,8 @@ python main.py "一句话描述"        # 命令行模式,直接生成
 python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 dist/ 发布包
 ```
 
-- 运行依赖 `config.yaml`(程序目录下),需填 `openrouter_api_key` 与 `fal_api_key`;
+- 运行依赖 `config.yaml`(程序目录下),需填 `openrouter_api_key` 与 `fal_api_key`
+  (`video.engine: seedance25` 时改为必填 `ark_api_key`,fal KEY 变为可选);
   源码运行还需本机 ffmpeg/ffprobe(打包版已内置)。
 - 无测试套件、无 CI lint;改动后至少用 `python -c "import ast; ast.parse(open('...').read())"`
   或 `python -m py_compile` 做语法检查,纯逻辑可写临时脚本验证。
@@ -33,7 +34,8 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
 1. **director.py** — LLM 编剧+导演(默认 `qwen/qwen3.8-max`),经 OpenRouter
    (OpenAI 兼容接口)把一句话扩写为 `Storyboard`(含镜头组 `Shot` 列表,每组内含
    1~6 个分镜 `Cut`)。组内分镜由视频引擎一次连续生成,组间才用转场;
-   组总长上限 15 秒、下限随引擎(Kling 3 秒、Seedance 4 秒,`_engine_min_group`),
+   组总长上下限均随引擎(下限 Kling 3 秒、Seedance 4 秒,`_engine_min_group`;
+   上限 Seedance 2.5 为 30 秒、其余 15 秒,`_engine_max_group`),
    代码约束总时长在 `video.target_duration` ±15% 内并用 `_clamp_duration`/`_build_cuts`
    钳制;`video.clip_duration` 仅是模型未给时长时的回退值。单条分镜 prompt 要求模型
    控制在 450 字符内(Kling multi_prompt 有 512 字符硬上限)。系统提示词按引擎渲染
@@ -44,9 +46,13 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
    解说型逐组写中文旁白(`narration` 字段),沉浸型全部置空;角色台词直接写进分镜
    prompt(中文引号台词),由视频模型原生配音。请求带 `response_format: json_schema`,
    不支持结构化输出的模型由 `_extract_json` 容错兜底。
-2. **kling.py** — fal.ai 生成模块,双引擎:`_FalGenerator` 基类承载提交/轮询/下载/
+2. **kling.py** — 视频生成模块,三引擎:`_FalGenerator` 基类承载提交/轮询/下载/
    看门狗/取消/降级重试等公共逻辑,`create_generator` 按 `video.engine` 实例化
-   `SeedanceGenerator`(默认)或 `KlingGenerator`,子类只实现 `_build_arguments`。
+   `SeedanceGenerator`(默认)、`ArkSeedanceGenerator`(seedance25)或
+   `KlingGenerator`;fal 引擎的子类只实现 `_build_arguments`,方舟直连的
+   `ArkSeedanceGenerator` 另覆写 `_submit_and_wait`(HTTP 任务提交/轮询/取消,
+   返回与 fal 相同形状的结果)、`upload_image`(base64 data URL,不走 fal 存储)
+   与 `generate_reference`(文生图仍走 fal,无 fal KEY 时跳过降级)。
    参考图优先用用户上传的主角图片(pipeline 复制进任务目录并上传),否则有固定主角时
    先文生图;参考图任何一步失败自动降级纯文生视频(`strip_reference_tokens`
    去掉占位符,兼容旧 manifest 的 `@Image1`/`image_urls`)。
@@ -55,6 +61,14 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
      reference-to-video 的 `image_urls`,prompt 中 `@Element1` 经
      `element_to_image_tokens` 转为 `@Image1`;原生支持全部画幅与
      `resolution`(默认 720p);不支持 negative_prompt。
+   - **Seedance 2.5**(`video.engine: seedance25`):fal.ai 未上线,直连火山方舟
+     官方任务 API(`ark_api_key` 鉴权,POST `contents/generations/tasks` →
+     轮询 → 下载,DELETE 取消);prompt 拼接与 `@Image1` 引用同 Seedance 2.0,
+     参考图放 `content` 数组(`role: reference_image`,base64 data URL);
+     单组时长钳到 4~30,分辨率至 4K;方舟 400 参数/审核错误标记
+     `status_code=422` 复用确定性跳过重试逻辑;此引擎下 fal KEY 可选
+     (仅自动文生参考图用,缺失自动降级);BytePlus 经 `seedance25.api_base`/
+     `model` 切换。
    - **Kling 3**:多分镜走 multi_prompt 结构化参数;有主角走 `elements` 角色元素
      (prompt 中 `@Element1`);提交前 `fit_prompt` 按分句边界钳制到端点硬上限
      (multi_prompt 单条 512 字符,单 prompt/negative_prompt 2500)。画幅原生仅
@@ -86,7 +100,7 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
   (无 `engine` 字段的旧 manifest 视为 kling 任务)——所以 `Shot`/`Storyboard`
   字段变更要保持 `from_dict` 对旧 manifest 兼容(用 `.get()` + 默认值)。
 - **配置兼容**:引擎无关参数(画幅/音效/重试/并发/超时等)在 `video` 节,引擎专属
-  参数在 `seedance`/`kling` 节;`load_config` 会把旧版配置中 kling 节里的引擎无关
+  参数在 `seedance`/`seedance25`/`kling` 节;`load_config` 会把旧版配置中 kling 节里的引擎无关
   参数自动迁移到 video 节。
 - **提示词一致性**:分镜脚本要求每个分镜 prompt 逐字重复 style_anchor 与角色外观描述,
   禁止跨组/跨分镜指代(镜头组之间相互独立生成);有主角时 prompt 统一用

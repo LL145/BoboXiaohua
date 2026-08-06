@@ -21,17 +21,28 @@ _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 _RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504, 524}
 
 # 镜头组时长约束(秒):一个镜头组一次生成,总长下限随引擎而异
-# (Kling 3 为 3 秒,Seedance 2.0 为 4 秒),上限均为 15;
-# 组内单个分镜最短可到 1 秒
+# (Kling 3 为 3 秒,Seedance 为 4 秒),上限也随引擎(Seedance 2.5 经
+# 火山方舟一次可连续生成 30 秒,其余引擎为 15 秒);组内单个分镜最短可到 1 秒
 _MIN_GROUP_SECONDS = 3
 _SEEDANCE_MIN_GROUP_SECONDS = 4
 _MAX_GROUP_SECONDS = 15
+_SEEDANCE25_MAX_GROUP_SECONDS = 30
 _MIN_CUT_SECONDS = 1
 _MAX_CUTS_PER_GROUP = 6  # Kling multi_prompt 上限,Seedance 沿用同一节奏约束
 
 
 def _engine_min_group(engine: str) -> int:
-    return _SEEDANCE_MIN_GROUP_SECONDS if engine == "seedance" else _MIN_GROUP_SECONDS
+    return (
+        _SEEDANCE_MIN_GROUP_SECONDS if engine.startswith("seedance")
+        else _MIN_GROUP_SECONDS
+    )
+
+
+def _engine_max_group(engine: str) -> int:
+    return (
+        _SEEDANCE25_MAX_GROUP_SECONDS if engine == "seedance25"
+        else _MAX_GROUP_SECONDS
+    )
 # Kling 对 multi_prompt 单条分镜提示词有 512 字符硬上限(超长直接 422 拒绝),
 # 要求模型控制在 450 以内留出余量;kling.py 提交前还会做最终钳制兜底
 _MAX_PROMPT_CHARS = 450
@@ -57,10 +68,13 @@ def _encode_image(path: Path) -> str | None:
     return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
 
 
-def _clamp_duration(value, fallback: int, minimum: int = _MIN_GROUP_SECONDS) -> int:
-    """把模型给出的时长钳制到 Kling 支持的范围;缺失/非法时用回退值。"""
+def _clamp_duration(
+    value, fallback: int,
+    minimum: int = _MIN_GROUP_SECONDS, maximum: int = _MAX_GROUP_SECONDS,
+) -> int:
+    """把模型给出的时长钳制到引擎支持的范围;缺失/非法时用回退值。"""
     try:
-        return max(minimum, min(_MAX_GROUP_SECONDS, int(value)))
+        return max(minimum, min(maximum, int(value)))
     except (TypeError, ValueError):
         return fallback
 
@@ -258,7 +272,7 @@ _SYSTEM_PROMPT = """\
 景别推进、正反打应放进同一组;切换场景、时间跳跃、叙事段落转折时才另起一组;
 - 组间拼接使用交叉溶解转场,适合承担章节感的切换;
 - 每个分镜 duration 为 1~15 的整数(秒);一个组内全部分镜时长之和必须为 \
-{group_min}~15 秒;
+{group_min}~{group_max} 秒;
 - 全部镜头组时长之和必须落在 {total_min}~{total_max} 秒之间,尽量接近 {target} 秒;
 - 节奏由你掌控:动作、冲突、快切用 1~3 秒的短分镜(放在同一组内连续快切),\
 常规叙事用 4~8 秒,氛围铺陈、情绪高潮、收尾用 9~15 秒的单分镜组;不要所有分镜等长。
@@ -416,6 +430,7 @@ class Director:
         fallback_duration = int(config["video"]["clip_duration"])
         engine = config.engine
         min_group = _engine_min_group(engine)
+        max_group = _engine_max_group(engine)
         target = int(config["video"]["target_duration"])
         total_min = max(min_group, round(target * 0.85))
         total_max = round(target * 1.15)
@@ -425,6 +440,7 @@ class Director:
         system = _SYSTEM_PROMPT.format(
             engine_name=config.engine_name,
             group_min=min_group,
+            group_max=max_group,
             target=target,
             total_min=total_min,
             total_max=total_max,
@@ -533,22 +549,28 @@ class Director:
 
         content = message.get("content") or ""
         parsed = _extract_json(content)
-        return self._build_storyboard(parsed, max_shots, fallback_duration, min_group)
+        return self._build_storyboard(
+            parsed, max_shots, fallback_duration, min_group, max_group
+        )
 
     # ---------------- 结果组装 ----------------
 
     @staticmethod
     def _build_cuts(
-        raw: dict, fallback_duration: int, min_group: int = _MIN_GROUP_SECONDS
+        raw: dict,
+        fallback_duration: int,
+        min_group: int = _MIN_GROUP_SECONDS,
+        max_group: int = _MAX_GROUP_SECONDS,
     ) -> list[Cut]:
-        """解析并钳制一个镜头组的分镜:单分镜 1~15 秒,组总长 min_group~15 秒。"""
+        """解析并钳制一个镜头组的分镜:单分镜 1~15 秒,组总长 min_group~max_group 秒。"""
         raw_cuts = raw.get("cuts")
         if not isinstance(raw_cuts, list) or not raw_cuts:
             # 模型未按新结构输出时,兼容平铺的 prompt/duration
             return [Cut(
                 prompt=str(raw.get("prompt", "")),
                 duration=_clamp_duration(
-                    raw.get("duration"), fallback_duration, minimum=min_group
+                    raw.get("duration"), fallback_duration,
+                    minimum=min_group, maximum=max_group,
                 ),
             )]
         cuts = [
@@ -566,13 +588,13 @@ class Director:
         # 组总长不足引擎下限时,逐秒补齐最短的分镜
         while sum(c.duration for c in cuts) < min_group:
             min(cuts, key=lambda c: c.duration).duration += 1
-        # 组总长超过上限时按比例压缩,再逐一削减到不超过 15 秒
+        # 组总长超过引擎上限时按比例压缩,再逐一削减到不超过上限
         total = sum(c.duration for c in cuts)
-        if total > _MAX_GROUP_SECONDS:
-            scale = _MAX_GROUP_SECONDS / total
+        if total > max_group:
+            scale = max_group / total
             for c in cuts:
                 c.duration = max(_MIN_CUT_SECONDS, int(c.duration * scale))
-            while sum(c.duration for c in cuts) > _MAX_GROUP_SECONDS:
+            while sum(c.duration for c in cuts) > max_group:
                 longest = max(cuts, key=lambda c: c.duration)
                 if longest.duration <= _MIN_CUT_SECONDS:
                     break
@@ -586,6 +608,7 @@ class Director:
         max_shots: int,
         fallback_duration: int,
         min_group: int = _MIN_GROUP_SECONDS,
+        max_group: int = _MAX_GROUP_SECONDS,
     ) -> Storyboard:
         raw_shots = data["shots"][:max_shots]
         if not raw_shots:
@@ -596,7 +619,7 @@ class Director:
                 title=str(raw["title"]),
                 negative_prompt=str(raw.get("negative_prompt", "")),
                 narration=str(raw.get("narration", "")).strip(),
-                cuts=cls._build_cuts(raw, fallback_duration, min_group),
+                cuts=cls._build_cuts(raw, fallback_duration, min_group, max_group),
             )
             for i, raw in enumerate(raw_shots)
         ]

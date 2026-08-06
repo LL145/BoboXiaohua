@@ -2,7 +2,8 @@
 → 旁白配音 → 拼接成片(转场/旁白/背景音乐/字幕)。
 
 稳健性设计:
-- 生成前预检:先校验 OpenRouter KEY、fal KEY 与磁盘空间,配错即刻提示,不浪费费用;
+- 生成前预检:先校验 OpenRouter KEY、fal KEY(方舟直连引擎则校验 ark KEY)
+  与磁盘空间,配错即刻提示,不浪费费用;
 - 断点续传:同一描述的未完成任务会复用已有分镜脚本、参考图、旁白音频和
   已生成片段,失败后再次点击「生成」只补齐缺失部分,不重复扣费;
 - 主角参考图:用户可上传主角图片(随创意发给导演模型照图写外观描述),
@@ -370,22 +371,47 @@ class Pipeline:
             pass  # 网络抖动不拦截,后续请求失败时会再给出明确提示
 
         # fal key 探测:查询一个不存在的任务,零费用;key 无效时 fal 返回 401/403,
-        # 有效时仅是任务不存在(404 等),其余状态一律放行
-        try:
-            endpoint = str(self._config.engine_section["text_endpoint"])
-            app_root = "/".join(endpoint.split("/")[:2])
-            resp = requests.get(
-                f"https://queue.fal.run/{app_root}/requests/"
-                "00000000-0000-0000-0000-000000000000/status",
-                headers={"Authorization": f"Key {self._config.fal_api_key}"},
-                timeout=10,
-            )
-            if resp.status_code in (401, 403):
-                raise RuntimeError(
-                    "fal.ai API KEY 无效,请检查 config.yaml 中的 fal_api_key"
+        # 有效时仅是任务不存在(404 等),其余状态一律放行。
+        # 方舟直连引擎(seedance25)的 fal 仅用于自动文生参考图,未配 KEY 时跳过
+        if self._config.fal_api_key:
+            try:
+                endpoint = str(
+                    self._config.engine_section.get("text_endpoint")
+                    or self._config["image"]["endpoint"]
                 )
-        except requests.RequestException:
-            pass
+                app_root = "/".join(endpoint.split("/")[:2])
+                resp = requests.get(
+                    f"https://queue.fal.run/{app_root}/requests/"
+                    "00000000-0000-0000-0000-000000000000/status",
+                    headers={"Authorization": f"Key {self._config.fal_api_key}"},
+                    timeout=10,
+                )
+                if resp.status_code in (401, 403):
+                    raise RuntimeError(
+                        "fal.ai API KEY 无效,请检查 config.yaml 中的 fal_api_key"
+                    )
+            except requests.RequestException:
+                pass
+
+        # 方舟 key 探测(Seedance 2.5):查询一个不存在的任务,零费用;
+        # key 无效返回 401/403,有效时仅是任务不存在(404),其余状态一律放行
+        if self._config.engine == "seedance25":
+            try:
+                api_base = str(self._config.engine_section["api_base"]).rstrip("/")
+                resp = requests.get(
+                    f"{api_base}/contents/generations/tasks/"
+                    "cgt-00000000000000-00000",
+                    headers={
+                        "Authorization": f"Bearer {self._config.ark_api_key}"
+                    },
+                    timeout=10,
+                )
+                if resp.status_code in (401, 403):
+                    raise RuntimeError(
+                        "火山方舟 API KEY 无效,请检查 config.yaml 中的 ark_api_key"
+                    )
+            except requests.RequestException:
+                pass
 
         try:
             free_gb = shutil.disk_usage(self._config.output_dir).free / 2**30
