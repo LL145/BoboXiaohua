@@ -185,7 +185,7 @@ class App:
         else:
             self.ref_var.set(
                 f"参考图 {len(picked)} 张(用途已标注;Seedance 引擎支持多图,"
-                "Kling 仅作同一主角的多角度参考)"
+                "Kling 仅作同一主角的多角度参考,即梦引擎不支持参考图)"
             )
         self.ref_clear_btn.config(state="normal")
 

@@ -12,6 +12,10 @@
 - **Kling 3**(快手,经 fal.ai):多分镜走 multi_prompt 结构化参数;有固定
   主角时走 reference-to-video 的 elements 角色元素(@Element1);3:4/4:3
   画幅按相邻原生画幅生成、成片时居中裁剪。
+- **即梦 3.0 Pro**(字节跳动,经火山引擎视觉智能官方 API):适合已有
+  即梦/火山引擎 AK+SK 的用户,用 HMAC-SHA256 V4 签名鉴权(无需方舟/fal
+  KEY);单次生成固定 5 秒或 10 秒,原生支持全部画幅;不支持参考图与
+  原生音效,角色一致性靠导演脚本逐字重复的外观描述保证。
 
 公共稳健性(全部引擎一致):提交/轮询/下载/超时看门狗/取消,任一环节失败
 自动降级为纯文生视频,绝不因参考图问题导致整体失败。
@@ -19,6 +23,10 @@
 
 from __future__ import annotations
 
+import datetime
+import hashlib
+import hmac
+import json
 import os
 import re
 import threading
@@ -51,12 +59,18 @@ _SEEDANCE_MAX_SECONDS = 15
 # Seedance 2.5(火山方舟)单次生成时长范围(秒):官方支持一次连续生成 30 秒
 _ARK_MIN_SECONDS = 4
 _ARK_MAX_SECONDS = 30
+# 即梦(火山引擎视觉智能 API)单次只能生成 5 秒或 10 秒(frames = 24×秒数 + 1)
+_JIMENG_DURATIONS = (5, 10)
+_JIMENG_API_VERSION = "2022-08-31"
+# 即梦业务错误中重试无意义的确定性错误码:参数无效与输入/输出内容审核未通过
+_JIMENG_DETERMINISTIC_CODES = {50400, 50411, 50412, 50413, 50511, 50512}
 
 # 各引擎支持的参考图张数上限(超出部分按顺序丢弃,pipeline 会提前告知用户)
 MAX_REFERENCE_IMAGES = {
     "seedance25": 30,  # 方舟官方:单次最多 30 张参考图
     "seedance": 9,     # fal reference-to-video:最多 9 张
     "kling": 4,        # elements 单角色的多角度参考,保守取 4 张
+    "jimeng": 0,       # 即梦 API 不支持角色参考图(靠外观描述保持一致)
 }
 
 # Kling 视频端点原生支持的画幅;3:4 / 4:3 不被原生支持,
@@ -179,6 +193,128 @@ def fit_prompt(prompt: str, limit: int) -> str:
 
 class FatalGenerationError(RuntimeError):
     """重试无意义的错误(KEY 无效、余额不足等),应立即终止全部镜头。"""
+
+
+# ---------------- 即梦(火山引擎视觉智能 API)公共请求 ----------------
+
+def _volc_sign_headers(
+    access_key: str, secret_key: str, host: str, region: str,
+    query: str, body: bytes,
+) -> dict:
+    """火山引擎 OpenAPI 的 HMAC-SHA256 V4 签名请求头(service 固定为 cv)。
+
+    query 必须已按参数名字典序排列(即梦仅 Action/Version 两个参数,天然有序)。
+    """
+    service = "cv"
+    x_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    short_date = x_date[:8]
+    payload_hash = hashlib.sha256(body).hexdigest()
+    content_type = "application/json"
+    canonical_headers = (
+        f"content-type:{content_type}\nhost:{host}\n"
+        f"x-content-sha256:{payload_hash}\nx-date:{x_date}\n"
+    )
+    signed_headers = "content-type;host;x-content-sha256;x-date"
+    canonical_request = "\n".join(
+        ["POST", "/", query, canonical_headers, signed_headers, payload_hash]
+    )
+    scope = f"{short_date}/{region}/{service}/request"
+    string_to_sign = "\n".join([
+        "HMAC-SHA256", x_date, scope,
+        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+    ])
+
+    def _hmac(key: bytes, msg: str) -> bytes:
+        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    k_signing = _hmac(_hmac(_hmac(_hmac(
+        secret_key.encode("utf-8"), short_date), region), service), "request")
+    signature = hmac.new(
+        k_signing, string_to_sign.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return {
+        "Content-Type": content_type,
+        "Host": host,
+        "X-Content-Sha256": payload_hash,
+        "X-Date": x_date,
+        "Authorization": (
+            f"HMAC-SHA256 Credential={access_key}/{scope}, "
+            f"SignedHeaders={signed_headers}, Signature={signature}"
+        ),
+    }
+
+
+def _jimeng_post(config: Config, action: str, payload: dict) -> requests.Response:
+    """向即梦(火山引擎视觉智能)API 发起一次带 V4 签名的 POST 请求。"""
+    jimeng = config["jimeng"]
+    host = str(jimeng["host"]).strip()
+    region = str(jimeng["region"]).strip()
+    query = f"Action={action}&Version={_JIMENG_API_VERSION}"
+    body = json.dumps(payload).encode("utf-8")
+    headers = _volc_sign_headers(
+        config.jimeng_access_key, config.jimeng_secret_key,
+        host, region, query, body,
+    )
+    return requests.post(
+        f"https://{host}/?{query}", headers=headers, data=body, timeout=60
+    )
+
+
+def _jimeng_error(resp: requests.Response) -> Exception | None:
+    """解析即梦响应中的错误;成功(code 10000)返回 None。
+
+    两类错误形态:网关错误(HTTP 4xx,ResponseMetadata.Error,签名/权限类)
+    与业务错误(通常 HTTP 200 但 code != 10000,参数/审核/限流类)。
+    """
+    try:
+        data = resp.json()
+    except ValueError:
+        return RuntimeError(f"即梦请求失败 HTTP {resp.status_code}: {resp.text[:300]}")
+    gateway = ((data.get("ResponseMetadata") or {}).get("Error") or {})
+    if gateway:
+        code = str(gateway.get("Code") or "")
+        message = str(gateway.get("Message") or "")
+        if any(k in code for k in ("Signature", "Credential", "AccessKey", "Auth")):
+            return FatalGenerationError(
+                "即梦 AK/SK 无效(签名校验失败),请检查 config.yaml 中的"
+                " jimeng_access_key 与 jimeng_secret_key"
+            )
+        if any(k in code for k in ("AccessDenied", "Forbidden", "Unauthorized")):
+            return FatalGenerationError(
+                "即梦服务无权限或未开通,请在火山引擎控制台开通「即梦AI」"
+                "视频生成服务,并确认 AK 所属账号有调用权限"
+            )
+        return RuntimeError(f"即梦请求失败({code}): {message[:300]}")
+    code = data.get("code")
+    if code is None and resp.status_code != 200:
+        return RuntimeError(f"即梦请求失败 HTTP {resp.status_code}: {resp.text[:300]}")
+    if code is not None and int(code) != 10000:
+        message = str(data.get("message") or "")
+        exc = RuntimeError(f"即梦生成失败({code}): {message[:300]}")
+        if int(code) in _JIMENG_DETERMINISTIC_CODES:
+            # 参数无效/内容审核未通过是确定性的,标记 422 语义跳过重试
+            exc.status_code = 422
+        return exc
+    return None
+
+
+def jimeng_credentials_problem(config: Config) -> str | None:
+    """零费用探测即梦 AK/SK:查询一个不存在的任务。
+
+    凭证无效会得到签名/权限类致命错误;凭证有效仅是任务不存在(业务错误)。
+    网络异常返回 None 不拦截,后续请求失败时会再给出明确提示。
+    """
+    try:
+        resp = _jimeng_post(config, "CVSync2AsyncGetResult", {
+            "req_key": str(config["jimeng"]["req_key"]),
+            "task_id": "0",
+        })
+    except requests.RequestException:
+        return None
+    error = _jimeng_error(resp)
+    if isinstance(error, FatalGenerationError):
+        return str(error)
+    return None
 
 
 class _FalGenerator:
@@ -746,6 +882,136 @@ class KlingGenerator(_FalGenerator):
         return endpoint, arguments, use_reference
 
 
+class JimengGenerator(_FalGenerator):
+    """即梦 3.0 Pro(字节跳动,经火山引擎视觉智能官方 API):可选引擎
+    (video.engine: jimeng),适合已有即梦/火山引擎 AK+SK 的用户。
+
+    与方舟/fal 引擎的差异:鉴权用 AK/SK 的 HMAC-SHA256 V4 签名(不需要
+    ark/fal KEY);单次生成固定 5 秒或 10 秒(镜头组时长就近取整);
+    不支持角色参考图与原生音效——角色一致性由导演脚本在每个分镜逐字重复
+    的外观描述保证,旁白解说(Edge TTS)与背景音乐不受影响。
+    复用基类的重试/下载/取消逻辑,覆写任务提交轮询与参考图相关方法。
+    """
+
+    _ENGINE_LABEL = "即梦"
+
+    def __init__(
+        self,
+        config: Config,
+        log: LogFn,
+        cancel_event: threading.Event | None = None,
+    ):
+        # 不调用基类 __init__:即梦引擎全程不使用 fal,避免写 FAL_KEY 环境变量
+        self._config = config
+        self._log = log
+        self._cancel = cancel_event
+
+    # ---------------- 参考图(即梦 API 不支持) ----------------
+
+    def upload_image(self, path: Path) -> str | None:
+        self._log("  当前引擎「即梦」不支持参考图,已忽略该图片。")
+        return None
+
+    def generate_reference(self, prompt: str, out_path: Path) -> str | None:
+        return None
+
+    # ---------------- 任务提交与轮询 ----------------
+
+    def _submit_and_wait(
+        self, endpoint: str, arguments: dict, timeout: float, label: str
+    ) -> dict:
+        """提交即梦视频生成任务并轮询,返回与 fal 相同形状的结果字典。"""
+        try:
+            resp = _jimeng_post(self._config, "CVSync2AsyncSubmitTask", arguments)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"{label} 任务提交失败(网络错误): {exc}") from exc
+        error = _jimeng_error(resp)
+        if error is not None:
+            raise error
+        task_id = str(((resp.json().get("data") or {}).get("task_id")) or "")
+        if not task_id:
+            raise RuntimeError(f"{label} 任务提交异常:即梦未返回任务 ID")
+
+        poll_payload = {
+            "req_key": arguments["req_key"],
+            "task_id": task_id,
+            # 要求以 URL 形式返回成片(否则可能只给 base64)
+            "req_json": json.dumps({"return_url": True}),
+        }
+        deadline = time.monotonic() + timeout
+        queued_notified = False
+        while True:
+            # 即梦 API 无取消接口:取消/超时后停止轮询即可,不再产生新请求
+            if self._cancel is not None and self._cancel.is_set():
+                raise FatalGenerationError("已取消生成")
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"{label} 生成超时(超过 {int(timeout)} 秒)")
+            self._sleep(_POLL_INTERVAL)
+            try:
+                resp = _jimeng_post(
+                    self._config, "CVSync2AsyncGetResult", poll_payload
+                )
+            except requests.RequestException:
+                continue  # 瞬时网络错误,继续等待
+            error = _jimeng_error(resp)
+            if error is not None:
+                if isinstance(error, FatalGenerationError):
+                    raise error
+                if getattr(error, "status_code", None) == 422:
+                    raise error  # 内容审核未通过等确定性失败
+                continue  # 瞬时错误(限流/5xx),继续等待
+            data = resp.json().get("data") or {}
+            status = str(data.get("status") or "").lower()
+            if status == "done":
+                url = str(
+                    data.get("video_url")
+                    or ((data.get("urls") or [None])[0] or "")
+                )
+                if not url:
+                    raise RuntimeError(f"{label} 任务完成但即梦未返回视频地址")
+                return {"video": {"url": url}}
+            if status in ("not_found", "expired"):
+                raise RuntimeError(f"{label} 生成失败:即梦任务状态为 {status}")
+            if status == "in_queue" and not queued_notified:
+                queued_notified = True
+                self._log(f"  {label} 排队中 …")
+
+    # ---------------- 请求参数 ----------------
+
+    def _build_arguments(
+        self, shot: Shot, references: list[tuple[str, str]] | None
+    ) -> tuple[str, dict, bool]:
+        """多分镜拼成单条中文 prompt;时长就近取 5 或 10 秒;不使用参考图。"""
+        jimeng = self._config["jimeng"]
+        video_cfg = self._config["video"]
+        prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
+        prompt = join_cut_prompts(prompts)
+        if len(prompt) > _MAX_SEEDANCE_PROMPT_CHARS:
+            self._log(
+                f"  ⚠ 镜头组 {shot.index} 提示词超长({len(prompt)} 字符),"
+                f"已裁剪到 {_MAX_SEEDANCE_PROMPT_CHARS} 字符内"
+            )
+            prompt = fit_prompt(prompt, _MAX_SEEDANCE_PROMPT_CHARS)
+
+        # 即梦仅支持 5 秒或 10 秒,就近取整(导演脚本已按 5/10 秒设计,
+        # 此处兜底旧 manifest 与模型偏差)
+        duration = min(_JIMENG_DURATIONS, key=lambda d: abs(d - shot.duration))
+        arguments: dict = {
+            "req_key": str(jimeng["req_key"]),
+            "prompt": prompt,
+            "frames": duration * 24 + 1,
+            # 即梦原生支持 16:9/9:16/1:1/3:4/4:3(以及 21:9),无需映射裁剪
+            "aspect_ratio": str(video_cfg["aspect_ratio"]),
+        }
+        try:
+            seed = int(jimeng.get("seed", -1))
+        except (TypeError, ValueError):
+            seed = -1
+        if seed >= 0:
+            arguments["seed"] = seed
+        return f"https://{jimeng['host']}", arguments, False
+
+
 def create_generator(
     config: Config, log: LogFn, cancel_event: threading.Event | None = None
 ) -> _FalGenerator:
@@ -753,5 +1019,6 @@ def create_generator(
     cls = {
         "seedance": SeedanceGenerator,
         "seedance25": ArkSeedanceGenerator,
+        "jimeng": JimengGenerator,
     }.get(config.engine, KlingGenerator)
     return cls(config, log, cancel_event=cancel_event)

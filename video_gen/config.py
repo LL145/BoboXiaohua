@@ -60,6 +60,8 @@ _DEFAULTS: dict[str, Any] = {
     "openrouter_api_key": "",
     "fal_api_key": "",
     "ark_api_key": "",
+    "jimeng_access_key": "",
+    "jimeng_secret_key": "",
     "llm": {
         "model": "qwen/qwen3.8-max",
         "reasoning_effort": "high",
@@ -82,6 +84,13 @@ _DEFAULTS: dict[str, Any] = {
         "text_endpoint": "fal-ai/kling-video/v3/pro/text-to-video",
         "reference_endpoint": "fal-ai/kling-video/o3/pro/reference-to-video",
         "price_per_second": 0.168,
+    },
+    "jimeng": {
+        "req_key": "jimeng_ti2v_v30_pro",
+        "host": "visual.volcengineapi.com",
+        "region": "cn-north-1",
+        "seed": -1,
+        "price_per_second": 0.04,
     },
     "image": {"endpoint": "fal-ai/nano-banana-2"},
     "narration": {
@@ -144,8 +153,18 @@ class Config:
         return (self._data.get("ark_api_key") or "").strip()
 
     @property
+    def jimeng_access_key(self) -> str:
+        """火山引擎 Access Key ID,即梦引擎的 AK/SK 签名鉴权使用。"""
+        return (self._data.get("jimeng_access_key") or "").strip()
+
+    @property
+    def jimeng_secret_key(self) -> str:
+        """火山引擎 Secret Access Key,即梦引擎的 AK/SK 签名鉴权使用。"""
+        return (self._data.get("jimeng_secret_key") or "").strip()
+
+    @property
     def engine(self) -> str:
-        """视频生成引擎:seedance25(默认)、seedance 或 kling。"""
+        """视频生成引擎:seedance25(默认)、seedance、kling 或 jimeng。"""
         return str(self._data["video"].get("engine") or "seedance25").strip().lower()
 
     @property
@@ -154,12 +173,16 @@ class Config:
         return {
             "seedance": "Seedance 2.0",
             "seedance25": "Seedance 2.5",
+            "jimeng": "即梦 3.0 Pro",
         }.get(self.engine, "Kling")
 
     @property
     def engine_section(self) -> dict[str, Any]:
         """当前引擎的专属配置节(端点、单价等)。"""
-        section = self.engine if self.engine in ("seedance", "seedance25") else "kling"
+        section = (
+            self.engine if self.engine in ("seedance", "seedance25", "jimeng")
+            else "kling"
+        )
         return self._data[section]
 
     @property
@@ -194,10 +217,21 @@ class Config:
                     "火山方舟 API KEY;若想改用 fal.ai,把 video.engine 设为"
                     " seedance 或 kling)"
                 )
+        elif self.engine == "jimeng":
+            # 即梦经火山引擎视觉智能 API 生成,用 AK/SK 签名鉴权;
+            # 其余 KEY(fal/方舟)均不需要
+            if not self.jimeng_access_key or not self.jimeng_secret_key:
+                problems.append(
+                    "config.yaml 中缺少 jimeng_access_key / jimeng_secret_key"
+                    "(即梦引擎需要火山引擎的 AK/SK,在火山引擎控制台"
+                    "「访问控制-密钥管理」中获取)"
+                )
         elif not self.fal_api_key:
             problems.append("config.yaml 中缺少 fal_api_key")
-        if self.engine not in ("seedance", "seedance25", "kling"):
-            problems.append("video.engine 需为 seedance / seedance25 / kling 之一")
+        if self.engine not in ("seedance", "seedance25", "kling", "jimeng"):
+            problems.append(
+                "video.engine 需为 seedance / seedance25 / kling / jimeng 之一"
+            )
         if not 3 <= int(self._data["video"]["clip_duration"]) <= 15:
             problems.append("video.clip_duration 需在 3~15 秒之间")
         if str(self._data["video"]["aspect_ratio"]) not in (
@@ -218,13 +252,17 @@ class Config:
             int(self._data["seedance25"].get("seed", -1))
         except (TypeError, ValueError):
             problems.append("seedance25.seed 需为整数(-1 表示每次随机)")
+        try:
+            int(self._data["jimeng"].get("seed", -1))
+        except (TypeError, ValueError):
+            problems.append("jimeng.seed 需为整数(-1 表示每次随机)")
         if not 10 <= int(self._data["video"]["target_duration"]) <= 600:
             problems.append("video.target_duration 需在 10~600 秒之间")
         if float(self._data["video"]["transition"]) < 0:
             problems.append("video.transition 不能为负数")
         if not 0 <= float(self._data["narration"]["volume"]) <= 2:
             problems.append("narration.volume 需在 0~2 之间")
-        for section in ("seedance", "seedance25", "kling"):
+        for section in ("seedance", "seedance25", "kling", "jimeng"):
             if float(self._data[section]["price_per_second"]) < 0:
                 problems.append(
                     f"{section}.price_per_second 不能为负数(设 0 可关闭费用预估)"
