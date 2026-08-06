@@ -87,7 +87,7 @@ ark_api_key: "..."                # 火山方舟 https://console.volcengine.com/
 默认已选用各环节当前先进的模型:编剧/导演为 **Qwen3.8-Max**(思考深度 high),
 视频为字节最新的 **Seedance 2.5**(fal.ai 暂未上线,经火山方舟官方 API;
 单镜头组最长 30 秒一次连续生成,支持原生 4K,720p 档),参考图为
-**Nano Banana 2**。分镜提示词按引擎自动选择语言(Seedance 系用中文,
+**Nano Banana 2**。分镜提示词按引擎自动选择语言(Seedance 系与即梦用中文,
 官方一等支持;Kling 用英文),角色台词一律默认中文配音。
 
 `fal_api_key` 在默认引擎下为可选:仅在自动文生主角参考图时用到,缺失则自动
@@ -99,6 +99,22 @@ OpenRouter 上的任意模型(如 `anthropic/claude-fable-5`、`openai/gpt-5.2`�
 `google/gemini-3-pro`);把 `video.engine` 改为 `seedance`(Seedance 2.0)或
 `kling`(Kling 3 Pro,费用约为 Seedance 的一半)即切回 fal.ai 引擎
 (此时必填 `fal_api_key`)。
+
+已有**即梦/火山引擎 AK+SK** 的用户可直接使用即梦引擎,无需申请方舟/fal KEY:
+把 `video.engine` 改为 `jimeng`,并填入火山引擎
+[「访问控制-密钥管理」](https://console.volcengine.com/iam/keymanage)中的
+AK/SK(需在火山引擎控制台开通「即梦AI」视频生成服务):
+
+```yaml
+jimeng_access_key: "AKLT..."      # Access Key ID
+jimeng_secret_key: "..."          # Secret Access Key
+video:
+  engine: "jimeng"
+```
+
+即梦引擎默认使用**即梦视频生成 3.0 Pro**(1080P,`jimeng.req_key` 可切换其他
+版本)。注意该 API 的单个镜头组固定 5 秒或 10 秒(导演会按此设计节奏),
+且不支持参考图与原生音效/台词配音(旁白解说与背景音乐不受影响)。
 
 ## 使用
 
@@ -119,7 +135,9 @@ OpenRouter 上的任意模型(如 `anthropic/claude-fable-5`、`openai/gpt-5.2`�
 
 > 多图支持随引擎而异:**Seedance 2.5**(默认)最多 30 张、**Seedance 2.0** 最多
 > 9 张,各图的用途说明会写入提示词(角色三视图能显著提升角色一致性);
-> **Kling** 仅把多张图作为**同一主角的多角度参考**,单独的用途说明不生效。
+> **Kling** 仅把多张图作为**同一主角的多角度参考**,单独的用途说明不生效;
+> **即梦** API 不支持参考图(角色一致性由脚本中逐字重复的外观描述保证,
+> 上传的图片仍会帮助导演模型照图撰写外观描述)。
 > 生成日志中也会提示当前引擎的支持情况。
 
 也支持命令行模式(可在描述后附一张或多张参考图路径,`路径=用途` 可注明用途):
@@ -153,14 +171,20 @@ output/20260803_153000_雨巷橘猫/
   右键(按住 Control 点击)→ 打开;若仍被拦截,在终端执行
   `xattr -cr AI短视频生成器.app` 后再打开。
 - **想换视频引擎/版本** — `video.engine` 可选 `seedance25`(默认,火山方舟
-  官方 API,需 `ark_api_key`)、`seedance`(Seedance 2.0,fal.ai)或 `kling`
-  (Kling 3,fal.ai);各引擎的端点/模型在 `seedance25.*` / `seedance.*` /
-  `kling.*` 中修改,fal 引擎的可选端点见 [fal.ai 模型页](https://fal.ai/models)。
+  官方 API,需 `ark_api_key`)、`seedance`(Seedance 2.0,fal.ai)、`kling`
+  (Kling 3,fal.ai)或 `jimeng`(即梦 3.0 Pro,火山引擎官方 API,
+  需 AK/SK);各引擎的端点/模型在 `seedance25.*` / `seedance.*` /
+  `kling.*` / `jimeng.*` 中修改,fal 引擎的可选端点见
+  [fal.ai 模型页](https://fal.ai/models)。
   注意旧版 Kling(2.x)仅支持 5/10 秒镜头且无原生音效。
+- **只有即梦账号的 AK/SK,没有方舟 API Key** — 把 `video.engine` 改为
+  `jimeng`,填 `jimeng_access_key` / `jimeng_secret_key` 即可(见「配置」一节);
+  需先在火山引擎控制台开通「即梦AI」视频生成服务。
 - **想换编剧模型** — 修改 `config.yaml` 中 `llm.model` 为 OpenRouter 上的任意模型 ID;
   `llm.reasoning_effort` 控制思考深度(不支持思考的模型自动忽略)。
-- **想复现/对比生成结果** — 把 `seedance25.seed` 固定为非负整数,相同参数下可复现
-  同一结果,便于微调提示词后对比;默认 -1 为每次随机(仅 Seedance 2.5 引擎支持)。
+- **想复现/对比生成结果** — 把 `seedance25.seed`(即梦引擎为 `jimeng.seed`)
+  固定为非负整数,相同参数下可复现同一结果,便于微调提示词后对比;
+  默认 -1 为每次随机(仅 Seedance 2.5 与即梦引擎支持)。
 - **想省钱** — 把 `seedance25.resolution`(或 fal 引擎的 `seedance.resolution`)
   降到 `480p`,或把 `video.engine` 改为 `kling`(约 $0.168/秒);
   Kling 引擎下 `video.generate_audio: false` 还能再省约 1/3

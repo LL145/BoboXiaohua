@@ -23,7 +23,8 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
 
 - 运行依赖 `config.yaml`(程序目录下),需填 `openrouter_api_key` 与 `ark_api_key`
   (默认引擎 seedance25 经火山方舟;fal KEY 此时可选,仅自动文生参考图用;
-  改用 fal 引擎 seedance/kling 时必填 `fal_api_key`);
+  改用 fal 引擎 seedance/kling 时必填 `fal_api_key`;改用 jimeng 引擎时改填
+  火山引擎的 `jimeng_access_key`/`jimeng_secret_key`,方舟/fal KEY 均可不填);
   源码运行还需本机 ffmpeg/ffprobe(打包版已内置)。
 - 无测试套件、无 CI lint;改动后至少用 `python -c "import ast; ast.parse(open('...').read())"`
   或 `python -m py_compile` 做语法检查,纯逻辑可写临时脚本验证。
@@ -50,17 +51,19 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
    解说型逐组写中文旁白(`narration` 字段),沉浸型全部置空;角色台词直接写进分镜
    prompt(中文引号台词),由视频模型原生配音。请求带 `response_format: json_schema`,
    不支持结构化输出的模型由 `_extract_json` 容错兜底。
-2. **kling.py** — 视频生成模块,三引擎:`_FalGenerator` 基类承载提交/轮询/下载/
+2. **kling.py** — 视频生成模块,四引擎:`_FalGenerator` 基类承载提交/轮询/下载/
    看门狗/取消/降级重试等公共逻辑,`create_generator` 按 `video.engine` 实例化
-   `ArkSeedanceGenerator`(seedance25,默认)、`SeedanceGenerator`(seedance)或
-   `KlingGenerator`;fal 引擎的子类只实现 `_build_arguments`,方舟直连的
-   `ArkSeedanceGenerator` 另覆写 `_submit_and_wait`(HTTP 任务提交/轮询/取消,
-   返回与 fal 相同形状的结果)、`upload_image`(base64 data URL,不走 fal 存储)
+   `ArkSeedanceGenerator`(seedance25,默认)、`SeedanceGenerator`(seedance)、
+   `KlingGenerator` 或 `JimengGenerator`(jimeng);fal 引擎的子类只实现
+   `_build_arguments`,方舟直连的 `ArkSeedanceGenerator` 另覆写
+   `_submit_and_wait`(HTTP 任务提交/轮询/取消,返回与 fal 相同形状的结果)、
+   `upload_image`(base64 data URL,不走 fal 存储)
    与 `generate_reference`(文生图仍走 fal,无 fal KEY 时跳过降级)。
    参考图取 `generate_clip(references=[(URL, 用途说明), …])`:优先用用户上传的
    参考图(pipeline 复制进任务目录并上传,用途持久化在 `references.json` 供断点
    续传),否则有固定主角时先文生图;各引擎参考图张数上限见 `MAX_REFERENCE_IMAGES`
-   (2.5 30 张 / 2.0 9 张 / Kling 4 张,pipeline 会向用户提示当前引擎的多图支持
+   (2.5 30 张 / 2.0 9 张 / Kling 4 张 / 即梦 0 张——上限为 0 时 pipeline 直接
+   跳过参考图并提示,pipeline 会向用户提示当前引擎的多图支持
    与超限截断);Seedance 系把各图用途经 `reference_usage_note` 写进 prompt 尾部;
    参考图任何一步失败自动降级纯文生视频(`strip_reference_tokens` 去掉占位符,
    兼容旧 manifest 的 `@Image1`/`image_urls`)。
@@ -88,6 +91,20 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
      (multi_prompt 单条 512 字符,单 prompt/negative_prompt 2500)。画幅原生仅
      16:9/9:16/1:1,3:4、4:3 经 `kling_generation_aspect` 映射生成,拼接后由
      `assembler.crop_to_aspect` 居中裁剪(在字幕烧录之前)。
+   - **即梦 3.0 Pro**(`video.engine: jimeng`):面向已有即梦/火山引擎 AK+SK
+     的用户,直连火山引擎视觉智能 API(`visual.volcengineapi.com`,service cv,
+     `_volc_sign_headers` 做 HMAC-SHA256 V4 签名,`jimeng_access_key`/
+     `jimeng_secret_key` 鉴权,不需要方舟/fal KEY);`CVSync2AsyncSubmitTask`
+     提交 → `CVSync2AsyncGetResult` 轮询(`req_json: {"return_url": true}`,
+     状态 in_queue/generating/done,无取消接口,取消即停止轮询);
+     单次生成固定 5/10 秒(`frames = 24×秒数 + 1`,组时长就近取整,
+     director 的 `_snap_jimeng_durations` 已先按 5/10 设计),原生支持全部
+     画幅;不支持参考图(`MAX_REFERENCE_IMAGES` 为 0,占位符一律
+     `strip_reference_tokens` 去除)、原生音效与 negative_prompt;
+     `jimeng.seed`(-1 随机);业务错误码经 `_jimeng_error` 分类:签名/权限
+     类致命,参数/审核类(50400/50411/50412/50413/50511/50512)标记
+     `status_code=422` 跳过重试,其余(含 50429 限流)重试;
+     `jimeng_credentials_problem` 供 pipeline 预检零费用探测 AK/SK。
    `FatalGenerationError`(KEY 无效/余额不足/端点不存在)立即终止全部镜头组;
    422 参数校验错误是确定性的,跳过重试直接降级/报错;其余错误逐组重试。
 3. **tts.py** — Edge TTS(免费)合成导演写的中文旁白,逐组落盘
@@ -114,11 +131,13 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
   (无 `engine` 字段的旧 manifest 视为 kling 任务)——所以 `Shot`/`Storyboard`
   字段变更要保持 `from_dict` 对旧 manifest 兼容(用 `.get()` + 默认值)。
 - **配置兼容**:引擎无关参数(画幅/音效/重试/并发/超时等)在 `video` 节,引擎专属
-  参数在 `seedance`/`seedance25`/`kling` 节;`load_config` 会把旧版配置中 kling 节里的引擎无关
+  参数在 `seedance`/`seedance25`/`kling`/`jimeng` 节;`load_config` 会把旧版配置中 kling 节里的引擎无关
   参数自动迁移到 video 节。
 - **提示词语言与台词**:分镜 prompt 语言随引擎(`_engine_prompt_language`):
-  Seedance 系用中文(官方一等支持),Kling 用英文;系统提示词的示例与长度规则
-  按语言取自 `_LANG_PROMPT_PARTS`。角色台词无论 prompt 语言一律默认中文普通话
+  字节系(Seedance、即梦)用中文(官方一等支持),Kling 用英文;系统提示词的
+  示例与长度规则按语言取自 `_LANG_PROMPT_PARTS`;引擎专属创作约束(即梦的
+  5/10 秒定长、无参考图、无配音)经 `_ENGINE_NOTES` 附在用户消息里。
+  角色台词无论 prompt 语言一律默认中文普通话
   (系统提示词硬性要求,除非用户创意明确要求其他语言)。
 - **提示词一致性**:分镜脚本要求每个分镜 prompt 逐字重复 style_anchor 与角色外观描述,
   禁止跨组/跨分镜指代(镜头组之间相互独立生成);有主角时 prompt 统一用

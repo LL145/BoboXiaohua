@@ -2,15 +2,15 @@
 → 旁白配音 → 拼接成片(转场/旁白/背景音乐/字幕)。
 
 稳健性设计:
-- 生成前预检:先校验 OpenRouter KEY、fal KEY(方舟直连引擎则校验 ark KEY)
-  与磁盘空间,配错即刻提示,不浪费费用;
+- 生成前预检:先校验 OpenRouter KEY、fal KEY(方舟直连引擎则校验 ark KEY,
+  即梦引擎则校验 AK/SK 签名)与磁盘空间,配错即刻提示,不浪费费用;
 - 断点续传:同一描述的未完成任务会复用已有分镜脚本、参考图、旁白音频和
   已生成片段,失败后再次点击「生成」只补齐缺失部分,不重复扣费;
 - 主角参考图:用户可上传主角图片(随创意发给导演模型照图写外观描述),
   未上传时导演模型判断有固定主角则自动文生图;参考图作为角色元素
   (@Element1)送入每个镜头组,任何一步失败都自动降级为纯文生视频;
 - 并行生成:多个镜头组同时提交视频引擎(默认 Seedance 2.5,
-  可切 Seedance 2.0 / Kling),总耗时约等于单个镜头组;
+  可切 Seedance 2.0 / Kling / 即梦),总耗时约等于单个镜头组;
 - 单镜头组独立重试 + 超时看门狗,KEY 无效等致命错误立即终止,不空耗重试;
 - 旁白与字幕:导演判断影片需要解说时,用 Edge TTS 合成旁白并生成字幕;
   TTS 不可用、混音或字幕失败,都只是放弃对应环节,绝不影响画面成片;
@@ -441,6 +441,15 @@ class Pipeline:
             except requests.RequestException:
                 pass
 
+        # 即梦 AK/SK 探测:查询一个不存在的任务,零费用;签名无效/服务未开通
+        # 等致命问题即刻拦截,网络异常不拦截
+        if self._config.engine == "jimeng":
+            from .kling import jimeng_credentials_problem
+
+            problem = jimeng_credentials_problem(self._config)
+            if problem:
+                raise RuntimeError(problem)
+
         try:
             free_gb = shutil.disk_usage(self._config.output_dir).free / 2**30
             if free_gb < 1:
@@ -503,7 +512,14 @@ class Pipeline:
         参考图(断点续传,用途存于 references.json)→ 按导演的
         reference_prompt 文生图。
         """
-        from .kling import image_is_valid
+        from .kling import MAX_REFERENCE_IMAGES, image_is_valid
+
+        if MAX_REFERENCE_IMAGES.get(self._config.engine, 1) == 0:
+            self._log(
+                f"  当前引擎 {self._config.engine_name} 不支持参考图,"
+                "角色一致性由分镜脚本中逐字重复的外观描述保证。"
+            )
+            return None
 
         locals_with_notes: list[tuple[Path, str]] = []
         if user_images:
