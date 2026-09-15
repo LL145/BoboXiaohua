@@ -1,7 +1,9 @@
-"""读取程序目录下的 config.yaml。"""
+"""读取程序目录下的 config.yaml,并把界面上的设置写回该文件。"""
 
 from __future__ import annotations
 
+import json
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -56,22 +58,39 @@ def bundled_font_dir() -> Path | None:
 
 CONFIG_PATH = app_dir() / "config.yaml"
 
+# 视频引擎(全部经 fal.ai):配置值 → 展示名;顺序即界面下拉框顺序,首项为默认
+ENGINES: dict[str, str] = {
+    "seedance25": "Seedance 2.5",
+    "seedance": "Seedance 2.0",
+    "kling": "Kling 3",
+    "gemini": "Gemini Omni Flash 1.1",
+}
+# 各引擎可选的输出分辨率(空元组表示该引擎端点不接受分辨率参数)
+ENGINE_RESOLUTIONS: dict[str, tuple[str, ...]] = {
+    "seedance25": ("480p", "720p", "1080p"),
+    "seedance": ("480p", "720p", "1080p", "4k"),
+    "kling": (),
+    "gemini": ("360p", "720p", "1080p", "4k"),
+}
+# 编剧模型的常用候选(OpenRouter 模型 ID),界面下拉框可直接选、也可手填任意模型
+LLM_MODEL_PRESETS: tuple[str, ...] = (
+    "z-ai/glm-5.3",
+    "qwen/qwen3.8-max",
+    "anthropic/claude-fable-5",
+    "openai/gpt-5.2",
+    "google/gemini-3-pro",
+    "deepseek/deepseek-r2",
+)
+# 角色台词的默认语言(写进导演系统提示词;用户创意明确要求其他语言时除外)
+DEFAULT_DIALOGUE_LANGUAGE = "中文普通话"
+
 _DEFAULTS: dict[str, Any] = {
     "openrouter_api_key": "",
     "fal_api_key": "",
-    "ark_api_key": "",
-    "jimeng_access_key": "",
-    "jimeng_secret_key": "",
     "llm": {
-        "model": "z-ai/glm-5.3",
+        "model": LLM_MODEL_PRESETS[0],
         "reasoning_effort": "medium",
         "max_tokens": 32000,
-    },
-    "seedance": {
-        "text_endpoint": "bytedance/seedance-2.0/text-to-video",
-        "reference_endpoint": "bytedance/seedance-2.0/reference-to-video",
-        "resolution": "720p",
-        "price_per_second": 0.3034,
     },
     "seedance25": {
         "text_endpoint": "bytedance/seedance-2.5/text-to-video",
@@ -80,12 +99,11 @@ _DEFAULTS: dict[str, Any] = {
         "seed": -1,
         "price_per_second": 0.473,
     },
-    "ark": {
-        "model": "doubao-seedance-2-5-260628",
-        "api_base": "https://ark.cn-beijing.volces.com/api/v3",
+    "seedance": {
+        "text_endpoint": "bytedance/seedance-2.0/text-to-video",
+        "reference_endpoint": "bytedance/seedance-2.0/reference-to-video",
         "resolution": "720p",
-        "seed": -1,
-        "price_per_second": 0.21,
+        "price_per_second": 0.3034,
     },
     "kling": {
         "text_endpoint": "fal-ai/kling-video/v3/pro/text-to-video",
@@ -98,13 +116,6 @@ _DEFAULTS: dict[str, Any] = {
         "resolution": "720p",
         "price_per_second": 0.10,
     },
-    "jimeng": {
-        "req_key": "jimeng_ti2v_v30_pro",
-        "host": "visual.volcengineapi.com",
-        "region": "cn-north-1",
-        "seed": -1,
-        "price_per_second": 0.04,
-    },
     "image": {"endpoint": "fal-ai/nano-banana-2"},
     "narration": {
         "enabled": True,
@@ -115,6 +126,7 @@ _DEFAULTS: dict[str, Any] = {
     "video": {
         "engine": "seedance25",
         "aspect_ratio": "16:9",
+        "dialogue_language": DEFAULT_DIALOGUE_LANGUAGE,
         "generate_audio": True,
         "clip_duration": 10,
         "max_retries": 2,
@@ -133,11 +145,8 @@ _LEGACY_KLING_KEYS = (
     "aspect_ratio", "generate_audio", "clip_duration",
     "max_retries", "concurrency", "shot_timeout",
 )
-# 旧版(fal.ai 尚未上线 Seedance 2.5 时)seedance25 节即火山方舟直连的配置;
-# 现在 seedance25 指 fal.ai 端点,方舟直连改为 ark 引擎/节。这些键只属于方舟
-_LEGACY_ARK_ONLY_KEYS = ("model", "api_base")
-# 两节共有、需随引擎一起迁移的键
-_LEGACY_ARK_SHARED_KEYS = ("resolution", "seed", "price_per_second")
+# 已下线的非 fal.ai 引擎(火山方舟直连 / 即梦):旧配置选了它们时改回默认引擎
+_RETIRED_ENGINES = ("ark", "jimeng")
 
 
 def _merge(base: dict, override: dict) -> dict:
@@ -157,6 +166,10 @@ class Config:
     def __getitem__(self, key: str) -> Any:
         return self._data[key]
 
+    def __setitem__(self, key: str, value: Any) -> None:
+        """界面上的选择覆盖配置文件里的值(仅影响本次生成)。"""
+        self._data[key] = value
+
     @property
     def openrouter_api_key(self) -> str:
         return (self._data.get("openrouter_api_key") or "").strip()
@@ -166,51 +179,25 @@ class Config:
         return (self._data.get("fal_api_key") or "").strip()
 
     @property
-    def ark_api_key(self) -> str:
-        """火山方舟(Volcengine Ark)API KEY,ark 引擎(Seedance 2.5 方舟直连)使用。"""
-        return (self._data.get("ark_api_key") or "").strip()
-
-    @property
-    def jimeng_access_key(self) -> str:
-        """火山引擎 Access Key ID,即梦引擎的 AK/SK 签名鉴权使用。"""
-        return (self._data.get("jimeng_access_key") or "").strip()
-
-    @property
-    def jimeng_secret_key(self) -> str:
-        """火山引擎 Secret Access Key,即梦引擎的 AK/SK 签名鉴权使用。"""
-        return (self._data.get("jimeng_secret_key") or "").strip()
-
-    @property
     def engine(self) -> str:
-        """视频生成引擎:seedance25(默认,fal.ai)、ark(Seedance 2.5 方舟直连)、
-        seedance、kling、gemini 或 jimeng。"""
+        """视频生成引擎:seedance25(默认)、seedance、kling 或 gemini,均经 fal.ai。"""
         return str(self._data["video"].get("engine") or "seedance25").strip().lower()
 
     @property
     def engine_name(self) -> str:
-        """引擎的展示名(日志用)。"""
-        return {
-            "seedance": "Seedance 2.0",
-            "seedance25": "Seedance 2.5",
-            "ark": "Seedance 2.5(火山方舟)",
-            "gemini": "Gemini Omni Flash 1.1",
-            "jimeng": "即梦 3.0 Pro",
-        }.get(self.engine, "Kling")
-
-    @property
-    def uses_fal_video(self) -> bool:
-        """视频片段是否经 fal.ai 生成(决定 fal_api_key 是否必填)。"""
-        return self.engine in ("seedance", "seedance25", "kling", "gemini")
+        """引擎的展示名(日志与界面用)。"""
+        return ENGINES.get(self.engine, "Kling 3")
 
     @property
     def engine_section(self) -> dict[str, Any]:
-        """当前引擎的专属配置节(端点、单价等)。"""
-        section = (
-            self.engine
-            if self.engine in ("seedance", "seedance25", "ark", "gemini", "jimeng")
-            else "kling"
-        )
-        return self._data[section]
+        """当前引擎的专属配置节(端点、分辨率、单价等)。"""
+        return self._data[self.engine if self.engine in ENGINES else "kling"]
+
+    @property
+    def dialogue_language(self) -> str:
+        """角色台词的默认语言(留空时回退为中文普通话)。"""
+        value = str(self._data["video"].get("dialogue_language") or "").strip()
+        return value or DEFAULT_DIALOGUE_LANGUAGE
 
     @property
     def ffmpeg_path(self) -> str:
@@ -234,72 +221,34 @@ class Config:
         """返回配置问题列表,为空表示可用。"""
         problems = []
         if not self.openrouter_api_key:
-            problems.append("config.yaml 中缺少 openrouter_api_key")
-        if self.engine == "ark":
-            # 方舟直连引擎经火山方舟官方 API 生成,需要方舟 KEY;
-            # fal KEY 仅用于自动文生主角参考图,缺失时自动降级,不拦截
-            if not self.ark_api_key:
+            problems.append("缺少 OpenRouter API KEY(在界面「设置」中填入,或编辑 config.yaml)")
+        if not self.fal_api_key:
+            problems.append("缺少 fal.ai API KEY(在界面「设置」中填入,或编辑 config.yaml)")
+        if self.engine not in ENGINES:
+            problems.append("video.engine 需为 " + " / ".join(ENGINES) + " 之一")
+        else:
+            allowed = ENGINE_RESOLUTIONS[self.engine]
+            if allowed and str(self.engine_section.get("resolution")) not in allowed:
                 problems.append(
-                    "config.yaml 中缺少 ark_api_key(ark 引擎经火山方舟官方 API "
-                    "生成 Seedance 2.5,需要方舟 API KEY;若想改用 fal.ai,"
-                    "把 video.engine 设为 seedance25)"
+                    f"{self.engine}.resolution 需为 {' / '.join(allowed)} 之一"
                 )
-        elif self.engine == "jimeng":
-            # 即梦经火山引擎视觉智能 API 生成,用 AK/SK 签名鉴权;
-            # 其余 KEY(fal/方舟)均不需要
-            if not self.jimeng_access_key or not self.jimeng_secret_key:
-                problems.append(
-                    "config.yaml 中缺少 jimeng_access_key / jimeng_secret_key"
-                    "(即梦引擎需要火山引擎的 AK/SK,在火山引擎控制台"
-                    "「访问控制-密钥管理」中获取)"
-                )
-        elif not self.fal_api_key:
-            problems.append(
-                "config.yaml 中缺少 fal_api_key(默认引擎 Seedance 2.5 经 fal.ai "
-                "生成;若想改用火山方舟官方 API,填 ark_api_key 并把 video.engine "
-                "设为 ark)"
-            )
-        if self.engine not in (
-            "seedance", "seedance25", "ark", "kling", "gemini", "jimeng"
-        ):
-            problems.append(
-                "video.engine 需为 seedance25 / ark / seedance / kling / gemini / "
-                "jimeng 之一"
-            )
         if not 3 <= int(self._data["video"]["clip_duration"]) <= 15:
             problems.append("video.clip_duration 需在 3~15 秒之间")
         if str(self._data["video"]["aspect_ratio"]) not in (
             "16:9", "9:16", "1:1", "3:4", "4:3"
         ):
             problems.append("video.aspect_ratio 需为 16:9 / 9:16 / 1:1 / 3:4 / 4:3 之一")
-        if str(self._data["seedance"]["resolution"]) not in (
-            "480p", "720p", "1080p", "4k"
-        ):
-            problems.append("seedance.resolution 需为 480p / 720p / 1080p / 4k 之一")
-        if str(self._data["seedance25"]["resolution"]) not in (
-            "480p", "720p", "1080p"
-        ):
-            problems.append("seedance25.resolution 需为 480p / 720p / 1080p 之一")
-        if str(self._data["ark"]["resolution"]) not in (
-            "480p", "720p", "1080p", "2k", "4k"
-        ):
-            problems.append("ark.resolution 需为 480p / 720p / 1080p / 2k / 4k 之一")
-        if str(self._data["gemini"]["resolution"]) not in (
-            "360p", "720p", "1080p", "4k"
-        ):
-            problems.append("gemini.resolution 需为 360p / 720p / 1080p / 4k 之一")
-        for section in ("seedance25", "ark", "jimeng"):
-            try:
-                int(self._data[section].get("seed", -1))
-            except (TypeError, ValueError):
-                problems.append(f"{section}.seed 需为整数(-1 表示每次随机)")
+        try:
+            int(self._data["seedance25"].get("seed", -1))
+        except (TypeError, ValueError):
+            problems.append("seedance25.seed 需为整数(-1 表示每次随机)")
         if not 10 <= int(self._data["video"]["target_duration"]) <= 600:
             problems.append("video.target_duration 需在 10~600 秒之间")
         if float(self._data["video"]["transition"]) < 0:
             problems.append("video.transition 不能为负数")
         if not 0 <= float(self._data["narration"]["volume"]) <= 2:
             problems.append("narration.volume 需在 0~2 之间")
-        for section in ("seedance", "seedance25", "ark", "kling", "gemini", "jimeng"):
+        for section in ENGINES:
             if float(self._data[section]["price_per_second"]) < 0:
                 problems.append(
                     f"{section}.price_per_second 不能为负数(设 0 可关闭费用预估)"
@@ -307,19 +256,30 @@ class Config:
         return problems
 
 
+def _template_text() -> str:
+    """打包版内置的 config.yaml 模板内容;没有模板时返回空串。"""
+    bundle = _bundle_dir()
+    template = bundle / "config.yaml" if bundle else None
+    if template is not None and template.exists():
+        return template.read_text(encoding="utf-8")
+    return ""
+
+
 def load_config() -> Config:
     if not CONFIG_PATH.exists():
-        # 打包版首次运行:从内置模板生成 config.yaml,用户只需填 KEY
-        bundle = _bundle_dir()
-        template = bundle / "config.yaml" if bundle else None
-        if template is not None and template.exists():
-            shutil.copyfile(template, CONFIG_PATH)
+        # 打包版首次运行:从内置模板生成 config.yaml,用户在界面填 KEY 即可
+        template = _template_text()
+        if template:
+            CONFIG_PATH.write_text(template, encoding="utf-8")
         else:
             raise FileNotFoundError(
-                f"未找到配置文件: {CONFIG_PATH}\n请在程序目录下创建 config.yaml 并填入 API KEY。"
+                f"未找到配置文件: {CONFIG_PATH}\n请在界面「设置」中填入 API KEY 并保存,"
+                "程序会自动创建 config.yaml。"
             )
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         user_data = yaml.safe_load(f) or {}
+    if not isinstance(user_data, dict):
+        user_data = {}
     # 兼容旧版配置:kling 节里的引擎无关参数迁移到 video 节
     legacy = user_data.get("kling") or {}
     if isinstance(legacy, dict):
@@ -328,39 +288,137 @@ def load_config() -> Config:
                 video_section = user_data.setdefault("video", {}) or {}
                 user_data["video"] = video_section
                 video_section.setdefault(key, legacy.pop(key))
-    _migrate_legacy_ark(user_data)
+    # 兼容旧版配置:已下线的方舟直连/即梦引擎改回默认的 fal.ai 引擎
+    video_section = user_data.get("video")
+    if isinstance(video_section, dict):
+        engine = str(video_section.get("engine") or "").strip().lower()
+        if engine in _RETIRED_ENGINES:
+            video_section["engine"] = _DEFAULTS["video"]["engine"]
     return Config(_merge(_DEFAULTS, user_data))
 
 
-def _migrate_legacy_ark(user_data: dict) -> None:
-    """兼容旧版配置:当年 fal.ai 尚未上线 Seedance 2.5,seedance25 节与
-    seedance25 引擎都指火山方舟直连;现在 seedance25 指 fal.ai,方舟直连
-    改名为 ark。迁移规则:
-    - seedance25 节里方舟专属的 model/api_base 一律搬到 ark 节;
-    - 旧配置选了 seedance25 引擎、只填了 ark_api_key 而没填 fal_api_key,
-      显然是在用方舟直连,自动改为 ark 引擎并把 resolution/seed/单价一并
-      搬过去,避免升级后无故报「缺少 fal_api_key」。
+# ---------------- 把界面设置写回 config.yaml ----------------
+
+def _yaml_scalar(value: Any) -> str:
+    """把 Python 值渲染成单行 YAML 标量(字符串一律加双引号,避免歧义)。"""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _split_trailing_comment(rest: str) -> tuple[str, str]:
+    """把 "值  # 注释" 拆成 (值, 注释),引号内的 # 不算注释。"""
+    rest = rest.rstrip()
+    stripped = rest.lstrip()
+    if stripped[:1] in ('"', "'"):
+        quote = stripped[0]
+        i = 1
+        while i < len(stripped):
+            if stripped[i] == "\\" and quote == '"':
+                i += 2
+                continue
+            if stripped[i] == quote:
+                break
+            i += 1
+        tail = stripped[i + 1:]
+        match = re.match(r"\s*(#.*)$", tail)
+        return stripped[:i + 1], (match.group(1) if match else "")
+    match = re.match(r"^(.*?)(?:\s+(#.*))?$", stripped)
+    return (match.group(1) if match else stripped), (match.group(2) or "")
+
+
+def _set_yaml_value(lines: list[str], path: list[str], value: Any) -> list[str]:
+    """在 YAML 文本行中改写 path(顶层键或「节.键」)对应的值,其余行原样保留。"""
+    rendered = _yaml_scalar(value)
+    if len(path) == 1:
+        pattern = re.compile(rf"^({re.escape(path[0])}\s*:)(.*)$")
+        for i, line in enumerate(lines):
+            match = pattern.match(line)
+            if match:
+                _, comment = _split_trailing_comment(match.group(2))
+                lines[i] = f"{path[0]}: {rendered}" + (f"  {comment}" if comment else "")
+                return lines
+        lines.append(f"{path[0]}: {rendered}")
+        return lines
+
+    section, key = path
+    section_re = re.compile(rf"^{re.escape(section)}\s*:\s*(#.*)?$")
+    key_re = re.compile(rf"^(\s+{re.escape(key)}\s*:)(.*)$")
+    start = next((i for i, line in enumerate(lines) if section_re.match(line)), None)
+    if start is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.extend([f"{section}:", f"  {key}: {rendered}"])
+        return lines
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if lines[i].strip() and not lines[i].startswith((" ", "\t", "#")):
+            end = i  # 下一个顶层键
+            break
+    for i in range(start + 1, end):
+        match = key_re.match(lines[i])
+        if match:
+            indent = match.group(1)[: len(match.group(1)) - len(match.group(1).lstrip())]
+            _, comment = _split_trailing_comment(match.group(2))
+            lines[i] = f"{indent}{key}: {rendered}" + (f"  {comment}" if comment else "")
+            return lines
+    # 节内没有该键:插到节内最后一个非空行之后
+    insert_at = start + 1
+    for i in range(start + 1, end):
+        if lines[i].strip():
+            insert_at = i + 1
+    lines.insert(insert_at, f"  {key}: {rendered}")
+    return lines
+
+
+def save_settings(updates: dict[str, Any]) -> None:
+    """把界面上的设置写回 config.yaml。
+
+    updates 的键为 "openrouter_api_key" 或 "节.键"(如 "llm.model")。只改写
+    对应的行,文件里的其余内容与注释原样保留;若改写结果无法通过 YAML
+    校验,则回退为整体重写(会丢失注释,但保证配置可用)。
     """
-    legacy = user_data.get("seedance25")
-    if not isinstance(legacy, dict):
-        return
-    ark_section = user_data.get("ark")
-    if not isinstance(ark_section, dict):
-        ark_section = {}
-    for key in _LEGACY_ARK_ONLY_KEYS:
-        if key in legacy:
-            ark_section.setdefault(key, legacy.pop(key))
-    video_section = user_data.get("video")
-    if not isinstance(video_section, dict):
-        video_section = {}
-    engine = str(video_section.get("engine") or "seedance25").strip().lower()
-    ark_key = str(user_data.get("ark_api_key") or "").strip()
-    fal_key = str(user_data.get("fal_api_key") or "").strip()
-    if engine == "seedance25" and ark_key and not fal_key:
-        video_section["engine"] = "ark"
-        user_data["video"] = video_section
-        for key in _LEGACY_ARK_SHARED_KEYS:
-            if key in legacy:
-                ark_section.setdefault(key, legacy.pop(key))
-    if ark_section:
-        user_data["ark"] = ark_section
+    text = CONFIG_PATH.read_text(encoding="utf-8") if CONFIG_PATH.exists() else _template_text()
+    lines = text.splitlines()
+    for dotted, value in updates.items():
+        lines = _set_yaml_value(lines, dotted.split(".", 1), value)
+    new_text = "\n".join(lines).rstrip("\n") + "\n"
+
+    def _ok(candidate: str) -> bool:
+        try:
+            data = yaml.safe_load(candidate) or {}
+        except yaml.YAMLError:
+            return False
+        if not isinstance(data, dict):
+            return False
+        for dotted, value in updates.items():
+            node: Any = data
+            for part in dotted.split(".", 1):
+                node = node.get(part) if isinstance(node, dict) else None
+            if node != value:
+                return False
+        return True
+
+    if not _ok(new_text):
+        try:
+            data = yaml.safe_load(text) or {}
+        except yaml.YAMLError:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        for dotted, value in updates.items():
+            parts = dotted.split(".", 1)
+            if len(parts) == 1:
+                data[parts[0]] = value
+            else:
+                section = data.get(parts[0])
+                if not isinstance(section, dict):
+                    section = {}
+                    data[parts[0]] = section
+                section[parts[1]] = value
+        new_text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+    tmp = CONFIG_PATH.with_suffix(".yaml.tmp")
+    tmp.write_text(new_text, encoding="utf-8")
+    tmp.replace(CONFIG_PATH)

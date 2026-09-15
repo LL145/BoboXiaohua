@@ -23,46 +23,39 @@ _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 _RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504, 524}
 
 # 镜头组时长约束(秒):一个镜头组一次生成,总长下限随引擎而异
-# (Kling 3 为 3 秒,Seedance 为 4 秒,即梦为 5 秒),上限也随引擎
-# (Seedance 2.5——fal.ai 与火山方舟直连 ark 同——一次可连续生成 30 秒,
-# Gemini Omni Flash 与即梦为 10 秒,其余引擎为 15 秒);组内单个分镜最短可到 1 秒
+# (Kling 3 为 3 秒,Seedance 为 4 秒),上限也随引擎(Seedance 2.5 一次可
+# 连续生成 30 秒,Gemini Omni Flash 为 10 秒,其余引擎为 15 秒);
+# 组内单个分镜最短可到 1 秒
 _MIN_GROUP_SECONDS = 3
 _SEEDANCE_MIN_GROUP_SECONDS = 4
 _MAX_GROUP_SECONDS = 15
 _SEEDANCE25_MAX_GROUP_SECONDS = 30
 _GEMINI_MAX_GROUP_SECONDS = 10
-# 即梦 API 单次只能生成 5 秒或 10 秒(_snap_jimeng_durations 会取整到这两档)
-_JIMENG_GROUP_SECONDS = (5, 10)
 _MIN_CUT_SECONDS = 1
 _MAX_CUTS_PER_GROUP = 6  # Kling multi_prompt 上限,Seedance 沿用同一节奏约束
 
 
 def _is_seedance(engine: str) -> bool:
-    """Seedance 系引擎:seedance(2.0)、seedance25(2.5,fal.ai)、ark(2.5,方舟直连)。"""
-    return engine.startswith("seedance") or engine == "ark"
+    """Seedance 系引擎:seedance(2.0)与 seedance25(2.5)。"""
+    return engine.startswith("seedance")
 
 
 def _engine_min_group(engine: str) -> int:
-    if engine == "jimeng":
-        return _JIMENG_GROUP_SECONDS[0]
     return _SEEDANCE_MIN_GROUP_SECONDS if _is_seedance(engine) else _MIN_GROUP_SECONDS
 
 
 def _engine_max_group(engine: str) -> int:
-    if engine == "jimeng":
-        return _JIMENG_GROUP_SECONDS[-1]
     if engine == "gemini":
         return _GEMINI_MAX_GROUP_SECONDS
     return (
-        _SEEDANCE25_MAX_GROUP_SECONDS if engine in ("seedance25", "ark")
-        else _MAX_GROUP_SECONDS
+        _SEEDANCE25_MAX_GROUP_SECONDS if engine == "seedance25" else _MAX_GROUP_SECONDS
     )
 
 
 def _engine_prompt_language(engine: str) -> str:
-    """分镜 prompt 的撰写语言:字节系模型(Seedance、即梦)对中文提示词有官方
-    一等支持(官方提示词指南即为中文),中文语义更准;Kling(经 fal)沿用英文。"""
-    return "中文" if _is_seedance(engine) or engine == "jimeng" else "英文"
+    """分镜 prompt 的撰写语言:字节系模型(Seedance)对中文提示词有官方
+    一等支持(官方提示词指南即为中文),中文语义更准;Kling 与 Gemini 沿用英文。"""
+    return "中文" if _is_seedance(engine) else "英文"
 # Kling 对 multi_prompt 单条分镜提示词有 512 字符硬上限(超长直接 422 拒绝),
 # 要求模型控制在 450 以内留出余量;kling.py 提交前还会做最终钳制兜底
 _MAX_PROMPT_CHARS = 450
@@ -86,24 +79,6 @@ def _encode_image(path: Path) -> str | None:
         return None
     mime = _IMAGE_MIME.get(Path(path).suffix.lower(), "image/png")
     return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
-
-
-def _snap_jimeng_durations(storyboard: "Storyboard") -> None:
-    """把各镜头组的总时长取整到即梦支持的档位(5 或 10 秒)。
-
-    系统提示词已要求模型按 5/10 秒设计,此处兜底模型偏差:就近选档,
-    在组内分镜上逐秒增减,保证 manifest 时长与实际生成的片段一致
-    (旁白时长预算、字幕定位都依赖这个时长)。
-    """
-    for shot in storyboard.shots:
-        target = min(_JIMENG_GROUP_SECONDS, key=lambda d: abs(d - shot.duration))
-        while shot.duration < target:
-            min(shot.cuts, key=lambda c: c.duration).duration += 1
-        while shot.duration > target:
-            longest = max(shot.cuts, key=lambda c: c.duration)
-            if longest.duration <= _MIN_CUT_SECONDS:
-                break  # 所有分镜都已到最短,保持现状(生成端会再兜底取整)
-            longest.duration -= 1
 
 
 def _clamp_duration(
@@ -346,8 +321,8 @@ style_anchor 的风格词。该参考图会作为角色元素随每个镜头组�
 narration 字段撰写中文旁白。要求:口语自然、贴合画面;语速约每秒 4 个字,\
 每组字数不超过"组时长 × 4",宁短勿长;所有组的旁白连起来必须是一篇完整流畅的解说词。
 - 沉浸型(氛围片、MV、纯剧情等):所有镜头组的 narration 一律置空字符串。
-角色台词(两种形态下都可用):**所有角色台词一律使用中文普通话**(除非用户创意明确\
-要求其他语言),绝不写英文台词。需要角色开口说话时,把中文台词直接写进对应分镜的 \
+角色台词(两种形态下都可用):**所有角色台词一律使用{dialogue_language}**(除非用户创意\
+明确要求其他语言),绝不写其他语言的台词。需要角色开口说话时,把台词直接写进对应分镜的 \
 prompt,格式如 {dialogue_example}(模型会原生生成配音与口型)。解说型影片中,\
 带台词的分镜要避免与旁白抢话,该组旁白应留白或极简。环境音效由模型自动生成,无需描述。
 
@@ -377,7 +352,8 @@ shots(数组,每项含 title、negative_prompt、narration、cuts;cuts 为数组
 """
 
 # 系统提示词中随 prompt 语言变化的示例与长度规则
-# (Seedance 系引擎用中文撰写分镜,Kling 用英文,见 _engine_prompt_language)
+# (Seedance 系引擎用中文撰写分镜,Kling 与 Gemini 用英文,见 _engine_prompt_language;
+# 台词示例按默认的中文台词撰写)
 _LANG_PROMPT_PARTS = {
     "中文": {
         "style_example": (
@@ -513,17 +489,6 @@ class Director:
             "与真实物理,请在分镜 prompt 中直接写明镜头运动与光线;"
             "原生同步音频始终开启,角色台词可直接写进分镜 prompt。"
         ),
-        "jimeng": (
-            "本片使用即梦视频引擎,有三条硬性约束:\n"
-            "1. 每个镜头组的总时长(组内分镜时长之和)必须严格为 5 秒或 "
-            "10 秒,二选一,不允许其他数值;\n"
-            "2. 该引擎不支持参考图:reference_prompt 一律置为空字符串,"
-            "所有分镜 prompt 中不得出现 @Element1 占位符,改为在每个涉及"
-            "主角的分镜 prompt 中逐字重复同一段固定外观描述;\n"
-            "3. 该引擎不生成原生音效与台词配音:不要设计依赖角色开口说话"
-            "的桥段(可用动作、表情与镜头语言表达),叙事优先采用解说型"
-            "旁白(narration 字段,由本地语音合成配音)。"
-        ),
     }
     # Kling / Gemini 端点不原生支持 3:4 / 4:3(Gemini 连 1:1 也不支持):
     # 由相邻原生画幅生成后居中裁剪(见 kling.kling_generation_aspect /
@@ -572,6 +537,7 @@ class Director:
         system = _SYSTEM_PROMPT.format(
             engine_name=config.engine_name,
             prompt_language=prompt_language,
+            dialogue_language=config.dialogue_language,
             group_min=min_group,
             group_max=max_group,
             target=target,
@@ -668,12 +634,12 @@ class Director:
         if resp.status_code in _RETRYABLE_STATUS:
             raise _RetryableHTTPError(f"HTTP {resp.status_code}: {_error_message(resp)}")
         if resp.status_code == 401:
-            raise RuntimeError("OpenRouter API KEY 无效,请检查 config.yaml 中的 openrouter_api_key")
+            raise RuntimeError("OpenRouter API KEY 无效,请检查界面「设置」中的 OpenRouter API KEY")
         if resp.status_code == 402:
             raise RuntimeError("OpenRouter 余额不足,请前往 openrouter.ai 充值")
         if resp.status_code == 404:
             raise RuntimeError(
-                f"模型不存在: {llm['model']},请检查 config.yaml 中的 llm.model"
+                f"模型不存在: {llm['model']},请检查界面「设置」中的编剧模型"
             )
         if resp.status_code != 200:
             raise RuntimeError(f"OpenRouter 请求失败 HTTP {resp.status_code}: {_error_message(resp)}")
@@ -718,8 +684,6 @@ class Director:
         storyboard = self._build_storyboard(
             parsed, max_shots, fallback_duration, min_group, max_group
         )
-        if engine == "jimeng":
-            _snap_jimeng_durations(storyboard)
         return storyboard
 
     def _post(self, body: dict) -> requests.Response:
