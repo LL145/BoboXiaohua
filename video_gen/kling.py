@@ -1,14 +1,16 @@
 """调用视频引擎生成素材:主角参考图(文生图)与各镜头组视频片段。
 
-支持三个视频引擎(config.yaml 的 video.engine 切换,默认 seedance25):
+支持五个视频引擎(config.yaml 的 video.engine 切换,默认 seedance25):
+- **Seedance 2.5**(字节跳动,经 fal.ai,默认):单组最长 30 秒一次连续生成,
+  多分镜按时间戳分块拼进单条 prompt;有固定主角时走 reference-to-video,
+  参考图(最多 30 张)经 image_urls 送入、prompt 中以 @Image1 引用(导演
+  脚本统一写 @Element1,提交前自动转换);原生支持全部画幅与音频。
+- **Seedance 2.5 方舟直连**(video.engine: ark):同一模型,改走火山方舟官方
+  任务接口(需 ark_api_key,适合已有方舟账号或需要 4K 的用户);参考图以
+  base64 data URL 随请求送入(role: reference_image),prompt 中按方舟官方
+  语法以 @图片1 引用;支持 negative_prompt 与 2K/4K。
 - **Seedance 2.0**(字节跳动,经 fal.ai):多分镜用 "Cut scene to" 语法拼进
-  单条 prompt 一次连续生成;有固定主角时走 reference-to-video,参考图经
-  image_urls 送入、prompt 中以 @Image1 引用(导演脚本统一写 @Element1,
-  提交前自动转换);原生支持 16:9/9:16/1:1/3:4/4:3 全部画幅与音频。
-- **Seedance 2.5**(字节跳动,经火山方舟官方 API,默认):fal.ai 尚未上线 2.5,
-  直连火山方舟(Volcengine Ark)的视频生成任务接口(需额外配 ark_api_key);
-  单组最长 30 秒一次连续生成,参考图以 base64 data URL 随请求送入
-  (role: reference_image),prompt 中按方舟官方语法以 @图片1 引用。
+  单条 prompt 一次连续生成(单组 4~15 秒);参考图同样经 image_urls 送入。
 - **Kling 3**(快手,经 fal.ai):多分镜走 multi_prompt 结构化参数;有固定
   主角时走 reference-to-video 的 elements 角色元素(@Element1);3:4/4:3
   画幅按相邻原生画幅生成、成片时居中裁剪。
@@ -56,9 +58,9 @@ _MAX_SEEDANCE_PROMPT_CHARS = 2500
 # Seedance 2.0 单次生成时长范围(秒)
 _SEEDANCE_MIN_SECONDS = 4
 _SEEDANCE_MAX_SECONDS = 15
-# Seedance 2.5(火山方舟)单次生成时长范围(秒):官方支持一次连续生成 30 秒
-_ARK_MIN_SECONDS = 4
-_ARK_MAX_SECONDS = 30
+# Seedance 2.5(fal.ai 与火山方舟同)单次生成时长范围(秒):一次连续生成 30 秒
+_SEEDANCE25_MIN_SECONDS = 4
+_SEEDANCE25_MAX_SECONDS = 30
 # 即梦(火山引擎视觉智能 API)单次只能生成 5 秒或 10 秒(frames = 24×秒数 + 1)
 _JIMENG_DURATIONS = (5, 10)
 _JIMENG_API_VERSION = "2022-08-31"
@@ -67,8 +69,9 @@ _JIMENG_DETERMINISTIC_CODES = {50400, 50411, 50412, 50413, 50511, 50512}
 
 # 各引擎支持的参考图张数上限(超出部分按顺序丢弃,pipeline 会提前告知用户)
 MAX_REFERENCE_IMAGES = {
-    "seedance25": 30,  # 方舟官方:单次最多 30 张参考图
-    "seedance": 9,     # fal reference-to-video:最多 9 张
+    "seedance25": 30,  # fal Seedance 2.5 reference-to-video:最多 30 张
+    "ark": 30,         # 方舟官方:单次最多 30 张参考图
+    "seedance": 9,     # fal Seedance 2.0 reference-to-video:最多 9 张
     "kling": 4,        # elements 单角色的多角度参考,保守取 4 张
     "jimeng": 0,       # 即梦 API 不支持角色参考图(靠外观描述保持一致)
 }
@@ -599,23 +602,102 @@ class SeedanceGenerator(_FalGenerator):
         return endpoint, arguments, use_reference
 
 
-class ArkSeedanceGenerator(_FalGenerator):
-    """Seedance 2.5(字节跳动,经火山方舟官方 API):默认视频引擎。
+class Seedance25Generator(_FalGenerator):
+    """Seedance 2.5(字节跳动,经 fal.ai):默认视频引擎(video.engine: seedance25)。
 
-    fal.ai 尚未上线 Seedance 2.5,因此直连火山方舟(Volcengine Ark)的
-    视频生成任务接口:POST 创建任务 → 轮询状态 → 下载成片,鉴权用 ark_api_key。
+    与 Seedance 2.0 同一套 fal 提交/轮询逻辑,差异:单组最长 30 秒,多分镜
+    按时间戳分块拼接(防长组后半段漂移),参考图最多 30 张,reference 端点
+    支持 seed;端点不支持 negative_prompt。
+    """
+
+    _ENGINE_LABEL = "Seedance 2.5"
+
+    def _build_arguments(
+        self, shot: Shot, references: list[tuple[str, str]] | None
+    ) -> tuple[str, dict, bool]:
+        """多分镜按时间戳分块拼成单条 prompt,有主角走 image_urls 参考图。"""
+        seedance25 = self._config["seedance25"]
+        video_cfg = self._config["video"]
+        combined = shot.combined_prompt.lower()
+        use_reference = bool(references) and (
+            "@element" in combined or "@image" in combined
+        )
+
+        if use_reference:
+            endpoint = str(seedance25["reference_endpoint"])
+            # fal 端点在 prompt 中用 @Image1 引用 image_urls 里的参考图;
+            # 导演脚本统一写 @Element1,在此转换(旧脚本的 @Image1 原样可用)
+            prompts = [element_to_image_tokens(cut.prompt) for cut in shot.cuts]
+        else:
+            endpoint = str(seedance25["text_endpoint"])
+            prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
+
+        prompt = _join_seedance25_prompts(prompts, shot)
+        refs: list[tuple[str, str]] = []
+        if use_reference:
+            refs = references[:MAX_REFERENCE_IMAGES["seedance25"]]
+            prompt += reference_usage_note([note for _, note in refs], "@Image{}")
+        if len(prompt) > _MAX_SEEDANCE_PROMPT_CHARS:
+            self._log(
+                f"  ⚠ 镜头组 {shot.index} 提示词超长({len(prompt)} 字符),"
+                f"已裁剪到 {_MAX_SEEDANCE_PROMPT_CHARS} 字符内"
+            )
+            prompt = fit_prompt(prompt, _MAX_SEEDANCE_PROMPT_CHARS)
+
+        duration = min(
+            _SEEDANCE25_MAX_SECONDS, max(_SEEDANCE25_MIN_SECONDS, shot.duration)
+        )
+        arguments: dict = {
+            "prompt": prompt,
+            # 端点的 duration 为字符串枚举("auto" 或 "4"~"30")
+            "duration": str(duration),
+            # Seedance 2.5 原生支持 16:9/9:16/1:1/3:4/4:3 全部画幅,无需映射裁剪
+            "aspect_ratio": str(video_cfg["aspect_ratio"]),
+            "resolution": str(seedance25["resolution"]),
+            "generate_audio": bool(video_cfg["generate_audio"]),
+        }
+        if use_reference:
+            arguments["image_urls"] = [url for url, _ in refs]
+            # seed 仅 reference-to-video 端点接受(text-to-video 无此参数)
+            try:
+                seed = int(seedance25.get("seed", -1))
+            except (TypeError, ValueError):
+                seed = -1
+            if seed >= 0:
+                arguments["seed"] = seed
+        return endpoint, arguments, use_reference
+
+
+def _join_seedance25_prompts(prompts: list[str], shot: Shot) -> str:
+    """Seedance 2.5 的多分镜拼接:多分镜按时间戳分块(官方推荐,把各分镜的
+    时长比例明确传给模型,避免 30 秒长镜头组的"后半段漂移"),单分镜沿用
+    普通拼接。fal.ai 与火山方舟两条通路共用。"""
+    if len(shot.cuts) > 1:
+        return join_cut_prompts_timed(
+            [(p, cut.duration) for p, cut in zip(prompts, shot.cuts)]
+        )
+    return join_cut_prompts(prompts)
+
+
+class ArkSeedanceGenerator(_FalGenerator):
+    """Seedance 2.5 方舟直连(字节跳动,经火山方舟官方 API):可选引擎
+    (video.engine: ark)。
+
+    直连火山方舟(Volcengine Ark)的视频生成任务接口:POST 创建任务 →
+    轮询状态 → 下载成片,鉴权用 ark_api_key。适合已有方舟账号、需要
+    2K/4K 或 negative_prompt 的用户。
     复用基类的重试/降级/下载/取消逻辑,仅替换任务提交与参考图上传:
     参考图无需对象存储,直接编码为 base64 data URL 随请求送入
     (role: reference_image);主角参考图的自动文生图仍走 fal,
     未配置 fal_api_key 时自动跳过并降级纯文生视频。
     """
 
-    _ENGINE_LABEL = "Seedance 2.5"
+    _ENGINE_LABEL = "Seedance 2.5(方舟)"
 
     # ---------------- 方舟请求要素 ----------------
 
     def _api_base(self) -> str:
-        return str(self._config["seedance25"]["api_base"]).rstrip("/")
+        return str(self._config["ark"]["api_base"]).rstrip("/")
 
     def _headers(self) -> dict:
         return {
@@ -723,10 +805,10 @@ class ArkSeedanceGenerator(_FalGenerator):
                 "火山方舟 API KEY 无效或无权限,请检查 config.yaml 中的 ark_api_key"
             )
         if resp.status_code == 404 or code in ("ModelNotFound", "ModelNotOpen"):
-            model = str(self._config["seedance25"]["model"])
+            model = str(self._config["ark"]["model"])
             return FatalGenerationError(
                 f"火山方舟模型不可用: {model}。请确认已在方舟控制台开通该模型,"
-                "并检查 config.yaml 中的 seedance25.model / seedance25.api_base"
+                "并检查 config.yaml 中的 ark.model / ark.api_base"
             )
         if resp.status_code == 402 or code in ("AccountOverdueError", "QuotaExceeded"):
             return FatalGenerationError(
@@ -745,7 +827,7 @@ class ArkSeedanceGenerator(_FalGenerator):
         self, shot: Shot, references: list[tuple[str, str]] | None
     ) -> tuple[str, dict, bool]:
         """多分镜按时间戳分块拼成单条 prompt,有主角以 reference_image 送入。"""
-        seedance25 = self._config["seedance25"]
+        ark = self._config["ark"]
         video_cfg = self._config["video"]
         combined = shot.combined_prompt.lower()
         use_reference = bool(references) and (
@@ -758,17 +840,10 @@ class ArkSeedanceGenerator(_FalGenerator):
         else:
             prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
 
-        if len(shot.cuts) > 1:
-            # 时间戳分块(官方推荐):把各分镜的时长比例明确传给模型,
-            # 避免 30 秒长镜头组的"后半段漂移"
-            prompt = join_cut_prompts_timed(
-                [(p, cut.duration) for p, cut in zip(prompts, shot.cuts)]
-            )
-        else:
-            prompt = join_cut_prompts(prompts)
+        prompt = _join_seedance25_prompts(prompts, shot)
         refs: list[tuple[str, str]] = []
         if use_reference:
-            refs = references[:MAX_REFERENCE_IMAGES["seedance25"]]
+            refs = references[:MAX_REFERENCE_IMAGES["ark"]]
             prompt += reference_usage_note([note for _, note in refs], "@图片{}")
         if len(prompt) > _MAX_SEEDANCE_PROMPT_CHARS:
             self._log(
@@ -784,13 +859,15 @@ class ArkSeedanceGenerator(_FalGenerator):
                 "image_url": {"url": url},
                 "role": "reference_image",
             })
-        duration = min(_ARK_MAX_SECONDS, max(_ARK_MIN_SECONDS, shot.duration))
+        duration = min(
+            _SEEDANCE25_MAX_SECONDS, max(_SEEDANCE25_MIN_SECONDS, shot.duration)
+        )
         arguments = {
-            "model": str(seedance25["model"]),
+            "model": str(ark["model"]),
             "content": content,
             # Seedance 2.5 原生支持 16:9/9:16/1:1/3:4/4:3 全部画幅,无需映射裁剪
             "ratio": str(video_cfg["aspect_ratio"]),
-            "resolution": str(seedance25["resolution"]),
+            "resolution": str(ark["resolution"]),
             "duration": duration,
             "generate_audio": bool(video_cfg["generate_audio"]),
             "watermark": False,
@@ -799,7 +876,7 @@ class ArkSeedanceGenerator(_FalGenerator):
         if negative:
             arguments["negative_prompt"] = fit_prompt(negative, _MAX_SINGLE_PROMPT_CHARS)
         try:
-            seed = int(seedance25.get("seed", -1))
+            seed = int(ark.get("seed", -1))
         except (TypeError, ValueError):
             seed = -1
         if seed >= 0:
@@ -1015,10 +1092,11 @@ class JimengGenerator(_FalGenerator):
 def create_generator(
     config: Config, log: LogFn, cancel_event: threading.Event | None = None
 ) -> _FalGenerator:
-    """按 video.engine 创建对应引擎的生成器(默认 seedance25)。"""
+    """按 video.engine 创建对应引擎的生成器(默认 seedance25,经 fal.ai)。"""
     cls = {
         "seedance": SeedanceGenerator,
-        "seedance25": ArkSeedanceGenerator,
+        "seedance25": Seedance25Generator,
+        "ark": ArkSeedanceGenerator,
         "jimeng": JimengGenerator,
     }.get(config.engine, KlingGenerator)
     return cls(config, log, cancel_event=cancel_event)
