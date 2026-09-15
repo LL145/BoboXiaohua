@@ -13,6 +13,11 @@
 - **Kling 3**(快手):多分镜走 multi_prompt 结构化参数;有主角走 elements
   角色元素(@Element1,多图仅作同一主角的多角度参考);3:4/4:3 需裁剪。
 
+旁白(narration.mode 为 native 时,默认):四个引擎都能原生生成语音,导演写的
+中文旁白经 `voiceover_note` 以画外音指令附在该组 prompt 末尾(语言随引擎,
+声线描述取自 Storyboard.narrator_voice,逐组重复以保持一致);Kling 多分镜
+走 multi_prompt,旁白按各分镜时长比例拆句分配到对应分镜。
+
 公共稳健性(全部引擎一致):提交/轮询/下载/超时看门狗/取消,任一环节失败
 自动降级为纯文生视频,绝不因参考图问题导致整体失败。
 """
@@ -30,6 +35,7 @@ import requests
 
 from .config import ALL_ASPECTS, Config, generation_aspect
 from .director import Shot
+from .tts import split_sentences
 
 LogFn = Callable[[str], None]
 
@@ -156,6 +162,64 @@ def reference_usage_note(
     return " 参考素材用途——" + ";".join(parts) + "。请保持画面中主角外观与参考图严格一致。"
 
 
+# 导演未给出声线描述时的回退值(按 prompt 语言)
+_DEFAULT_NARRATOR = {
+    True: "沉稳的成年女声,解说语气",
+    False: "a calm adult female narrator, documentary tone",
+}
+
+
+def voiceover_note(narration: str, narrator_voice: str, english: bool) -> str:
+    """把中文旁白写成画外音指令,附在镜头组 prompt 末尾(原生配音方式)。
+
+    指令语言随引擎的 prompt 语言;旁白本身始终是中文普通话原文。声线描述全片
+    固定、逐组重复,是跨组保持同一"播音员"的唯一手段(各组独立生成)。
+    """
+    text = " ".join(narration.split())
+    if not text:
+        return ""
+    voice = " ".join(narrator_voice.split()) or _DEFAULT_NARRATOR[not english]
+    if english:
+        return (
+            f' Off-screen voiceover in Mandarin Chinese ({voice}), clearly audible,'
+            f' paced to fit the clip: "{text}" No background music.'
+        )
+    return (
+        f" 画外音旁白({voice}),中文普通话,清晰可闻,语速贴合本段时长:"
+        f"“{text}”不要配乐。"
+    )
+
+
+def split_narration_by_cuts(narration: str, durations: list[int]) -> list[str]:
+    """按各分镜时长比例把旁白整句分配给分镜(Kling multi_prompt 逐分镜写画外音)。
+
+    句子不拆开,按累计时长贪心归入当前分镜;空句/单分镜直接整段返回。
+    """
+    sentences = split_sentences(narration)
+    if not sentences:
+        return [""] * len(durations)
+    if len(durations) <= 1:
+        return ["".join(sentences)]
+    total_chars = sum(len(x) for x in sentences) or 1
+    total_secs = sum(max(1, int(d)) for d in durations) or 1
+    parts: list[list[str]] = [[] for _ in durations]
+    cursor = 0.0  # 已分配句子占旁白总字数的比例
+    for sentence in sentences:
+        share = len(sentence) / total_chars
+        midpoint = cursor + share / 2
+        # 句子中点落在哪个分镜的时间区间,就归入哪个分镜
+        elapsed = 0.0
+        target = len(durations) - 1
+        for i, d in enumerate(durations):
+            elapsed += max(1, int(d)) / total_secs
+            if midpoint < elapsed:
+                target = i
+                break
+        parts[target].append(sentence)
+        cursor += share
+    return ["".join(p) for p in parts]
+
+
 def fit_prompt(prompt: str, limit: int) -> str:
     """把提示词裁剪到长度上限内:尽量在句号/逗号等分句边界截断,避免拦腰斩词。"""
     prompt = prompt.strip()
@@ -195,6 +259,10 @@ class _FalGenerator:
         # 声音策略:影片有旁白或将混入背景音乐时,禁止视频模型自行配乐
         # (由 pipeline 在生成前设定;Gemini 据此附加英文指令)
         self.allow_music = True
+        # 旁白方式与声线(pipeline 在生成前按本次脚本设定):native 时把各组的
+        # 中文旁白以画外音指令附进 prompt,交给视频模型原生配音
+        self.narration_mode = config.effective_narration_mode
+        self.narrator_voice = ""
         # fal_client 通过 FAL_KEY 环境变量读取凭证
         os.environ["FAL_KEY"] = config.fal_api_key
 
@@ -328,6 +396,14 @@ class _FalGenerator:
             f"已裁剪到 {limit} 字符内"
         )
         return fit_prompt(prompt, limit)
+
+    def _voiceover(self, narration: str) -> str:
+        """原生配音方式下该段旁白的画外音指令;其他方式或无旁白时为空串。"""
+        if self.narration_mode != "native" or not narration.strip():
+            return ""
+        return voiceover_note(
+            narration, self.narrator_voice, english=self._spec.prompt_language != "中文"
+        )
 
     def generate_clip(
         self,
@@ -501,6 +577,7 @@ class _SinglePromptGenerator(_FalGenerator):
             )
         else:
             prompt = join_cut_prompts(prompts)
+        prompt += self._voiceover(shot.narration)
         prompt += reference_usage_note(
             [note for _, note in refs], self._TOKEN_FORMAT,
             english=self._ENGLISH_NOTE, zero_based=self._ZERO_BASED,
@@ -606,15 +683,24 @@ class KlingGenerator(_FalGenerator):
             prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
 
         if len(shot.cuts) > 1:
+            # 旁白按分镜时长比例拆句,逐分镜附画外音指令(multi_prompt 无组级 prompt)
+            pieces = split_narration_by_cuts(
+                shot.narration if self.narration_mode == "native" else "",
+                [cut.duration for cut in shot.cuts],
+            )
             arguments["multi_prompt"] = [
                 {
-                    "prompt": self._fit(p, _MAX_MULTI_PROMPT_CHARS, shot, f" 分镜 {i}"),
+                    "prompt": self._fit(
+                        p + self._voiceover(piece), _MAX_MULTI_PROMPT_CHARS, shot, f" 分镜 {i}"
+                    ),
                     "duration": str(cut.duration),
                 }
-                for i, (p, cut) in enumerate(zip(prompts, shot.cuts), 1)
+                for i, (p, cut, piece) in enumerate(zip(prompts, shot.cuts, pieces), 1)
             ]
         else:
-            arguments["prompt"] = self._fit(prompts[0], _MAX_PROMPT_CHARS, shot)
+            arguments["prompt"] = self._fit(
+                prompts[0] + self._voiceover(shot.narration), _MAX_PROMPT_CHARS, shot
+            )
             arguments["duration"] = str(self._group_duration(shot))
         endpoint = self._section["reference_endpoint" if use_reference else "text_endpoint"]
         return str(endpoint), arguments, use_reference

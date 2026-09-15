@@ -12,7 +12,9 @@
 - 并行生成:多个镜头组同时提交视频引擎(全部经 fal.ai,默认 Gemini Omni Flash,
   可切 Seedance 2.5 / 2.0 / Kling 3),总耗时约等于单个镜头组;
 - 单镜头组独立重试 + 超时看门狗,KEY 无效等致命错误立即终止,不空耗重试;
-- 旁白与字幕:导演判断影片需要解说时,用 Edge TTS 合成旁白并生成字幕;
+- 旁白与字幕:导演判断影片需要解说时,默认(narration.mode: native)把旁白
+  作为画外音指令附进各组 prompt,由视频模型原生配音,字幕按镜头组时间轴估算;
+  tts 方式则用 Edge TTS 合成旁白并混入、字幕取逐句时间轴;
   Edge TTS 失败时自动改用 fal.ai 的付费 TTS 后备(narration.fallback_endpoint),
   后备也不可用、混音或字幕失败,都只是放弃对应环节,绝不影响画面成片;
 - 声音策略:影片有旁白或将混入背景音乐时,提示视频模型不要自行配乐
@@ -150,10 +152,22 @@ class Pipeline:
             if shot.index > 1 and shot.transition == "dissolve":
                 detail += ",溶解转入"
             log(f"  {shot.index}. {shot.title}({shot.duration}s{detail})")
-        log(
-            "  声音设计:解说型(旁白 + 字幕)" if storyboard.has_narration
-            else "  声音设计:沉浸型(原生音效与台词)"
-        )
+        narration_mode = config.effective_narration_mode
+        if storyboard.has_narration and narration_mode == "native":
+            voice = storyboard.narrator_voice.strip()
+            log(
+                f"  声音设计:解说型(旁白由 {config.engine_name} 原生配音 + 字幕"
+                + (f",声线:{voice})" if voice else ")")
+            )
+        elif storyboard.has_narration and narration_mode == "tts":
+            log("  声音设计:解说型(Edge TTS 合成旁白 + 字幕)")
+            if config.narration_mode == "native":
+                log(
+                    f"  ⚠ {config.engine_name} 已关闭原生音效(video.generate_audio),"
+                    "旁白改用 TTS 合成;想要原生配音请开启音效"
+                )
+        else:
+            log("  声音设计:沉浸型(原生音效与台词)")
 
         pending = [
             s for s in storyboard.shots
@@ -180,9 +194,10 @@ class Pipeline:
         # 声音策略:有旁白或将混入背景音乐时,不让视频模型自行配乐
         bgm = self._pick_bgm(storyboard, bgm_tracks)
         generator.allow_music = not (
-            (storyboard.has_narration and bool(config["narration"]["enabled"]))
-            or bgm is not None
+            (storyboard.has_narration and narration_mode != "off") or bgm is not None
         )
+        generator.narration_mode = narration_mode
+        generator.narrator_voice = storyboard.narrator_voice
 
         # 2. 主角参考图(用户上传优先;断点续传复用已保存的参考图;
         # 否则导演判断有固定主角时自动生成;失败自动降级纯文生)
@@ -244,11 +259,12 @@ class Pipeline:
 
         clips = [run_dir / f"shot_{s.index:02d}.mp4" for s in storyboard.shots]
 
-        # 4. 旁白配音(导演判断影片需要解说时;失败只丢旁白,不影响成片)
+        # 4. 旁白配音(tts 方式且导演判断影片需要解说时;失败只丢旁白,不影响成片;
+        # native 方式的旁白已由视频模型随画面配音,这里只需字幕)
         narration_cfg = config["narration"]
         narration_audio: dict[int, Path] = {}
         step = 4
-        if storyboard.has_narration and bool(narration_cfg["enabled"]):
+        if storyboard.has_narration and narration_mode == "tts":
             log("④ 合成旁白配音(Edge TTS)…")
             self._report_progress(82, "合成旁白配音")
             narration_audio = tts.synthesize_all(
@@ -289,6 +305,8 @@ class Pipeline:
                 assembler, storyboard, narration_audio, offsets, current, run_dir,
                 fallback=generator.synthesize_speech,
             )
+        elif storyboard.has_narration and narration_mode == "native":
+            srt_path = self._native_narration_srt(assembler, storyboard, offsets, current, run_dir)
 
         if bgm is not None:
             self._check_cancel()
@@ -362,6 +380,35 @@ class Pipeline:
         except OSError:
             return narration_path, None
         return narration_path, srt_path
+
+    def _native_narration_srt(
+        self,
+        assembler: Assembler,
+        storyboard: Storyboard,
+        offsets: list[float],
+        current: Path,
+        run_dir: Path,
+    ) -> Path | None:
+        """原生配音方式的字幕:旁白已在片段音轨里,没有逐句时间轴,
+        按各镜头组在成片上的时间区间、以句子字数比例估算;失败返回 None。"""
+        total = assembler.probe_duration(current) or float(storyboard.total_duration)
+        entries: list[tuple[float, float, str]] = []
+        for i, shot in enumerate(storyboard.shots):
+            text = shot.narration.strip()
+            if not text:
+                continue
+            start = offsets[i] if i < len(offsets) else total
+            end = offsets[i + 1] if i + 1 < len(offsets) else total
+            slot = max(1.0, end - start - 0.3)
+            entries += tts.narration_srt_entries(text, start, slot)
+        if not entries:
+            return None
+        srt_path = run_dir / f"{_safe_name(storyboard.title)}.srt"
+        try:
+            srt_path.write_text(tts.build_srt(entries), encoding="utf-8")
+        except OSError:
+            return None
+        return srt_path
 
     def _fit_narration(
         self,
@@ -572,6 +619,7 @@ class Pipeline:
         aspect = str(self._config["video"]["aspect_ratio"])
         target = int(self._config["video"]["target_duration"])
         engine = self._config.engine
+        narration_mode = self._config.effective_narration_mode
 
         for candidate in sorted(self._config.output_dir.glob(f"*_{key}*"), reverse=True):
             manifest_path = candidate / _MANIFEST_NAME
@@ -592,6 +640,13 @@ class Pipeline:
                 if manifest.get("engine", "kling") != engine:
                     continue
                 storyboard = Storyboard.from_dict(manifest["storyboard"])
+                # 旁白方式不同的旧任务不续传:原生配音的旁白已烧进片段音轨,
+                # 与 TTS 事后混入的片段不能混用(无该字段的旧 manifest 为 TTS 时代;
+                # 影片本无旁白时不受影响)
+                if storyboard.has_narration and (
+                    manifest.get("narration_mode", "tts") != narration_mode
+                ):
+                    continue
             except Exception:  # noqa: BLE001 - 损坏的 manifest 直接忽略
                 continue
             final_path = candidate / f"{_safe_name(storyboard.title)}.mp4"
@@ -618,6 +673,7 @@ class Pipeline:
             "aspect_ratio": aspect,
             "target_duration": target,
             "engine": engine,
+            "narration_mode": narration_mode,
             "storyboard": storyboard.to_dict(),
         }
         (run_dir / _MANIFEST_NAME).write_text(
@@ -680,6 +736,8 @@ class Pipeline:
             lines.append(f"主角参考图 prompt: {storyboard.reference_prompt}")
         if storyboard.bgm_file:
             lines.append(f"背景音乐: {storyboard.bgm_file}")
+        if storyboard.narrator_voice.strip():
+            lines.append(f"旁白声线: {storyboard.narrator_voice.strip()}")
         lines.append("")
         for shot in storyboard.shots:
             joiner = "交叉溶解" if shot.transition == "dissolve" else "硬切"
