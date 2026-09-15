@@ -1,7 +1,9 @@
 """用 ffmpeg 将各镜头片段拼接为最终成片。
 
-拼接优先带交叉溶解转场 + 首尾淡入淡出(需要 ffprobe 与重编码);
-任一环节不可用时自动回退为普通拼接,保证一定能出片。
+拼接按导演给出的组间衔接方式处理:硬切(默认,concat 滤镜)或交叉溶解
+(xfade),全片再加首尾淡入淡出(需要 ffprobe 与重编码);任一环节不可用时
+自动回退为普通拼接,保证一定能出片。
+旁白混入时对原生音轨做侧链闪避(旁白响起时自动压低对白/音效),
 背景音乐(如有)在拼接后混入,与片段原生音效共存。
 """
 
@@ -76,9 +78,13 @@ class Assembler:
         clips: list[Path],
         out_path: Path,
         fallback_durations: list[float] | None = None,
+        transitions: list[str] | None = None,
     ) -> tuple[Path, list[float]]:
-        """拼接片段:优先交叉溶解转场,失败回退普通拼接。
+        """拼接片段:按 transitions 逐个衔接(硬切 / 交叉溶解)并加首尾淡入淡出,
+        失败回退普通拼接。
 
+        transitions[i] 为第 i 段与前一段之间的衔接方式("cut" / "dissolve"),
+        首项忽略;缺省全部硬切。video.transition 为 0 时全部硬切。
         返回 (成片路径, 各片段在成片时间轴上的起点秒数)——旁白与字幕
         依赖这些偏移定位到对应镜头组。
         """
@@ -95,6 +101,11 @@ class Assembler:
             shutil.copyfile(clips[0], out_path)
             return out_path, [0.0]
 
+        wanted = [str(t).strip().lower() for t in (transitions or [])]
+        dissolve = [
+            self._transition > 0 and 0 < i < len(wanted) and wanted[i] == "dissolve"
+            for i in range(len(clips))
+        ]
         if self._transition > 0:
             if all(p is None for p in probed):
                 self._log(
@@ -102,10 +113,10 @@ class Assembler:
                     "(建议使用自带 ffprobe 的完整 ffmpeg 发行包)…"
                 )
             try:
-                offsets = self._concat_with_transitions(clips, durations, out_path)
+                offsets = self._concat_with_transitions(clips, durations, dissolve, out_path)
                 if offsets is not None:
                     return out_path, offsets
-                self._log("片段时长过短或无法探测,跳过交叉溶解转场,改用直接拼接 …")
+                self._log("片段时长过短或无法探测,跳过转场处理,改用直接拼接 …")
             except subprocess.CalledProcessError:
                 self._log("转场拼接失败,回退为直接拼接 …")
 
@@ -133,9 +144,14 @@ class Assembler:
         return out_path, offsets
 
     def _concat_with_transitions(
-        self, clips: list[Path], durations: list[float | None], out_path: Path
+        self,
+        clips: list[Path],
+        durations: list[float | None],
+        dissolve: list[bool],
+        out_path: Path,
     ) -> list[float] | None:
-        """xfade 交叉溶解 + 首尾淡入淡出;音轨齐全时同步 acrossfade。
+        """按组衔接:硬切用 concat 滤镜、溶解用 xfade,再加首尾淡入淡出;
+        音轨齐全时同步处理(硬切 concat / 溶解 acrossfade)。
 
         返回各片段起点偏移;None 表示前置条件不满足(如 ffprobe 缺失),
         由调用方回退。
@@ -149,17 +165,24 @@ class Assembler:
         for clip in clips:
             inputs += ["-i", str(clip)]
 
-        parts: list[str] = []
+        # concat 滤镜输出的时间基为 1/1000000,与原片(如 1/12288)不同,而 xfade
+        # 要求两路输入时间基一致:先把每路视频统一到 AVTB,硬切与溶解才能混用
+        parts: list[str] = [f"[{i}:v]settb=AVTB[in{i}]" for i in range(len(clips))]
         starts: list[float] = [0.0]
-        prev, offset = "[0:v]", 0.0
+        prev, total = "[in0]", durations[0]
         for i in range(1, len(clips)):
-            offset += durations[i - 1] - t
-            starts.append(offset)
-            parts.append(
-                f"{prev}[{i}:v]xfade=transition=fade:duration={t}:offset={offset:.3f}[v{i}]"
-            )
+            if dissolve[i]:
+                offset = total - t
+                parts.append(
+                    f"{prev}[in{i}]xfade=transition=fade:duration={t}:offset={offset:.3f}[v{i}]"
+                )
+                starts.append(offset)
+                total = offset + durations[i]
+            else:
+                parts.append(f"{prev}[in{i}]concat=n=2:v=1:a=0[v{i}]")
+                starts.append(total)
+                total += durations[i]
             prev = f"[v{i}]"
-        total = sum(durations) - t * (len(clips) - 1)
         fade_out = max(0.0, total - 1.0)
         parts.append(f"{prev}fade=t=in:d=0.5,fade=t=out:st={fade_out:.3f}:d=1[v]")
 
@@ -167,12 +190,19 @@ class Assembler:
         if with_audio:
             prev = "[0:a]"
             for i in range(1, len(clips)):
-                parts.append(f"{prev}[{i}:a]acrossfade=d={t}[a{i}]")
+                if dissolve[i]:
+                    parts.append(f"{prev}[{i}:a]acrossfade=d={t}[a{i}]")
+                else:
+                    parts.append(f"{prev}[{i}:a]concat=n=2:v=0:a=1[a{i}]")
                 prev = f"[a{i}]"
             parts.append(f"{prev}afade=t=out:st={fade_out:.3f}:d=1[a]")
             maps += ["-map", "[a]"]
 
-        self._log("拼接片段(交叉溶解转场" + (",含原生音效" if with_audio else "") + ")…")
+        n_dissolve = sum(dissolve)
+        self._log(
+            f"拼接片段(硬切 {len(clips) - 1 - n_dissolve} 处、交叉溶解 {n_dissolve} 处"
+            + (",含原生音效" if with_audio else "") + ")…"
+        )
         args = [*inputs, "-filter_complex", ";".join(parts), *maps,
                 "-c:v", "libx264", "-preset", "medium", "-crf", "18",
                 "-pix_fmt", "yuv420p"]
@@ -224,6 +254,8 @@ class Assembler:
 
         segments: [(起点秒, 音频路径, 可用时长上限)]。旁白略长于所在镜头组时
         自动加速(至多 1.4 倍)并截断,避免串到下一组画面。
+        原片音轨(对白/音效)以旁白为侧链做闪避压缩:旁白响起时自动压低,
+        间隙恢复;侧链滤镜不可用时退回等量混音。
         返回各段旁白实际的 (起点, 时长, 加速倍率) 供字幕对齐;
         失败返回 None(沿用原片)。
         """
@@ -257,11 +289,29 @@ class Assembler:
         # 先探测原片有无音轨,直接选对混音方案;探测不可用(ffprobe 缺失)时
         # 才退回"先试混音、失败再按无音轨处理"的两步走
         has_audio = self._has_audio(video)
+        # 旁白合成一路(apad 补齐到与原片等长,保证侧链滤镜以原片长度为准)
+        narr = (
+            f"{''.join(labels)}amix=inputs={n}:duration=longest:normalize=0,apad[narr]"
+            if n > 1 else f"{labels[0]}apad[narr]"
+        )
         try:
-            self._log(f"混入旁白配音({n} 段)…")
+            self._log(f"混入旁白配音({n} 段,原生音轨自动闪避)…")
             if has_audio is not False:
                 try:
-                    # 与原片音轨(环境音/台词)混音
+                    # 原片音轨以旁白为侧链压缩(旁白时压低约 -12dB),再与旁白混合
+                    ducked = ";".join([
+                        *filters, narr, "[narr]asplit=2[sc][nr]",
+                        "[0:a][sc]sidechaincompress=threshold=0.02:ratio=6"
+                        ":attack=20:release=400:makeup=1[bed]",
+                        "[bed][nr]amix=inputs=2:duration=first:normalize=0[a]",
+                    ])
+                    self._run([*inputs, "-filter_complex", ducked, *tail])
+                    return timeline
+                except subprocess.CalledProcessError:
+                    if has_audio:
+                        self._log("  侧链闪避不可用,改用等量混音 …")
+                try:
+                    # 与原片音轨(环境音/台词)等量混音
                     mix = f"[0:a]{''.join(labels)}amix=inputs={n + 1}:duration=first:normalize=0[a]"
                     self._run([*inputs, "-filter_complex", ";".join([*filters, mix]), *tail])
                     return timeline

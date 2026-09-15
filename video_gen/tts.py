@@ -4,8 +4,10 @@
 合成时同步记录逐句的精确时间轴(edge-tts 句边界事件),落盘为
 narration_XX.timeline.json,供字幕严格对齐语音;旁白超长时还支持
 以更快语速(rate)重新合成,比事后 atempo 变速自然得多。
-稳健性:edge-tts 未安装、网络不可用、单句合成失败,都只是放弃对应旁白,
-绝不影响画面成片(与全片"绝不因局部失败毁掉整次任务"的原则一致)。
+稳健性:edge-tts 未安装、网络不可用(近年常见 403 封禁)、单句合成失败时,
+先尝试调用方提供的后备合成器(pipeline 传入 fal.ai 付费 TTS),后备也失败才
+放弃对应旁白,绝不影响画面成片(与全片"绝不因局部失败毁掉整次任务"的原则一致)。
+后备合成没有逐句时间轴,字幕回退为按字数比例估算。
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ from typing import Callable
 from .director import Storyboard
 
 LogFn = Callable[[str], None]
+# 后备合成器:(旁白文本, 输出路径, 语速加快百分比, 镜头组序号) → 是否成功
+FallbackFn = Callable[[str, Path, int, int], bool]
 
 # 小于该体积的音频视为无效(空文件/截断)
 _MIN_AUDIO_BYTES = 1024
@@ -62,11 +66,12 @@ def synthesize_all(
     voice: str,
     log: LogFn,
     cancel: threading.Event | None = None,
+    fallback: FallbackFn | None = None,
 ) -> dict[int, Path]:
     """逐镜头组合成旁白,返回 {镜头组序号: 音频路径};失败的组被跳过。
 
     已存在的有效音频直接复用(断点续传);cancel 置位时停止合成后续组,
-    是否终止整个任务由调用方决定。
+    是否终止整个任务由调用方决定;fallback 为 Edge TTS 失败时的后备合成器。
     """
     pending = [s for s in storyboard.shots if s.narration.strip()]
     if not pending:
@@ -74,8 +79,10 @@ def synthesize_all(
     try:
         import edge_tts  # noqa: F401 - 仅探测可用性
     except ImportError:
-        log("  未安装 edge-tts,跳过旁白配音(安装:pip install edge-tts)。")
-        return {}
+        if fallback is None:
+            log("  未安装 edge-tts,跳过旁白配音(安装:pip install edge-tts)。")
+            return {}
+        log("  未安装 edge-tts,改用后备 TTS 合成旁白 …")
 
     results: dict[int, Path] = {}
     for shot in pending:
@@ -85,17 +92,34 @@ def synthesize_all(
         if narration_is_valid(out_path):
             results[shot.index] = out_path
             continue
-        if synthesize(shot.narration.strip(), voice, out_path, log, shot.index):
+        if synthesize(
+            shot.narration.strip(), voice, out_path, log, shot.index, fallback=fallback
+        ):
             results[shot.index] = out_path
     return results
 
 
 def synthesize(
-    text: str, voice: str, out_path: Path, log: LogFn, index: int, rate: int = 0
+    text: str,
+    voice: str,
+    out_path: Path,
+    log: LogFn,
+    index: int,
+    rate: int = 0,
+    fallback: FallbackFn | None = None,
 ) -> bool:
-    """合成一段旁白到 out_path,并写出逐句时间轴;rate 为语速加快百分比(0~N)。"""
+    """合成一段旁白到 out_path,并写出逐句时间轴;rate 为语速加快百分比(0~N)。
+
+    Edge TTS 两次失败(或未安装)后交给 fallback;后备产物没有逐句时间轴,
+    删除同名旧时间轴文件以免字幕错位。
+    """
     tmp_path = out_path.with_suffix(".part")
-    for attempt in (1, 2):
+    try:
+        import edge_tts  # noqa: F401
+        edge_available = True
+    except ImportError:
+        edge_available = False
+    for attempt in (1, 2) if edge_available else ():
         try:
             sentences = _stream_synthesize(text, voice, rate, tmp_path)
             if tmp_path.exists() and tmp_path.stat().st_size >= _MIN_AUDIO_BYTES:
@@ -107,6 +131,13 @@ def synthesize(
             log(f"  镜头组 {index} 旁白第 {attempt} 次合成失败: {exc}")
             time.sleep(2)
     tmp_path.unlink(missing_ok=True)
+    if fallback is not None:
+        try:
+            if fallback(text, out_path, rate, index) and narration_is_valid(out_path):
+                timeline_path(out_path).unlink(missing_ok=True)
+                return True
+        except Exception as exc:  # noqa: BLE001 - 后备失败同样不致命
+            log(f"  镜头组 {index} 后备 TTS 出错: {exc}")
     log(f"  镜头组 {index} 旁白合成失败,该组将没有解说(不影响画面)。")
     return False
 

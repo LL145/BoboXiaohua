@@ -126,8 +126,8 @@ def generation_aspect(engine: str, aspect: str) -> str:
     return _GENERATION_ASPECT.get(aspect, "16:9")
 # 编剧模型的常用候选(OpenRouter 模型 ID),界面下拉框可直接选、也可手填任意模型
 LLM_MODEL_PRESETS: tuple[str, ...] = (
-    "z-ai/glm-5.3",
     "qwen/qwen3.8-max",
+    "z-ai/glm-5.3",
     "anthropic/claude-fable-5",
     "openai/gpt-5.2",
     "google/gemini-3-pro",
@@ -148,25 +148,29 @@ _DEFAULTS: dict[str, Any] = {
         "text_endpoint": "google/gemini-omni-flash/v1.1/text-to-video",
         "reference_endpoint": "google/gemini-omni-flash/v1.1/reference-to-video",
         "resolution": "720p",
-        "price_per_second": 0.10,
+        # 费用预估单价(美元/秒),按分辨率;fal 实时定价为准
+        "price_per_second": {"360p": 0.03, "720p": 0.10, "1080p": 0.15, "4k": 0.30},
     },
     "seedance25": {
         "text_endpoint": "bytedance/seedance-2.5/text-to-video",
         "reference_endpoint": "bytedance/seedance-2.5/reference-to-video",
         "resolution": "720p",
         "seed": -1,
-        "price_per_second": 0.473,
+        "price_per_second": {"480p": 0.2205, "720p": 0.473, "1080p": 1.164},
     },
     "seedance": {
         "text_endpoint": "bytedance/seedance-2.0/text-to-video",
         "reference_endpoint": "bytedance/seedance-2.0/reference-to-video",
         "resolution": "720p",
-        "price_per_second": 0.3034,
+        # 按 token 计费(宽×高×秒×24/1024,$0.014/千 token;4k 为 $0.008/千 token)折算
+        "price_per_second": {"480p": 0.135, "720p": 0.3034, "1080p": 0.68, "4k": 1.56},
     },
     "kling": {
         "text_endpoint": "fal-ai/kling-video/v3/pro/text-to-video",
         "reference_endpoint": "fal-ai/kling-video/o3/pro/reference-to-video",
+        # 端点无分辨率参数;开/关原生音效两档单价
         "price_per_second": 0.168,
+        "price_per_second_no_audio": 0.112,
     },
     "image": {"endpoint": "fal-ai/nano-banana-2"},
     "narration": {
@@ -174,6 +178,9 @@ _DEFAULTS: dict[str, Any] = {
         "voice": "zh-CN-XiaoxiaoNeural",
         "volume": 1.0,
         "subtitles": True,
+        # Edge TTS 失败时的付费后备(fal.ai,约 $0.10/千字);留空则不启用
+        "fallback_endpoint": "fal-ai/minimax/speech-02-hd",
+        "fallback_voice": "Chinese (Mandarin)_Warm_Girl",
     },
     "video": {
         "engine": DEFAULT_ENGINE,
@@ -257,6 +264,29 @@ class Config:
         return self._data.get(self.engine) or self._data[DEFAULT_ENGINE]
 
     @property
+    def price_per_second(self) -> float:
+        """当前引擎、当前分辨率(与音效开关)下的费用预估单价(美元/秒);
+        配置为 0 或缺失时返回 0(不显示预估)。
+
+        price_per_second 可为单个数字,也可为「分辨率 → 单价」映射(旧配置的
+        单个数字仍兼容);Kling 端点无分辨率参数,关音效时取
+        price_per_second_no_audio。
+        """
+        section = self.engine_section
+        price = section.get("price_per_second", 0)
+        if isinstance(price, dict):
+            resolution = str(section.get("resolution") or "")
+            price = price.get(resolution)
+            if price is None:  # 未登记的分辨率:取最贵一档,宁可高估
+                price = max((float(v) for v in section["price_per_second"].values()), default=0)
+        elif not bool(self._data["video"].get("generate_audio", True)):
+            price = section.get("price_per_second_no_audio", price)
+        try:
+            return max(0.0, float(price or 0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    @property
     def dialogue_language(self) -> str:
         """角色台词的默认语言(留空时回退为中文普通话)。"""
         value = str(self._data["video"].get("dialogue_language") or "").strip()
@@ -310,9 +340,15 @@ class Config:
         if not 0 <= float(self._data["narration"]["volume"]) <= 2:
             problems.append("narration.volume 需在 0~2 之间")
         for section in ENGINES:
-            if float(self._data[section]["price_per_second"]) < 0:
+            price = self._data[section].get("price_per_second", 0)
+            values = price.values() if isinstance(price, dict) else [price]
+            try:
+                if any(float(v) < 0 for v in values):
+                    raise ValueError
+            except (TypeError, ValueError):
                 problems.append(
-                    f"{section}.price_per_second 不能为负数(设 0 可关闭费用预估)"
+                    f"{section}.price_per_second 需为非负数或「分辨率: 单价」映射"
+                    "(设 0 可关闭费用预估)"
                 )
         return problems
 

@@ -33,10 +33,12 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
 
 一次生成 = `Pipeline.run()`(pipeline.py)串起以下阶段,数据流单向:
 
-1. **director.py** — LLM 编剧+导演(默认 `z-ai/glm-5.3`,思考深度 medium;
-   模型拒绝该档位时自动去掉 `reasoning` 参数重试),经 OpenRouter
+1. **director.py** — LLM 编剧+导演(默认 `qwen/qwen3.8-max`,支持图片输入,
+   思考深度 medium;模型拒绝该档位时自动去掉 `reasoning` 参数重试),经 OpenRouter
    (OpenAI 兼容接口)把一句话扩写为 `Storyboard`(含镜头组 `Shot` 列表,每组内含
-   1~6 个分镜 `Cut`)。组内分镜由视频引擎一次连续生成,组间才用转场;
+   1~6 个分镜 `Cut`)。组内分镜由视频引擎一次连续生成;组间衔接由导演在
+   `Shot.transition` 决定(`cut` 硬切为默认,`dissolve` 交叉溶解仅用于时间跳跃/
+   章节转换,`_normalize_transition` 归一,旧 manifest 缺字段视为硬切);
    组总长范围取自引擎能力表 `config.ENGINES[engine].group_seconds`(Gemini 3~10、
    Seedance 2.5 4~30、Seedance 2.0 4~15、Kling 3~15),
    代码约束总时长在 `video.target_duration` ±15% 内并用 `_clamp_duration`/`_build_cuts`
@@ -51,7 +53,10 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
    用户可上传参考图(可多张,各带用途说明):随创意以多模态消息(最多 4 张,
    `_MAX_DIRECTOR_IMAGES`)发给导演模型照图撰写 @Element1 外观描述,
    模型不支持图片输入时自动去图重试(文字说明仍列出各图用途)。导演同时决定声音形态:
-   解说型逐组写中文旁白(`narration` 字段),沉浸型全部置空;角色台词直接写进分镜
+   解说型逐组写中文旁白(`narration` 字段),沉浸型全部置空;系统提示词禁止在分镜
+   prompt 里要求配乐(背景音乐由程序统一混入);Gemini 的 `_ENGINE_NOTES` 额外要求
+   每条分镜末尾写明英文声音设计、单分镜组写明 "single continuous shot, no cuts"
+   (该引擎不写明就会自行配乐/自行切分镜头);角色台词直接写进分镜
    prompt,由视频模型原生配音,台词语言取 `video.dialogue_language`(默认
    `中文普通话`,`Config.dialogue_language`,经 `{dialogue_language}` 渲染进
    系统提示词的硬性要求)。请求带 `response_format: json_schema`,
@@ -80,9 +85,12 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
      `duration` 为 3~10 的整数,分辨率 360p/720p/1080p/4k,画幅原生仅 16:9/9:16
      (1:1/3:4/4:3 经 `config.generation_aspect` 映射生成、成片时裁剪);原生
      音频始终开启(无 `generate_audio`),无 seed/negative_prompt;参考图走
-     `image_urls`(最多 10 张)按顺序送入、没有占位符语法,`@Element1` 经
-     `element_to_reference_phrases` 改写为 "the character from reference image 1",
-     各图用途经 `reference_usage_note(..., english=True)` 以英文附在 prompt 尾部;
+     `image_urls`(最多 10 张)按顺序送入,prompt 中用 fal 文档的位置占位符
+     `<IMAGE_REF_0>`(从 0 计)引用,`@Element1` 经 `element_to_reference_phrases`
+     改写,各图用途经 `reference_usage_note(..., english=True, zero_based=True)`
+     以英文附在 prompt 尾部;提交前 `_shot_directives` 兜底附加英文指令:单分镜组
+     加 "Single continuous shot, no cuts.",`allow_music` 为 False(pipeline 在
+     影片有旁白或将混 BGM 时设定)加 "No background music…";
      提示词语言为英文(同 Kling)。
    - **Seedance 2.5**(`video.engine: seedance25`):端点
      `bytedance/seedance-2.5/text-to-video` 与 `reference-to-video`;多分镜经
@@ -112,11 +120,18 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
    `narration_XX.mp3`(断点续传复用),同步记录逐句精确时间轴
    `narration_XX.timeline.json`(SentenceBoundary 事件)供字幕对齐,
    旧版 edge-tts 只有词边界时按句子字数归组推算;SRT 生成优先用该时间轴,
-   缺失时回退按字数比例估算。edge-tts 缺失/网络失败只丢旁白,不影响成片。
-4. **assembler.py** — ffmpeg 拼接:优先 xfade 交叉溶解 + 首尾淡入淡出(需重编码),
-   失败回退 concat 无损拼接;`concat()` 返回各镜头组在成片时间轴上的偏移,供旁白
-   与字幕定位。旁白超长时先用 edge-tts 语速参数(+N%,≤40)重合成(音质自然),
-   仍超长才 atempo 加速≤1.4 并截断;字幕优先烧录(libass,使用随程序分发的
+   缺失时回退按字数比例估算。edge-tts 缺失/网络失败(常见 403 封禁)时交给
+   `fallback` 后备合成器(pipeline 传入 `_FalGenerator.synthesize_speech`:
+   fal.ai `narration.fallback_endpoint`,默认 MiniMax speech-02-hd,音色
+   `narration.fallback_voice`,语速加快百分比映射为 `speed`),后备产物无逐句
+   时间轴(旧时间轴文件会被删掉,字幕回退估算);后备也失败只丢旁白,不影响成片。
+4. **assembler.py** — ffmpeg 拼接:`concat(..., transitions=[…])` 按每组的衔接
+   方式逐段处理(硬切用 concat 滤镜、溶解用 xfade/acrossfade,`video.transition`
+   为溶解时长,0 则全部硬切)+ 首尾淡入淡出(需重编码),失败回退 concat demuxer
+   无损拼接;返回各镜头组在成片时间轴上的偏移,供旁白与字幕定位。旁白超长时先用
+   edge-tts 语速参数(+N%,≤40)重合成(音质自然),仍超长才 atempo 加速≤1.4
+   并截断;`mix_narration` 把原生音轨以旁白为侧链做 `sidechaincompress` 闪避
+   (旁白时压低,间隙恢复),侧链失败退回等量 amix;字幕优先烧录(libass,使用随程序分发的
    `fonts/` 内 Noto Sans SC 字体,缺失时回退平台系统字体),失败退 mp4 软字幕;
    `music/` 目录有音频时由导演挑选一首混入(bgm)。每级失败都沿用上一级产物。
 5. **config.py** — 读取程序目录 `config.yaml`,与 `_DEFAULTS` 深合并;`app_dir()` 兼容
@@ -125,7 +140,10 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
    上限、用途说明是否生效;顺序即界面下拉框顺序,首项为 `DEFAULT_ENGINE`)是
    引擎差异的唯一登记处,director/pipeline/gui/generator 一律查表
    (`Config.engine_spec`),不再散落 `if engine == …`;`generation_aspect(engine,
-   aspect)` 给出实际生成画幅;`LLM_MODEL_PRESETS` 为编剧模型候选。
+   aspect)` 给出实际生成画幅;`LLM_MODEL_PRESETS` 为编剧模型候选。费用预估单价
+   `<engine>.price_per_second` 为「分辨率 → 美元/秒」映射(旧配置的单个数字仍兼容;
+   Kling 无分辨率参数,关音效时取 `price_per_second_no_audio`),`Config.price_per_second`
+   按当前引擎/分辨率/音效开关取值,未登记的分辨率取最贵一档。
    `save_settings({"llm.model": …, "video.engine": …})` 把界面设置写回
    `config.yaml`:逐行改写对应键(`_set_yaml_value`,保留其余行与注释,缺键则
    补行),写完用 YAML 解析校验,校验失败才整体 `safe_dump` 重写。

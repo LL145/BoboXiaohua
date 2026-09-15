@@ -3,8 +3,10 @@
 引擎能力(时长范围、参考图上限、原生画幅、提示词语言)登记在 config.ENGINES,
 本模块只负责把导演脚本转换成各端点的请求参数:
 - **Gemini Omni Flash 1.1**(Google,默认):单组 3~10 秒,原生同步音频始终
-  开启;参考图按顺序送入、没有占位符语法,@Element1 改写为自然语言引用
-  ("the character from reference image 1");画幅原生仅 16:9/9:16。
+  开启;参考图按 image_urls 顺序以 fal 文档的位置占位符 <IMAGE_REF_0>、
+  <IMAGE_REF_1> 引用(从 0 计),@Element1 据此改写;画幅原生仅 16:9/9:16。
+  该引擎不写明声音会自行配乐、单分镜不写明会自行切分镜头,提交前按声音策略
+  (pipeline 设定:有旁白/背景音乐时禁配乐)与分镜数附加英文指令兜底。
 - **Seedance 2.5 / 2.0**(字节跳动):多分镜拼进单条 prompt 一次连续生成
   (2.5 按时间戳分块、单组最长 30 秒;2.0 用 "Cut scene to" 衔接、最长 15 秒);
   参考图经 image_urls 送入,prompt 中以 @Image1 引用;原生支持全部画幅。
@@ -69,10 +71,12 @@ def element_to_image_tokens(prompt: str) -> str:
 
 
 def element_to_reference_phrases(prompt: str) -> str:
-    """把 @Element1/@Image1 占位符改写为自然语言引用(Gemini 端点无占位符语法,
-    参考图按 image_urls 顺序送入模型,靠"第 N 张参考图"的说法对应)。"""
+    """把 @Element1/@Image1 占位符改写为 Gemini 端点的位置占位符 <IMAGE_REF_0>
+    (fal 文档语法:参考图按 image_urls 顺序从 0 编号)。"""
     return re.sub(
-        r"@(?:Element|Image)(\d+)\s*", r"the character from reference image \1 ", prompt
+        r"@(?:Element|Image)(\d+)",
+        lambda m: f"<IMAGE_REF_{int(m.group(1)) - 1}>",
+        prompt,
     ).strip()
 
 
@@ -122,21 +126,23 @@ def join_cut_prompts_timed(prompts_durations: list[tuple[str, int]]) -> str:
 
 
 def reference_usage_note(
-    notes: list[str], token_format: str, english: bool = False
+    notes: list[str], token_format: str, english: bool = False, zero_based: bool = False
 ) -> str:
     """生成参考素材的用途说明,附在 prompt 末尾。
 
     社区经验:未标注用途的参考图是效果不佳的最常见原因——每个参考素材
     都应说明用途,prompt 中用"参考图中的角色"式引用而非重新描述。
-    token_format 如 "@Image{}"(Seedance)或 "Reference image {}"(Gemini);
-    english 为 True 时说明文字用英文(用途本身照抄用户所写)。
+    token_format 如 "@Image{}"(Seedance,从 1 计)或 "<IMAGE_REF_{}>"
+    (Gemini,zero_based 从 0 计);english 为 True 时说明文字用英文
+    (用途本身照抄用户所写)。
     """
     if not notes:
         return ""
+    offset = 0 if zero_based else 1
     if english:
         parts = [
-            f"{token_format.format(i)}: {note.strip() or 'main character reference'}"
-            for i, note in enumerate(notes, 1)
+            f"{token_format.format(i + offset)}: {note.strip() or 'main character reference'}"
+            for i, note in enumerate(notes)
         ]
         return (
             " Reference media usage — " + "; ".join(parts)
@@ -144,8 +150,8 @@ def reference_usage_note(
             " the reference images."
         )
     parts = [
-        f"{token_format.format(i)}:{note.strip() or '主角形象参考'}"
-        for i, note in enumerate(notes, 1)
+        f"{token_format.format(i + offset)}:{note.strip() or '主角形象参考'}"
+        for i, note in enumerate(notes)
     ]
     return " 参考素材用途——" + ";".join(parts) + "。请保持画面中主角外观与参考图严格一致。"
 
@@ -186,6 +192,9 @@ class _FalGenerator:
         self._engine = config.engine
         self._spec = config.engine_spec
         self._section = config.engine_section  # 端点、分辨率等引擎专属配置
+        # 声音策略:影片有旁白或将混入背景音乐时,禁止视频模型自行配乐
+        # (由 pipeline 在生成前设定;Gemini 据此附加英文指令)
+        self.allow_music = True
         # fal_client 通过 FAL_KEY 环境变量读取凭证
         os.environ["FAL_KEY"] = config.fal_api_key
 
@@ -233,6 +242,42 @@ class _FalGenerator:
                 self._log(f"  参考图第 {attempt} 次生成失败: {exc}")
                 time.sleep(3)
         return None
+
+    def synthesize_speech(
+        self, text: str, out_path: Path, rate: int = 0, index: int = 0
+    ) -> bool:
+        """Edge TTS 的付费后备:用 fal.ai 的 TTS 端点合成旁白到 out_path(mp3)。
+
+        端点与音色取自 narration.fallback_endpoint / fallback_voice(留空不启用);
+        rate 为语速加快百分比,映射为 MiniMax 的 speed(0.5~2.0)。
+        任何失败只返回 False,不影响成片。
+        """
+        narration = self._config["narration"]
+        endpoint = str(narration.get("fallback_endpoint") or "").strip()
+        if not endpoint or not text.strip():
+            return False
+        voice = str(narration.get("fallback_voice") or "").strip()
+        setting: dict = {"speed": round(min(2.0, 1 + max(0, rate) / 100), 2)}
+        if voice:
+            setting["voice_id"] = voice
+        arguments = {
+            "text": text.strip()[:5000],
+            "voice_setting": setting,
+            "audio_setting": {"format": "mp3", "sample_rate": 32000},
+            "output_format": "url",
+            "language_boost": "Chinese",
+        }
+        label = f"镜头组 {index} 旁白(fal 后备 TTS)" if index else "旁白(fal 后备 TTS)"
+        try:
+            self._log(f"  {label} 合成中 …")
+            result = self._submit_and_wait(endpoint, arguments, timeout=300, label=label)
+            self._download(result["audio"]["url"], out_path)
+            return out_path.exists() and out_path.stat().st_size >= 1024
+        except FatalGenerationError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 后备 TTS 失败只丢旁白
+            self._log(f"  {label} 失败: {exc}")
+            return False
 
     def upload_image(self, path: Path) -> str | None:
         """把本地参考图上传到 fal 存储,返回可供模型引用的 URL。"""
@@ -434,7 +479,9 @@ class _SinglePromptGenerator(_FalGenerator):
     _SEED = False                    # reference 端点是否接受 seed(取自本引擎节的 seed)
     _INT_DURATION = False            # duration 传整数(否则传字符串枚举)
     _TOKEN_FORMAT = "@Image{}"       # 参考图在 prompt 中的引用写法
+    _ZERO_BASED = False              # 参考图编号从 0 计(Gemini)
     _ENGLISH_NOTE = False            # 参考图用途说明用英文
+    _SHOT_DIRECTIVES = False         # 提交前附加"单镜头/禁配乐"英文指令(Gemini)
 
     @staticmethod
     def _convert_tokens(prompt: str) -> str:
@@ -455,8 +502,11 @@ class _SinglePromptGenerator(_FalGenerator):
         else:
             prompt = join_cut_prompts(prompts)
         prompt += reference_usage_note(
-            [note for _, note in refs], self._TOKEN_FORMAT, english=self._ENGLISH_NOTE
+            [note for _, note in refs], self._TOKEN_FORMAT,
+            english=self._ENGLISH_NOTE, zero_based=self._ZERO_BASED,
         )
+        if self._SHOT_DIRECTIVES:
+            prompt += self._shot_directives(shot, prompt)
         prompt = self._fit(prompt, _MAX_PROMPT_CHARS, shot)
 
         duration = self._group_duration(shot)
@@ -481,6 +531,18 @@ class _SinglePromptGenerator(_FalGenerator):
         return endpoint, arguments, use_reference
 
 
+    def _shot_directives(self, shot: Shot, prompt: str) -> str:
+        """Gemini 不写明就会自行切分镜头、自行配乐:单分镜组写明一镜到底,
+        影片有旁白/背景音乐时写明不要配乐(导演脚本已写过的不重复)。"""
+        lowered = prompt.lower()
+        parts: list[str] = []
+        if len(shot.cuts) == 1 and "continuous shot" not in lowered:
+            parts.append("Single continuous shot, no cuts.")
+        if not self.allow_music and not re.search(r"\b(?:no|without)\b[^.;]*\bmusic\b", lowered):
+            parts.append("No background music; ambient sound and dialogue only.")
+        return (" " + " ".join(parts)) if parts else ""
+
+
 class SeedanceGenerator(_SinglePromptGenerator):
     """Seedance 2.0:多分镜以 "Cut scene to" 衔接,单组 4~15 秒。"""
 
@@ -495,13 +557,16 @@ class Seedance25Generator(_SinglePromptGenerator):
 
 class GeminiGenerator(_SinglePromptGenerator):
     """Gemini Omni Flash 1.1:单组 3~10 秒(整数),原生音频始终开启(无开关);
-    参考图按顺序送入、无占位符语法,以英文自然语言引用;无 seed/negative_prompt。"""
+    参考图按 image_urls 顺序以 <IMAGE_REF_0> 位置占位符引用;无 seed/negative_prompt;
+    提交前附加单镜头/禁配乐指令。"""
 
     _TIMED_JOIN = True
     _AUDIO_FLAG = False
     _INT_DURATION = True
-    _TOKEN_FORMAT = "Reference image {}"
+    _TOKEN_FORMAT = "<IMAGE_REF_{}>"
+    _ZERO_BASED = True
     _ENGLISH_NOTE = True
+    _SHOT_DIRECTIVES = True
 
     @staticmethod
     def _convert_tokens(prompt: str) -> str:

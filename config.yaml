@@ -7,9 +7,9 @@ openrouter_api_key: ""
 # fal.ai API Key(https://fal.ai/dashboard/keys),所有视频引擎均经 fal.ai 生成
 fal_api_key: ""
 
-# 编剧 + 导演模型(经 OpenRouter,可填任意模型 ID)
+# 编剧 + 导演模型(经 OpenRouter,可填任意模型 ID;需支持图片输入才能看参考图)
 llm:
-  model: "z-ai/glm-5.3"
+  model: "qwen/qwen3.8-max"
   # 思考深度:low / medium / high / xhigh / max,留空不传
   reasoning_effort: "medium"
   max_tokens: 32000
@@ -21,8 +21,8 @@ gemini:
   reference_endpoint: "google/gemini-omni-flash/v1.1/reference-to-video"
   # 360p / 720p / 1080p / 4k
   resolution: "720p"
-  # 费用预估单价(美元/秒),0 为不显示
-  price_per_second: 0.10
+  # 费用预估单价(美元/秒,按分辨率;以 fal 实时定价为准,全部为 0 则不显示)
+  price_per_second: {"360p": 0.03, "720p": 0.10, "1080p": 0.15, "4k": 0.30}
 
 # Seedance 2.5:单组最长 30 秒,参考图最多 30 张
 seedance25:
@@ -32,7 +32,7 @@ seedance25:
   resolution: "720p"
   # 随机种子,-1 为每次随机(仅带参考图的镜头组生效)
   seed: -1
-  price_per_second: 0.473
+  price_per_second: {"480p": 0.2205, "720p": 0.473, "1080p": 1.164}
 
 # Seedance 2.0:单组最长 15 秒
 seedance:
@@ -40,14 +40,16 @@ seedance:
   reference_endpoint: "bytedance/seedance-2.0/reference-to-video"
   # 480p / 720p / 1080p / 4k
   resolution: "720p"
-  price_per_second: 0.3034
+  # 按 token 计费折算的每秒单价
+  price_per_second: {"480p": 0.135, "720p": 0.3034, "1080p": 0.68, "4k": 1.56}
 
 # Kling 3:3:4 / 4:3 画幅按相邻画幅生成后居中裁剪
 kling:
   text_endpoint: "fal-ai/kling-video/v3/pro/text-to-video"
   reference_endpoint: "fal-ai/kling-video/o3/pro/reference-to-video"
-  # 开启原生音效的单价;关闭音效约 0.112
+  # 端点无分辨率参数;开 / 关原生音效两档单价
   price_per_second: 0.168
+  price_per_second_no_audio: 0.112
 
 # 主角参考图的文生图模型(fal.ai)
 image:
@@ -62,6 +64,10 @@ narration:
   volume: 1.0
   # 字幕默认开关(界面勾选优先)
   subtitles: true
+  # Edge TTS 失败时的付费后备(fal.ai MiniMax,约 $0.10/千字);留空则不启用
+  fallback_endpoint: "fal-ai/minimax/speech-02-hd"
+  # 后备音色(MiniMax voice_id)
+  fallback_voice: "Chinese (Mandarin)_Warm_Girl"
 
 # 成片与生成参数
 video:
@@ -83,7 +89,7 @@ video:
   # 默认目标总时长(秒),10~600(界面选择优先)
   target_duration: 60
   output_dir: "output"
-  # 镜头间交叉溶解时长(秒),0 为硬切
+  # 交叉溶解转场的时长(秒);由导演决定哪些镜头组之间用溶解(默认硬切),0 为全部硬切
   transition: 0.5
   # 背景音乐音量(0~1);把音频文件放进 music/ 文件夹即自动混入
   bgm_volume: 0.22

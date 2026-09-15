@@ -1,8 +1,8 @@
 """LLM 担任编剧 + 导演:把一句话描述扩写成完整的分镜脚本。
 
 通过 OpenRouter(OpenAI 兼容接口)调用,可在 config.yaml 中切换任意模型;
-默认使用 z-ai/glm-5.3(reasoning effort: medium;模型只认部分档位时由
-OpenRouter 映射到最近档,若被拒则自动去掉该参数重试)。
+默认使用 qwen/qwen3.8-max(支持图片输入与结构化输出;reasoning effort: medium,
+模型只认部分档位时由 OpenRouter 映射到最近档,若被拒则自动去掉该参数重试)。
 """
 
 from __future__ import annotations
@@ -27,6 +27,8 @@ _RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504, 524}
 _MIN_CUT_SECONDS = 1
 _MAX_CUTS_PER_GROUP = 6  # Kling multi_prompt 上限,其余引擎沿用同一节奏约束
 _LEGACY_CUT_SECONDS = 5  # 旧 manifest 缺 duration 字段时的回退值
+# 镜头组与上一组之间的衔接方式:硬切(默认)或交叉溶解(时间跳跃/章节转换)
+TRANSITIONS = ("cut", "dissolve")
 # Kling 对 multi_prompt 单条分镜提示词有 512 字符硬上限(超长直接 422 拒绝),
 # 要求模型控制在 450 以内留出余量;generator.py 提交前还会做最终钳制兜底
 _MAX_PROMPT_CHARS = 450
@@ -50,6 +52,12 @@ def _encode_image(path: Path) -> str | None:
         return None
     mime = _IMAGE_MIME.get(Path(path).suffix.lower(), "image/png")
     return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def _normalize_transition(value) -> str:
+    """把模型/旧 manifest 给出的衔接方式归一为 TRANSITIONS 之一,未知一律硬切。"""
+    text = str(value or "").strip().lower()
+    return text if text in TRANSITIONS else TRANSITIONS[0]
 
 
 def _clamp_duration(value, fallback: int, minimum: int, maximum: int) -> int:
@@ -76,6 +84,7 @@ class Shot:
     negative_prompt: str
     cuts: list[Cut]
     narration: str = "" # 该组的中文旁白;空串表示无旁白
+    transition: str = "cut"  # 与上一组之间的衔接:cut 硬切 / dissolve 交叉溶解(首组忽略)
 
     @property
     def duration(self) -> int:
@@ -92,6 +101,7 @@ class Shot:
             "title": self.title,
             "negative_prompt": self.negative_prompt,
             "narration": self.narration,
+            "transition": self.transition,
             "cuts": [asdict(c) for c in self.cuts],
         }
 
@@ -113,6 +123,7 @@ class Shot:
             title=str(data["title"]),
             negative_prompt=str(data.get("negative_prompt", "")),
             narration=str(data.get("narration", "")),
+            transition=_normalize_transition(data.get("transition")),
             cuts=cuts,
         )
 
@@ -200,6 +211,14 @@ _STORYBOARD_SCHEMA = {
                             "字数不超过组时长×4)。整部影片不需要旁白时置空字符串"
                         ),
                     },
+                    "transition": {
+                        "type": "string",
+                        "description": (
+                            "本组与上一组之间的衔接方式,只能是 cut(硬切,默认)"
+                            "或 dissolve(交叉溶解,仅用于时间跳跃、地点更换或章节"
+                            "转换);第一组填 cut"
+                        ),
+                    },
                     "cuts": {
                         "type": "array",
                         "description": (
@@ -237,7 +256,7 @@ _STORYBOARD_SCHEMA = {
                         },
                     },
                 },
-                "required": ["title", "negative_prompt", "narration", "cuts"],
+                "required": ["title", "negative_prompt", "narration", "transition", "cuts"],
                 "additionalProperties": False,
             },
         },
@@ -258,7 +277,9 @@ _SYSTEM_PROMPT = """\
 - 每个镜头组由 1~6 个"分镜"(cuts)构成,一组会被模型一次性连续生成,\
 组内分镜之间的画面衔接、运动连续性由模型原生保证——因此同一场景内的连续动作、\
 景别推进、正反打应放进同一组;切换场景、时间跳跃、叙事段落转折时才另起一组;
-- 组间拼接使用交叉溶解转场,适合承担章节感的切换;
+- 组间衔接由你在 transition 字段决定:同一场景或紧接的动作、对话之间一律用 \
+cut(硬切,和真实剪辑一样,占绝大多数);只有时间跳跃、地点更换、章节转换时才用 \
+dissolve(交叉溶解);第一组固定填 cut;
 - 每个分镜 duration 为 1~15 的整数(秒);一个组内全部分镜时长之和必须为 \
 {group_min}~{group_max} 秒;
 - 全部镜头组时长之和必须落在 {total_min}~{total_max} 秒之间,尽量接近 {target} 秒;
@@ -296,7 +317,8 @@ narration 字段撰写中文旁白。要求:口语自然、贴合画面;语速�
 角色台词(两种形态下都可用):**所有角色台词一律使用{dialogue_language}**(除非用户创意\
 明确要求其他语言),绝不写其他语言的台词。需要角色开口说话时,把台词直接写进对应分镜的 \
 prompt,格式如 {dialogue_example}(模型会原生生成配音与口型)。解说型影片中,\
-带台词的分镜要避免与旁白抢话,该组旁白应留白或极简。环境音效由模型自动生成,无需描述。
+带台词的分镜要避免与旁白抢话,该组旁白应留白或极简。环境音效由模型自动生成,\
+除引擎说明另有要求外无需描述;绝不在 prompt 里要求配乐——背景音乐由程序统一混入。
 
 ## 每个分镜 prompt 的结构({prompt_language},按顺序)
 1. Subject + Action(放在最前):开头直接写主体(复用固定外观描述)及其核心动作\
@@ -319,7 +341,7 @@ text, watermark, extra limbs, deformed hands, flickering)。
 ## 输出格式
 只输出一个 JSON 对象(不要 Markdown 代码块、不要任何解释文字),字段为:
 title(string)、logline(string)、style_anchor(string)、reference_prompt(string)、\
-shots(数组,每项含 title、negative_prompt、narration、cuts;cuts 为数组,\
+shots(数组,每项含 title、negative_prompt、narration、transition、cuts;cuts 为数组,\
 每项含 prompt、duration);若用户消息中提供了背景音乐列表,则额外包含 bgm_file(string)。
 """
 
@@ -460,6 +482,10 @@ class Director:
             "的整数;该引擎擅长用自然语言表达的镜头调度(推轨、镜头焦段、布光)"
             "与真实物理,请在分镜 prompt 中直接写明镜头运动与光线;"
             "原生同步音频始终开启,角色台词可直接写进分镜 prompt。"
+            "该引擎不写明声音时会自作主张配乐、不写明镜头结构时会自行切分多镜头,"
+            "因此每个分镜 prompt 末尾必须用一句英文明确声音设计(只描述环境音、"
+            "音效与台词,例如 \"Audio: rain on pavement, distant traffic, no music\"),"
+            "只含一个分镜的镜头组还要写明 \"single continuous shot, no cuts\"。"
         ),
     }
     # 引擎不原生支持目标画幅时(见 config.generation_aspect):由相邻原生画幅
@@ -724,6 +750,7 @@ class Director:
                 title=str(raw["title"]),
                 negative_prompt=str(raw.get("negative_prompt", "")),
                 narration=str(raw.get("narration", "")).strip(),
+                transition=_normalize_transition(raw.get("transition")),
                 cuts=cls._build_cuts(raw, fallback_duration, min_group, max_group),
             )
             for i, raw in enumerate(raw_shots)

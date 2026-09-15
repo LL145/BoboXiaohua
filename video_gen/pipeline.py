@@ -13,10 +13,13 @@
   可切 Seedance 2.5 / 2.0 / Kling 3),总耗时约等于单个镜头组;
 - 单镜头组独立重试 + 超时看门狗,KEY 无效等致命错误立即终止,不空耗重试;
 - 旁白与字幕:导演判断影片需要解说时,用 Edge TTS 合成旁白并生成字幕;
-  TTS 不可用、混音或字幕失败,都只是放弃对应环节,绝不影响画面成片;
+  Edge TTS 失败时自动改用 fal.ai 的付费 TTS 后备(narration.fallback_endpoint),
+  后备也不可用、混音或字幕失败,都只是放弃对应环节,绝不影响画面成片;
+- 声音策略:影片有旁白或将混入背景音乐时,提示视频模型不要自行配乐
+  (generator.allow_music),旁白混入时原生音轨自动闪避;
 - 运行日志同步写入任务目录 log.txt,便于排查问题;
 - 背景音乐:程序目录 music/ 下有音频文件时,由导演模型按影片情绪挑选混入;
-- 费用预估:生成前按待生成镜头秒数估算 fal 费用并展示;
+- 费用预估:生成前按待生成镜头秒数与所选分辨率(Kling 按音效开关)估算 fal 费用并展示;
 - 可取消:界面「取消」按钮置位 cancel_event,视频任务轮询/等待/片段下载、
   旁白合成循环与拼接各阶段之间均及时检查,以 GenerationCancelled 停止,
   已完成产物保留、可断点续传。
@@ -144,6 +147,8 @@ class Pipeline:
             detail = f",{len(shot.cuts)} 个分镜" if len(shot.cuts) > 1 else ""
             if shot.narration.strip():
                 detail += ",含旁白"
+            if shot.index > 1 and shot.transition == "dissolve":
+                detail += ",溶解转入"
             log(f"  {shot.index}. {shot.title}({shot.duration}s{detail})")
         log(
             "  声音设计:解说型(旁白 + 字幕)" if storyboard.has_narration
@@ -156,17 +161,28 @@ class Pipeline:
         ]
         done_before = len(storyboard.shots) - len(pending)
 
-        # 费用预估:只计待生成的镜头秒数,已复用的镜头不重复计费
-        price = float(config.engine_section["price_per_second"])
+        # 费用预估:只计待生成的镜头秒数,已复用的镜头不重复计费;
+        # 单价随引擎与分辨率(Kling 随音效开关)变化
+        price = config.price_per_second
         if pending and price > 0:
             seconds = sum(s.duration for s in pending)
+            resolution = str(config.engine_section.get("resolution") or "")
+            spec = f"{config.engine_name} {resolution}".strip()
+            if not config.engine_spec.resolutions:
+                spec += "(关音效)" if not bool(config["video"]["generate_audio"]) else "(含音效)"
             log(
                 f"  💰 预计本次视频生成费用约 {seconds} 秒 × ${price:g}/秒"
-                f" ≈ ${seconds * price:.2f}(分镜脚本与参考图另计少量费用)"
+                f" ≈ ${seconds * price:.2f}({spec};分镜脚本与参考图另计少量费用)"
             )
 
         self._check_cancel()
         generator = create_generator(config, log, cancel_event=self._cancel)
+        # 声音策略:有旁白或将混入背景音乐时,不让视频模型自行配乐
+        bgm = self._pick_bgm(storyboard, bgm_tracks)
+        generator.allow_music = not (
+            (storyboard.has_narration and bool(config["narration"]["enabled"]))
+            or bgm is not None
+        )
 
         # 2. 主角参考图(用户上传优先;断点续传复用已保存的参考图;
         # 否则导演判断有固定主角时自动生成;失败自动降级纯文生)
@@ -238,6 +254,7 @@ class Pipeline:
             narration_audio = tts.synthesize_all(
                 storyboard, run_dir, str(narration_cfg["voice"]), log,
                 cancel=self._cancel,
+                fallback=generator.synthesize_speech,
             )
             step = 5
 
@@ -250,6 +267,7 @@ class Pipeline:
         _, offsets = assembler.concat(
             clips, stage_path,
             fallback_durations=[float(s.duration) for s in storyboard.shots],
+            transitions=[s.transition for s in storyboard.shots],
         )
         current = stage_path
 
@@ -268,10 +286,10 @@ class Pipeline:
             self._check_cancel()
             self._report_progress(90, "混入旁白与生成字幕")
             current, srt_path = self._apply_narration(
-                assembler, storyboard, narration_audio, offsets, current, run_dir
+                assembler, storyboard, narration_audio, offsets, current, run_dir,
+                fallback=generator.synthesize_speech,
             )
 
-        bgm = self._pick_bgm(storyboard, bgm_tracks)
         if bgm is not None:
             self._check_cancel()
             self._report_progress(93, "混入背景音乐")
@@ -307,6 +325,7 @@ class Pipeline:
         offsets: list[float],
         current: Path,
         run_dir: Path,
+        fallback: tts.FallbackFn | None = None,
     ) -> tuple[Path, Path | None]:
         """把旁白混入成片并生成字幕文件;失败时沿用无旁白版本。"""
         total = assembler.probe_duration(current) or float(storyboard.total_duration)
@@ -320,7 +339,7 @@ class Pipeline:
             start = offsets[i]
             end = offsets[i + 1] if i + 1 < len(offsets) else total
             slot = max(1.0, end - start - 0.3)  # 留 0.3 秒呼吸,避免串到下一组
-            audio = self._fit_narration(assembler, shot, audio, slot, voice)
+            audio = self._fit_narration(assembler, shot, audio, slot, voice, fallback)
             segments.append((start, audio, slot))
             segment_shots.append(shot)
 
@@ -345,7 +364,13 @@ class Pipeline:
         return narration_path, srt_path
 
     def _fit_narration(
-        self, assembler: Assembler, shot, audio: Path, slot: float, voice: str
+        self,
+        assembler: Assembler,
+        shot,
+        audio: Path,
+        slot: float,
+        voice: str,
+        fallback: tts.FallbackFn | None = None,
     ) -> Path:
         """旁白明显超长时,用更快语速重新合成一版(原生变速,音质自然);
         重合成失败则保留原音频,由混音阶段的 atempo 兜底加速。"""
@@ -360,7 +385,8 @@ class Pipeline:
                 f"以 +{rate}% 语速重新合成 …"
             )
             tts.synthesize(
-                shot.narration.strip(), voice, fast, self._log, shot.index, rate=rate
+                shot.narration.strip(), voice, fast, self._log, shot.index,
+                rate=rate, fallback=fallback,
             )
         return fast if tts.narration_is_valid(fast) else audio
 
@@ -656,7 +682,11 @@ class Pipeline:
             lines.append(f"背景音乐: {storyboard.bgm_file}")
         lines.append("")
         for shot in storyboard.shots:
-            lines.append(f"—— 镜头组 {shot.index}: {shot.title}({shot.duration}s)")
+            joiner = "交叉溶解" if shot.transition == "dissolve" else "硬切"
+            lines.append(
+                f"—— 镜头组 {shot.index}: {shot.title}({shot.duration}s"
+                + (f",{joiner}转入)" if shot.index > 1 else ")")
+            )
             if shot.narration.strip():
                 lines.append(f"旁白: {shot.narration.strip()}")
             for j, cut in enumerate(shot.cuts, start=1):
