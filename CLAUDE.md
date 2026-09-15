@@ -174,3 +174,5 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
 - **错误分层**:瞬时错误(网络、5xx、解析失败)自动重试;致命错误抛
   `FatalGenerationError`/`RuntimeError` 并给出用户能看懂的中文提示与解决办法。
 - 中文注释、中文用户文案;代码风格遵循现有模块(dataclass、类型标注、`from __future__ import annotations`)。
+- **分支与推送**:所有改动直接提交并推送到 `main` 分支,不另开分支、不走 PR;
+  仅当用户明确要求创建新分支时才在新分支上开发。
