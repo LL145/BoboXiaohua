@@ -2,16 +2,15 @@
 → 旁白配音 → 拼接成片(转场/旁白/背景音乐/字幕)。
 
 稳健性设计:
-- 生成前预检:先校验 OpenRouter KEY、fal KEY(方舟直连引擎 ark 则校验
-  ark KEY,即梦引擎则校验 AK/SK 签名)与磁盘空间,配错即刻提示,不浪费费用;
+- 生成前预检:先校验 OpenRouter KEY、fal KEY 与磁盘空间,配错即刻提示,
+  不浪费费用;
 - 断点续传:同一描述的未完成任务会复用已有分镜脚本、参考图、旁白音频和
   已生成片段,失败后再次点击「生成」只补齐缺失部分,不重复扣费;
 - 主角参考图:用户可上传主角图片(随创意发给导演模型照图写外观描述),
   未上传时导演模型判断有固定主角则自动文生图;参考图作为角色元素
   (@Element1)送入每个镜头组,任何一步失败都自动降级为纯文生视频;
-- 并行生成:多个镜头组同时提交视频引擎(默认 Seedance 2.5 经 fal.ai,
-  可切方舟直连 / Seedance 2.0 / Kling / Gemini Omni Flash / 即梦),
-  总耗时约等于单个镜头组;
+- 并行生成:多个镜头组同时提交视频引擎(全部经 fal.ai,默认 Seedance 2.5,
+  可切 Seedance 2.0 / Kling 3 / Gemini Omni Flash),总耗时约等于单个镜头组;
 - 单镜头组独立重试 + 超时看门狗,KEY 无效等致命错误立即终止,不空耗重试;
 - 旁白与字幕:导演判断影片需要解说时,用 Edge TTS 合成旁白并生成字幕;
   TTS 不可用、混音或字幕失败,都只是放弃对应环节,绝不影响画面成片;
@@ -394,62 +393,28 @@ class Pipeline:
             )
             if resp.status_code == 401:
                 raise RuntimeError(
-                    "OpenRouter API KEY 无效,请检查 config.yaml 中的 openrouter_api_key"
+                    "OpenRouter API KEY 无效,请检查界面「设置」中的 OpenRouter API KEY"
                 )
         except requests.RequestException:
             pass  # 网络抖动不拦截,后续请求失败时会再给出明确提示
 
         # fal key 探测:查询一个不存在的任务,零费用;key 无效时 fal 返回 401/403,
-        # 有效时仅是任务不存在(404 等),其余状态一律放行。
-        # 方舟直连(ark)/即梦引擎的 fal 仅用于自动文生参考图,未配 KEY 时跳过
-        if self._config.fal_api_key:
-            try:
-                endpoint = str(
-                    self._config.engine_section.get("text_endpoint")
-                    or self._config["image"]["endpoint"]
+        # 有效时仅是任务不存在(404 等),其余状态一律放行
+        try:
+            endpoint = str(self._config.engine_section["text_endpoint"])
+            app_root = "/".join(endpoint.split("/")[:2])
+            resp = requests.get(
+                f"https://queue.fal.run/{app_root}/requests/"
+                "00000000-0000-0000-0000-000000000000/status",
+                headers={"Authorization": f"Key {self._config.fal_api_key}"},
+                timeout=10,
+            )
+            if resp.status_code in (401, 403):
+                raise RuntimeError(
+                    "fal.ai API KEY 无效,请检查界面「设置」中的 fal.ai API KEY"
                 )
-                app_root = "/".join(endpoint.split("/")[:2])
-                resp = requests.get(
-                    f"https://queue.fal.run/{app_root}/requests/"
-                    "00000000-0000-0000-0000-000000000000/status",
-                    headers={"Authorization": f"Key {self._config.fal_api_key}"},
-                    timeout=10,
-                )
-                if resp.status_code in (401, 403):
-                    raise RuntimeError(
-                        "fal.ai API KEY 无效,请检查 config.yaml 中的 fal_api_key"
-                    )
-            except requests.RequestException:
-                pass
-
-        # 方舟 key 探测(ark 引擎):查询一个不存在的任务,零费用;
-        # key 无效返回 401/403,有效时仅是任务不存在(404),其余状态一律放行
-        if self._config.engine == "ark":
-            try:
-                api_base = str(self._config.engine_section["api_base"]).rstrip("/")
-                resp = requests.get(
-                    f"{api_base}/contents/generations/tasks/"
-                    "cgt-00000000000000-00000",
-                    headers={
-                        "Authorization": f"Bearer {self._config.ark_api_key}"
-                    },
-                    timeout=10,
-                )
-                if resp.status_code in (401, 403):
-                    raise RuntimeError(
-                        "火山方舟 API KEY 无效,请检查 config.yaml 中的 ark_api_key"
-                    )
-            except requests.RequestException:
-                pass
-
-        # 即梦 AK/SK 探测:查询一个不存在的任务,零费用;签名无效/服务未开通
-        # 等致命问题即刻拦截,网络异常不拦截
-        if self._config.engine == "jimeng":
-            from .kling import jimeng_credentials_problem
-
-            problem = jimeng_credentials_problem(self._config)
-            if problem:
-                raise RuntimeError(problem)
+        except requests.RequestException:
+            pass
 
         try:
             free_gb = shutil.disk_usage(self._config.output_dir).free / 2**30
@@ -487,7 +452,7 @@ class Pipeline:
 
         engine = self._config.engine
         limit = MAX_REFERENCE_IMAGES.get(engine, 1)
-        if engine in ("seedance", "seedance25", "ark", "gemini"):
+        if engine in ("seedance", "seedance25", "gemini"):
             self._log(
                 f"  当前引擎 {self._config.engine_name} 支持多参考图"
                 f"(最多 {limit} 张),各图的用途说明会写入提示词。"

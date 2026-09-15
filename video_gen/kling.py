@@ -1,27 +1,19 @@
 """调用视频引擎生成素材:主角参考图(文生图)与各镜头组视频片段。
 
-支持五个视频引擎(config.yaml 的 video.engine 切换,默认 seedance25):
-- **Seedance 2.5**(字节跳动,经 fal.ai,默认):单组最长 30 秒一次连续生成,
+全部视频引擎均经 fal.ai 生成(config.yaml 的 video.engine 切换,默认 seedance25):
+- **Seedance 2.5**(字节跳动,默认):单组最长 30 秒一次连续生成,
   多分镜按时间戳分块拼进单条 prompt;有固定主角时走 reference-to-video,
   参考图(最多 30 张)经 image_urls 送入、prompt 中以 @Image1 引用(导演
   脚本统一写 @Element1,提交前自动转换);原生支持全部画幅与音频。
-- **Seedance 2.5 方舟直连**(video.engine: ark):同一模型,改走火山方舟官方
-  任务接口(需 ark_api_key,适合已有方舟账号或需要 4K 的用户);参考图以
-  base64 data URL 随请求送入(role: reference_image),prompt 中按方舟官方
-  语法以 @图片1 引用;支持 negative_prompt 与 2K/4K。
-- **Seedance 2.0**(字节跳动,经 fal.ai):多分镜用 "Cut scene to" 语法拼进
+- **Seedance 2.0**(字节跳动):多分镜用 "Cut scene to" 语法拼进
   单条 prompt 一次连续生成(单组 4~15 秒);参考图同样经 image_urls 送入。
-- **Kling 3**(快手,经 fal.ai):多分镜走 multi_prompt 结构化参数;有固定
+- **Kling 3**(快手):多分镜走 multi_prompt 结构化参数;有固定
   主角时走 reference-to-video 的 elements 角色元素(@Element1);3:4/4:3
   画幅按相邻原生画幅生成、成片时居中裁剪。
-- **Gemini Omni Flash 1.1**(Google,经 fal.ai):单组 3~10 秒,原生同步音频
+- **Gemini Omni Flash 1.1**(Google):单组 3~10 秒,原生同步音频
   (含台词)始终开启;参考图(最多 10 张)按顺序送入模型、没有占位符语法,
   提交前把 @Element1 改写为 "the character from reference image 1";
   画幅原生仅 16:9/9:16,1:1/3:4/4:3 按相邻画幅生成、成片时居中裁剪。
-- **即梦 3.0 Pro**(字节跳动,经火山引擎视觉智能官方 API):适合已有
-  即梦/火山引擎 AK+SK 的用户,用 HMAC-SHA256 V4 签名鉴权(无需方舟/fal
-  KEY);单次生成固定 5 秒或 10 秒,原生支持全部画幅;不支持参考图与
-  原生音效,角色一致性靠导演脚本逐字重复的外观描述保证。
 
 公共稳健性(全部引擎一致):提交/轮询/下载/超时看门狗/取消,任一环节失败
 自动降级为纯文生视频,绝不因参考图问题导致整体失败。
@@ -29,10 +21,6 @@
 
 from __future__ import annotations
 
-import datetime
-import hashlib
-import hmac
-import json
 import os
 import re
 import threading
@@ -62,26 +50,18 @@ _MAX_SEEDANCE_PROMPT_CHARS = 2500
 # Seedance 2.0 单次生成时长范围(秒)
 _SEEDANCE_MIN_SECONDS = 4
 _SEEDANCE_MAX_SECONDS = 15
-# Seedance 2.5(fal.ai 与火山方舟同)单次生成时长范围(秒):一次连续生成 30 秒
+# Seedance 2.5 单次生成时长范围(秒):一次连续生成 30 秒
 _SEEDANCE25_MIN_SECONDS = 4
 _SEEDANCE25_MAX_SECONDS = 30
 # Gemini Omni Flash 1.1(fal.ai)单次生成时长范围(秒,整数)
 _GEMINI_MIN_SECONDS = 3
 _GEMINI_MAX_SECONDS = 10
-# 即梦(火山引擎视觉智能 API)单次只能生成 5 秒或 10 秒(frames = 24×秒数 + 1)
-_JIMENG_DURATIONS = (5, 10)
-_JIMENG_API_VERSION = "2022-08-31"
-# 即梦业务错误中重试无意义的确定性错误码:参数无效与输入/输出内容审核未通过
-_JIMENG_DETERMINISTIC_CODES = {50400, 50411, 50412, 50413, 50511, 50512}
-
 # 各引擎支持的参考图张数上限(超出部分按顺序丢弃,pipeline 会提前告知用户)
 MAX_REFERENCE_IMAGES = {
-    "seedance25": 30,  # fal Seedance 2.5 reference-to-video:最多 30 张
-    "ark": 30,         # 方舟官方:单次最多 30 张参考图
-    "seedance": 9,     # fal Seedance 2.0 reference-to-video:最多 9 张
+    "seedance25": 30,  # Seedance 2.5 reference-to-video:最多 30 张
+    "seedance": 9,     # Seedance 2.0 reference-to-video:最多 9 张
     "kling": 4,        # elements 单角色的多角度参考,保守取 4 张
-    "gemini": 10,      # fal reference-to-video:image_urls 最多 10 张
-    "jimeng": 0,       # 即梦 API 不支持角色参考图(靠外观描述保持一致)
+    "gemini": 10,      # reference-to-video:image_urls 最多 10 张
 }
 
 # Kling 视频端点原生支持的画幅;3:4 / 4:3 不被原生支持,
@@ -134,11 +114,6 @@ def strip_reference_tokens(prompt: str) -> str:
 def element_to_image_tokens(prompt: str) -> str:
     """把导演脚本统一使用的 @Element1 占位符转换为 fal Seedance 的 @Image1 引用。"""
     return re.sub(r"@Element(\d+)", r"@Image\1", prompt)
-
-
-def element_to_ark_image_tokens(prompt: str) -> str:
-    """把 @Element1/@Image1 占位符转换为火山方舟官方的 @图片1 引用语法。"""
-    return re.sub(r"@(?:Element|Image)(\d+)", r"@图片\1", prompt)
 
 
 def element_to_reference_phrases(prompt: str) -> str:
@@ -199,7 +174,7 @@ def reference_usage_note(
 
     社区经验:未标注用途的参考图是效果不佳的最常见原因——每个参考素材
     都应说明用途,prompt 中用"参考图中的角色"式引用而非重新描述。
-    token_format 如 "@图片{}"(方舟)、"@Image{}"(fal Seedance)或
+    token_format 如 "@Image{}"(Seedance)或
     "Reference image {}"(Gemini);english 为 True 时说明文字用英文
     (用途本身照抄用户所写)。
     """
@@ -238,128 +213,6 @@ def fit_prompt(prompt: str, limit: int) -> str:
 
 class FatalGenerationError(RuntimeError):
     """重试无意义的错误(KEY 无效、余额不足等),应立即终止全部镜头。"""
-
-
-# ---------------- 即梦(火山引擎视觉智能 API)公共请求 ----------------
-
-def _volc_sign_headers(
-    access_key: str, secret_key: str, host: str, region: str,
-    query: str, body: bytes,
-) -> dict:
-    """火山引擎 OpenAPI 的 HMAC-SHA256 V4 签名请求头(service 固定为 cv)。
-
-    query 必须已按参数名字典序排列(即梦仅 Action/Version 两个参数,天然有序)。
-    """
-    service = "cv"
-    x_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    short_date = x_date[:8]
-    payload_hash = hashlib.sha256(body).hexdigest()
-    content_type = "application/json"
-    canonical_headers = (
-        f"content-type:{content_type}\nhost:{host}\n"
-        f"x-content-sha256:{payload_hash}\nx-date:{x_date}\n"
-    )
-    signed_headers = "content-type;host;x-content-sha256;x-date"
-    canonical_request = "\n".join(
-        ["POST", "/", query, canonical_headers, signed_headers, payload_hash]
-    )
-    scope = f"{short_date}/{region}/{service}/request"
-    string_to_sign = "\n".join([
-        "HMAC-SHA256", x_date, scope,
-        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
-    ])
-
-    def _hmac(key: bytes, msg: str) -> bytes:
-        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
-
-    k_signing = _hmac(_hmac(_hmac(_hmac(
-        secret_key.encode("utf-8"), short_date), region), service), "request")
-    signature = hmac.new(
-        k_signing, string_to_sign.encode("utf-8"), hashlib.sha256
-    ).hexdigest()
-    return {
-        "Content-Type": content_type,
-        "Host": host,
-        "X-Content-Sha256": payload_hash,
-        "X-Date": x_date,
-        "Authorization": (
-            f"HMAC-SHA256 Credential={access_key}/{scope}, "
-            f"SignedHeaders={signed_headers}, Signature={signature}"
-        ),
-    }
-
-
-def _jimeng_post(config: Config, action: str, payload: dict) -> requests.Response:
-    """向即梦(火山引擎视觉智能)API 发起一次带 V4 签名的 POST 请求。"""
-    jimeng = config["jimeng"]
-    host = str(jimeng["host"]).strip()
-    region = str(jimeng["region"]).strip()
-    query = f"Action={action}&Version={_JIMENG_API_VERSION}"
-    body = json.dumps(payload).encode("utf-8")
-    headers = _volc_sign_headers(
-        config.jimeng_access_key, config.jimeng_secret_key,
-        host, region, query, body,
-    )
-    return requests.post(
-        f"https://{host}/?{query}", headers=headers, data=body, timeout=60
-    )
-
-
-def _jimeng_error(resp: requests.Response) -> Exception | None:
-    """解析即梦响应中的错误;成功(code 10000)返回 None。
-
-    两类错误形态:网关错误(HTTP 4xx,ResponseMetadata.Error,签名/权限类)
-    与业务错误(通常 HTTP 200 但 code != 10000,参数/审核/限流类)。
-    """
-    try:
-        data = resp.json()
-    except ValueError:
-        return RuntimeError(f"即梦请求失败 HTTP {resp.status_code}: {resp.text[:300]}")
-    gateway = ((data.get("ResponseMetadata") or {}).get("Error") or {})
-    if gateway:
-        code = str(gateway.get("Code") or "")
-        message = str(gateway.get("Message") or "")
-        if any(k in code for k in ("Signature", "Credential", "AccessKey", "Auth")):
-            return FatalGenerationError(
-                "即梦 AK/SK 无效(签名校验失败),请检查 config.yaml 中的"
-                " jimeng_access_key 与 jimeng_secret_key"
-            )
-        if any(k in code for k in ("AccessDenied", "Forbidden", "Unauthorized")):
-            return FatalGenerationError(
-                "即梦服务无权限或未开通,请在火山引擎控制台开通「即梦AI」"
-                "视频生成服务,并确认 AK 所属账号有调用权限"
-            )
-        return RuntimeError(f"即梦请求失败({code}): {message[:300]}")
-    code = data.get("code")
-    if code is None and resp.status_code != 200:
-        return RuntimeError(f"即梦请求失败 HTTP {resp.status_code}: {resp.text[:300]}")
-    if code is not None and int(code) != 10000:
-        message = str(data.get("message") or "")
-        exc = RuntimeError(f"即梦生成失败({code}): {message[:300]}")
-        if int(code) in _JIMENG_DETERMINISTIC_CODES:
-            # 参数无效/内容审核未通过是确定性的,标记 422 语义跳过重试
-            exc.status_code = 422
-        return exc
-    return None
-
-
-def jimeng_credentials_problem(config: Config) -> str | None:
-    """零费用探测即梦 AK/SK:查询一个不存在的任务。
-
-    凭证无效会得到签名/权限类致命错误;凭证有效仅是任务不存在(业务错误)。
-    网络异常返回 None 不拦截,后续请求失败时会再给出明确提示。
-    """
-    try:
-        resp = _jimeng_post(config, "CVSync2AsyncGetResult", {
-            "req_key": str(config["jimeng"]["req_key"]),
-            "task_id": "0",
-        })
-    except requests.RequestException:
-        return None
-    error = _jimeng_error(resp)
-    if isinstance(error, FatalGenerationError):
-        return str(error)
-    return None
 
 
 class _FalGenerator:
@@ -413,8 +266,7 @@ class _FalGenerator:
         }
         for attempt in (1, 2):
             try:
-                # 参考图文生图固定走 fal(视频引擎为方舟直连时亦然)
-                result = self._fal_submit_and_wait(
+                result = self._submit_and_wait(
                     endpoint, arguments, timeout=600, label="参考图"
                 )
                 url = result["images"][0]["url"]
@@ -507,12 +359,6 @@ class _FalGenerator:
     def _submit_and_wait(
         self, endpoint: str, arguments: dict, timeout: float, label: str
     ) -> dict:
-        """提交视频任务并轮询直至完成;方舟直连引擎会覆写本方法。"""
-        return self._fal_submit_and_wait(endpoint, arguments, timeout, label)
-
-    def _fal_submit_and_wait(
-        self, endpoint: str, arguments: dict, timeout: float, label: str
-    ) -> dict:
         """提交 fal 任务并轮询直至完成,带超时看门狗与排队进度提示。"""
         import fal_client
 
@@ -565,7 +411,7 @@ class _FalGenerator:
         code = getattr(exc, "status_code", None)
         if code in (401, 403):
             return FatalGenerationError(
-                "fal.ai API KEY 无效或无权限,请检查 config.yaml 中的 fal_api_key"
+                "fal.ai API KEY 无效或无权限,请检查界面「设置」中的 fal.ai API KEY"
             )
         if code == 402:
             return FatalGenerationError("fal.ai 余额不足,请前往 fal.ai 充值")
@@ -713,218 +559,12 @@ class Seedance25Generator(_FalGenerator):
 def _join_timed_prompts(prompts: list[str], shot: Shot) -> str:
     """多分镜按时间戳分块拼接(Seedance 2.5 官方推荐,把各分镜的时长比例
     明确传给模型,避免长镜头组的"后半段漂移"),单分镜沿用普通拼接。
-    Seedance 2.5(fal.ai / 火山方舟)与 Gemini Omni Flash 共用。"""
+    Seedance 2.5 与 Gemini Omni Flash 共用。"""
     if len(shot.cuts) > 1:
         return join_cut_prompts_timed(
             [(p, cut.duration) for p, cut in zip(prompts, shot.cuts)]
         )
     return join_cut_prompts(prompts)
-
-
-class ArkSeedanceGenerator(_FalGenerator):
-    """Seedance 2.5 方舟直连(字节跳动,经火山方舟官方 API):可选引擎
-    (video.engine: ark)。
-
-    直连火山方舟(Volcengine Ark)的视频生成任务接口:POST 创建任务 →
-    轮询状态 → 下载成片,鉴权用 ark_api_key。适合已有方舟账号、需要
-    2K/4K 或 negative_prompt 的用户。
-    复用基类的重试/降级/下载/取消逻辑,仅替换任务提交与参考图上传:
-    参考图无需对象存储,直接编码为 base64 data URL 随请求送入
-    (role: reference_image);主角参考图的自动文生图仍走 fal,
-    未配置 fal_api_key 时自动跳过并降级纯文生视频。
-    """
-
-    _ENGINE_LABEL = "Seedance 2.5(方舟)"
-
-    # ---------------- 方舟请求要素 ----------------
-
-    def _api_base(self) -> str:
-        return str(self._config["ark"]["api_base"]).rstrip("/")
-
-    def _headers(self) -> dict:
-        return {
-            "Authorization": f"Bearer {self._config.ark_api_key}",
-            "Content-Type": "application/json",
-        }
-
-    # ---------------- 参考图 ----------------
-
-    def upload_image(self, path: Path) -> str | None:
-        """方舟接口直接接受 base64 data URL,无需上传到 fal 存储。"""
-        from .director import _encode_image
-
-        url = _encode_image(path)
-        if url is None:
-            self._log(f"  读取主角图片失败: {path}")
-        return url
-
-    def generate_reference(self, prompt: str, out_path: Path) -> str | None:
-        """自动文生主角参考图仍走 fal;未配 fal KEY 时跳过(降级纯文生)。"""
-        if not self._config.fal_api_key:
-            self._log(
-                "  未配置 fal_api_key,跳过自动生成主角参考图"
-                "(可在界面上传主角图片替代)。"
-            )
-            return None
-        # fal 返回的参考图 URL 是公网可访问的,方舟可直接引用;
-        # 为稳妥起见改用已下载的本地文件编码为 data URL(不依赖 fal 链接时效)
-        if super().generate_reference(prompt, out_path) is None:
-            return None
-        return self.upload_image(out_path)
-
-    # ---------------- 任务提交与轮询 ----------------
-
-    def _submit_and_wait(
-        self, endpoint: str, arguments: dict, timeout: float, label: str
-    ) -> dict:
-        """提交方舟视频生成任务并轮询,返回与 fal 相同形状的结果字典。"""
-        try:
-            resp = requests.post(
-                endpoint, headers=self._headers(), json=arguments, timeout=60
-            )
-        except requests.RequestException as exc:
-            raise RuntimeError(f"{label} 任务提交失败(网络错误): {exc}") from exc
-        if resp.status_code != 200:
-            raise self._classify_ark(resp)
-        task_id = str(resp.json().get("id") or "")
-        if not task_id:
-            raise RuntimeError(f"{label} 任务提交异常:方舟未返回任务 ID")
-
-        poll_url = f"{endpoint}/{task_id}"
-        deadline = time.monotonic() + timeout
-        queued_notified = False
-        while True:
-            if self._cancel is not None and self._cancel.is_set():
-                self._ark_cancel(poll_url)
-                raise FatalGenerationError("已取消生成")
-            if time.monotonic() > deadline:
-                self._ark_cancel(poll_url)
-                raise RuntimeError(f"{label} 生成超时(超过 {int(timeout)} 秒)")
-            self._sleep(_POLL_INTERVAL)
-            try:
-                resp = requests.get(poll_url, headers=self._headers(), timeout=30)
-            except requests.RequestException:
-                continue  # 瞬时网络错误,继续等待
-            if resp.status_code != 200:
-                classified = self._classify_ark(resp)
-                if isinstance(classified, FatalGenerationError):
-                    raise classified
-                continue
-            data = resp.json()
-            status = str(data.get("status") or "").lower()
-            if status == "succeeded":
-                url = str((data.get("content") or {}).get("video_url") or "")
-                if not url:
-                    raise RuntimeError(f"{label} 任务完成但方舟未返回视频地址")
-                return {"video": {"url": url}}
-            if status in ("failed", "cancelled", "canceled", "expired"):
-                error = data.get("error") or {}
-                raise RuntimeError(
-                    f"{label} 生成失败({error.get('code', status)}):"
-                    f" {error.get('message', '无详细信息')}"
-                )
-            if status == "queued" and not queued_notified:
-                queued_notified = True
-                self._log(f"  {label} 排队中 …")
-
-    def _ark_cancel(self, poll_url: str) -> None:
-        """尽力取消方舟任务(仅排队/运行中的任务可取消,失败不影响主流程)。"""
-        try:
-            requests.delete(poll_url, headers=self._headers(), timeout=15)
-        except requests.RequestException:
-            pass
-
-    def _classify_ark(self, resp: requests.Response) -> Exception:
-        """把方舟的 HTTP 错误翻译成用户能看懂的提示;致命错误不再重试。"""
-        try:
-            error = resp.json().get("error") or {}
-        except ValueError:
-            error = {}
-        code = str(error.get("code") or "")
-        message = str(error.get("message") or resp.text[:300])
-        if resp.status_code in (401, 403):
-            return FatalGenerationError(
-                "火山方舟 API KEY 无效或无权限,请检查 config.yaml 中的 ark_api_key"
-            )
-        if resp.status_code == 404 or code in ("ModelNotFound", "ModelNotOpen"):
-            model = str(self._config["ark"]["model"])
-            return FatalGenerationError(
-                f"火山方舟模型不可用: {model}。请确认已在方舟控制台开通该模型,"
-                "并检查 config.yaml 中的 ark.model / ark.api_base"
-            )
-        if resp.status_code == 402 or code in ("AccountOverdueError", "QuotaExceeded"):
-            return FatalGenerationError(
-                "火山方舟账户余额不足或额度用尽,请前往火山引擎控制台充值"
-            )
-        exc = RuntimeError(f"火山方舟请求失败({code or resp.status_code}): {message}")
-        if resp.status_code == 400 and code not in ("RateLimitExceeded",):
-            # 参数校验/内容审核类 400 是确定性的,标记为 422 语义:
-            # generate_clip 会跳过重试,直接降级/报错
-            exc.status_code = 422
-        return exc
-
-    # ---------------- 请求参数 ----------------
-
-    def _build_arguments(
-        self, shot: Shot, references: list[tuple[str, str]] | None
-    ) -> tuple[str, dict, bool]:
-        """多分镜按时间戳分块拼成单条 prompt,有主角以 reference_image 送入。"""
-        ark = self._config["ark"]
-        video_cfg = self._config["video"]
-        combined = shot.combined_prompt.lower()
-        use_reference = bool(references) and (
-            "@element" in combined or "@image" in combined or "@图片" in combined
-        )
-
-        if use_reference:
-            # 方舟官方语法:prompt 中以 @图片1 引用 content 里的第 1 张参考图
-            prompts = [element_to_ark_image_tokens(cut.prompt) for cut in shot.cuts]
-        else:
-            prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
-
-        prompt = _join_timed_prompts(prompts, shot)
-        refs: list[tuple[str, str]] = []
-        if use_reference:
-            refs = references[:MAX_REFERENCE_IMAGES["ark"]]
-            prompt += reference_usage_note([note for _, note in refs], "@图片{}")
-        if len(prompt) > _MAX_SEEDANCE_PROMPT_CHARS:
-            self._log(
-                f"  ⚠ 镜头组 {shot.index} 提示词超长({len(prompt)} 字符),"
-                f"已裁剪到 {_MAX_SEEDANCE_PROMPT_CHARS} 字符内"
-            )
-            prompt = fit_prompt(prompt, _MAX_SEEDANCE_PROMPT_CHARS)
-
-        content: list[dict] = [{"type": "text", "text": prompt}]
-        for url, _ in refs:
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": url},
-                "role": "reference_image",
-            })
-        duration = min(
-            _SEEDANCE25_MAX_SECONDS, max(_SEEDANCE25_MIN_SECONDS, shot.duration)
-        )
-        arguments = {
-            "model": str(ark["model"]),
-            "content": content,
-            # Seedance 2.5 原生支持 16:9/9:16/1:1/3:4/4:3 全部画幅,无需映射裁剪
-            "ratio": str(video_cfg["aspect_ratio"]),
-            "resolution": str(ark["resolution"]),
-            "duration": duration,
-            "generate_audio": bool(video_cfg["generate_audio"]),
-            "watermark": False,
-        }
-        negative = shot.negative_prompt.strip()
-        if negative:
-            arguments["negative_prompt"] = fit_prompt(negative, _MAX_SINGLE_PROMPT_CHARS)
-        try:
-            seed = int(ark.get("seed", -1))
-        except (TypeError, ValueError):
-            seed = -1
-        if seed >= 0:
-            arguments["seed"] = seed
-        endpoint = f"{self._api_base()}/contents/generations/tasks"
-        return endpoint, arguments, use_reference
 
 
 class KlingGenerator(_FalGenerator):
@@ -1059,136 +699,6 @@ class GeminiGenerator(_FalGenerator):
         return endpoint, arguments, use_reference
 
 
-class JimengGenerator(_FalGenerator):
-    """即梦 3.0 Pro(字节跳动,经火山引擎视觉智能官方 API):可选引擎
-    (video.engine: jimeng),适合已有即梦/火山引擎 AK+SK 的用户。
-
-    与方舟/fal 引擎的差异:鉴权用 AK/SK 的 HMAC-SHA256 V4 签名(不需要
-    ark/fal KEY);单次生成固定 5 秒或 10 秒(镜头组时长就近取整);
-    不支持角色参考图与原生音效——角色一致性由导演脚本在每个分镜逐字重复
-    的外观描述保证,旁白解说(Edge TTS)与背景音乐不受影响。
-    复用基类的重试/下载/取消逻辑,覆写任务提交轮询与参考图相关方法。
-    """
-
-    _ENGINE_LABEL = "即梦"
-
-    def __init__(
-        self,
-        config: Config,
-        log: LogFn,
-        cancel_event: threading.Event | None = None,
-    ):
-        # 不调用基类 __init__:即梦引擎全程不使用 fal,避免写 FAL_KEY 环境变量
-        self._config = config
-        self._log = log
-        self._cancel = cancel_event
-
-    # ---------------- 参考图(即梦 API 不支持) ----------------
-
-    def upload_image(self, path: Path) -> str | None:
-        self._log("  当前引擎「即梦」不支持参考图,已忽略该图片。")
-        return None
-
-    def generate_reference(self, prompt: str, out_path: Path) -> str | None:
-        return None
-
-    # ---------------- 任务提交与轮询 ----------------
-
-    def _submit_and_wait(
-        self, endpoint: str, arguments: dict, timeout: float, label: str
-    ) -> dict:
-        """提交即梦视频生成任务并轮询,返回与 fal 相同形状的结果字典。"""
-        try:
-            resp = _jimeng_post(self._config, "CVSync2AsyncSubmitTask", arguments)
-        except requests.RequestException as exc:
-            raise RuntimeError(f"{label} 任务提交失败(网络错误): {exc}") from exc
-        error = _jimeng_error(resp)
-        if error is not None:
-            raise error
-        task_id = str(((resp.json().get("data") or {}).get("task_id")) or "")
-        if not task_id:
-            raise RuntimeError(f"{label} 任务提交异常:即梦未返回任务 ID")
-
-        poll_payload = {
-            "req_key": arguments["req_key"],
-            "task_id": task_id,
-            # 要求以 URL 形式返回成片(否则可能只给 base64)
-            "req_json": json.dumps({"return_url": True}),
-        }
-        deadline = time.monotonic() + timeout
-        queued_notified = False
-        while True:
-            # 即梦 API 无取消接口:取消/超时后停止轮询即可,不再产生新请求
-            if self._cancel is not None and self._cancel.is_set():
-                raise FatalGenerationError("已取消生成")
-            if time.monotonic() > deadline:
-                raise RuntimeError(f"{label} 生成超时(超过 {int(timeout)} 秒)")
-            self._sleep(_POLL_INTERVAL)
-            try:
-                resp = _jimeng_post(
-                    self._config, "CVSync2AsyncGetResult", poll_payload
-                )
-            except requests.RequestException:
-                continue  # 瞬时网络错误,继续等待
-            error = _jimeng_error(resp)
-            if error is not None:
-                if isinstance(error, FatalGenerationError):
-                    raise error
-                if getattr(error, "status_code", None) == 422:
-                    raise error  # 内容审核未通过等确定性失败
-                continue  # 瞬时错误(限流/5xx),继续等待
-            data = resp.json().get("data") or {}
-            status = str(data.get("status") or "").lower()
-            if status == "done":
-                url = str(
-                    data.get("video_url")
-                    or ((data.get("urls") or [None])[0] or "")
-                )
-                if not url:
-                    raise RuntimeError(f"{label} 任务完成但即梦未返回视频地址")
-                return {"video": {"url": url}}
-            if status in ("not_found", "expired"):
-                raise RuntimeError(f"{label} 生成失败:即梦任务状态为 {status}")
-            if status == "in_queue" and not queued_notified:
-                queued_notified = True
-                self._log(f"  {label} 排队中 …")
-
-    # ---------------- 请求参数 ----------------
-
-    def _build_arguments(
-        self, shot: Shot, references: list[tuple[str, str]] | None
-    ) -> tuple[str, dict, bool]:
-        """多分镜拼成单条中文 prompt;时长就近取 5 或 10 秒;不使用参考图。"""
-        jimeng = self._config["jimeng"]
-        video_cfg = self._config["video"]
-        prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
-        prompt = join_cut_prompts(prompts)
-        if len(prompt) > _MAX_SEEDANCE_PROMPT_CHARS:
-            self._log(
-                f"  ⚠ 镜头组 {shot.index} 提示词超长({len(prompt)} 字符),"
-                f"已裁剪到 {_MAX_SEEDANCE_PROMPT_CHARS} 字符内"
-            )
-            prompt = fit_prompt(prompt, _MAX_SEEDANCE_PROMPT_CHARS)
-
-        # 即梦仅支持 5 秒或 10 秒,就近取整(导演脚本已按 5/10 秒设计,
-        # 此处兜底旧 manifest 与模型偏差)
-        duration = min(_JIMENG_DURATIONS, key=lambda d: abs(d - shot.duration))
-        arguments: dict = {
-            "req_key": str(jimeng["req_key"]),
-            "prompt": prompt,
-            "frames": duration * 24 + 1,
-            # 即梦原生支持 16:9/9:16/1:1/3:4/4:3(以及 21:9),无需映射裁剪
-            "aspect_ratio": str(video_cfg["aspect_ratio"]),
-        }
-        try:
-            seed = int(jimeng.get("seed", -1))
-        except (TypeError, ValueError):
-            seed = -1
-        if seed >= 0:
-            arguments["seed"] = seed
-        return f"https://{jimeng['host']}", arguments, False
-
-
 def create_generator(
     config: Config, log: LogFn, cancel_event: threading.Event | None = None
 ) -> _FalGenerator:
@@ -1196,8 +706,6 @@ def create_generator(
     cls = {
         "seedance": SeedanceGenerator,
         "seedance25": Seedance25Generator,
-        "ark": ArkSeedanceGenerator,
         "gemini": GeminiGenerator,
-        "jimeng": JimengGenerator,
     }.get(config.engine, KlingGenerator)
     return cls(config, log, cancel_event=cancel_event)

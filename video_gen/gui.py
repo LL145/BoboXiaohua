@@ -10,13 +10,26 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
-from .config import CONFIG_PATH, app_dir, load_config
+from .config import (
+    CONFIG_PATH,
+    ENGINE_RESOLUTIONS,
+    ENGINES,
+    LLM_MODEL_PRESETS,
+    app_dir,
+    load_config,
+    save_settings,
+)
 from .pipeline import GenerationCancelled, Pipeline
 
 _PLACEHOLDER = "例如:一只橘猫在雨后的东京街头漫步,霓虹灯倒映在水洼里,电影感画面"
 _REF_HINT_EMPTY = "未选择(有固定主角时将由 AI 自动生成形象)"
+_NO_RESOLUTION = "(引擎默认)"  # 该引擎端点不接受分辨率参数时的占位文案
+_ENGINE_LABELS = {  # 引擎下拉框:展示名 → 配置值(首项为默认引擎)
+    f"{name}(默认)" if i == 0 else name: engine
+    for i, (engine, name) in enumerate(ENGINES.items())
+}
 
-# 画幅选项:显示文案 → 配置值(Seedance 与即梦原生支持全部画幅;
+# 画幅选项:显示文案 → 配置值(Seedance 原生支持全部画幅;
 # Kling 引擎下 3:4 / 4:3、Gemini 引擎下 1:1 / 3:4 / 4:3 由相邻画幅生成后
 # 自动居中裁剪)
 _ASPECT_CHOICES = {
@@ -50,8 +63,8 @@ class App:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title("AI 短视频生成器")
-        self.root.geometry("880x580")
-        self.root.minsize(760, 480)
+        self.root.geometry("960x680")
+        self.root.minsize(860, 560)
 
         # 工作线程 → 主线程的消息队列,消息为 (类型, *参数) 元组:
         # ("log", 文本) / ("prog", 百分比, 阶段) / ("done", 成片路径) / ("fail",) / ("cancel",)
@@ -70,6 +83,8 @@ class App:
 
     def _build_ui(self) -> None:
         pad = {"padx": 12, "pady": 6}
+
+        self._build_settings()
 
         top = ttk.Frame(self.root)
         top.pack(fill="x", **pad)
@@ -149,8 +164,153 @@ class App:
         )
         self.log_box.pack(fill="both", expand=True, padx=6, pady=6)
 
-        self.status_var = tk.StringVar(value="就绪。首次使用请先在 config.yaml 中填入 API KEY。")
+        self.status_var = tk.StringVar(
+            value="就绪。首次使用请在上方「设置」填入两个 API KEY(点「生成」时自动保存)。"
+        )
         ttk.Label(self.root, textvariable=self.status_var, anchor="w").pack(fill="x", padx=12, pady=(0, 8))
+
+    def _build_settings(self) -> None:
+        """顶部「设置」区:API KEY、编剧模型、视频引擎与分辨率,保存进 config.yaml。"""
+        box = ttk.LabelFrame(self.root, text="设置(保存在程序目录的 config.yaml,只需填一次)")
+        box.pack(fill="x", padx=12, pady=(8, 0))
+        for col in (1, 3):
+            box.columnconfigure(col, weight=1)
+        settings = self._load_settings()
+
+        # 第一行:两个 API KEY
+        ttk.Label(box, text="OpenRouter KEY:").grid(row=0, column=0, sticky="e", padx=(8, 4), pady=4)
+        self.openrouter_var = tk.StringVar(value=settings["openrouter_api_key"])
+        self.openrouter_entry = ttk.Entry(box, textvariable=self.openrouter_var, show="•")
+        self.openrouter_entry.grid(row=0, column=1, sticky="ew", pady=4)
+        ttk.Label(box, text="fal.ai KEY:").grid(row=0, column=2, sticky="e", padx=(12, 4), pady=4)
+        self.fal_var = tk.StringVar(value=settings["fal_api_key"])
+        self.fal_entry = ttk.Entry(box, textvariable=self.fal_var, show="•")
+        self.fal_entry.grid(row=0, column=3, sticky="ew", pady=4)
+        self.show_keys_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            box, text="显示", variable=self.show_keys_var, command=self._toggle_key_visibility
+        ).grid(row=0, column=4, padx=(6, 8), pady=4)
+
+        # 第二行:编剧模型(可选可填)、视频引擎、分辨率、保存
+        ttk.Label(box, text="编剧模型:").grid(row=1, column=0, sticky="e", padx=(8, 4), pady=(0, 6))
+        self.llm_model_var = tk.StringVar(value=settings["llm_model"])
+        ttk.Combobox(
+            box, textvariable=self.llm_model_var, values=list(LLM_MODEL_PRESETS)
+        ).grid(row=1, column=1, sticky="ew", pady=(0, 6))
+        engine_row = ttk.Frame(box)
+        engine_row.grid(row=1, column=2, columnspan=3, sticky="ew", padx=(12, 8), pady=(0, 6))
+        ttk.Label(engine_row, text="视频引擎:").pack(side="left", padx=(0, 4))
+        self.engine_var = tk.StringVar(
+            value=next(
+                (label for label, v in _ENGINE_LABELS.items() if v == settings["engine"]),
+                next(iter(_ENGINE_LABELS)),
+            )
+        )
+        engine_box = ttk.Combobox(
+            engine_row, textvariable=self.engine_var, state="readonly",
+            values=list(_ENGINE_LABELS), width=22,
+        )
+        engine_box.pack(side="left")
+        engine_box.bind("<<ComboboxSelected>>", self._on_engine_change)
+        ttk.Label(engine_row, text="分辨率:").pack(side="left", padx=(10, 4))
+        self.resolution_var = tk.StringVar()
+        self.resolution_box = ttk.Combobox(
+            engine_row, textvariable=self.resolution_var, state="readonly", width=10
+        )
+        self.resolution_box.pack(side="left")
+        self._resolutions = settings["resolutions"]
+        self._refresh_resolution_choices()
+        ttk.Button(engine_row, text="💾 保存设置", command=self._save_settings).pack(
+            side="right"
+        )
+
+    # ---------------- 设置 ----------------
+
+    @staticmethod
+    def _load_settings() -> dict:
+        """从 config.yaml 读取界面「设置」区的当前值(没有配置文件时用默认值)。"""
+        engine = next(iter(ENGINES))
+        values = {
+            "openrouter_api_key": "",
+            "fal_api_key": "",
+            "llm_model": LLM_MODEL_PRESETS[0],
+            "engine": engine,
+            # 各引擎各自记住分辨率,切换引擎时不互相覆盖
+            "resolutions": {
+                e: (choices[1] if len(choices) > 1 else choices[0]) if choices else ""
+                for e, choices in ENGINE_RESOLUTIONS.items()
+            },
+        }
+        try:
+            config = load_config()
+        except Exception:  # noqa: BLE001 - 首次启动可能还没有配置文件
+            return values
+        values["openrouter_api_key"] = config.openrouter_api_key
+        values["fal_api_key"] = config.fal_api_key
+        values["llm_model"] = str(config["llm"]["model"] or LLM_MODEL_PRESETS[0])
+        if config.engine in ENGINES:
+            values["engine"] = config.engine
+        for e, choices in ENGINE_RESOLUTIONS.items():
+            current = str(config[e].get("resolution") or "")
+            if current in choices:
+                values["resolutions"][e] = current
+        return values
+
+    def _selected_engine(self) -> str:
+        return _ENGINE_LABELS.get(self.engine_var.get(), next(iter(ENGINES)))
+
+    def _refresh_resolution_choices(self) -> None:
+        """分辨率下拉框随引擎变化:Kling 端点无分辨率参数时禁用。"""
+        engine = self._selected_engine()
+        choices = ENGINE_RESOLUTIONS.get(engine, ())
+        if choices:
+            self.resolution_box.config(values=list(choices), state="readonly")
+            current = self._resolutions.get(engine) or choices[0]
+            self.resolution_var.set(current if current in choices else choices[0])
+        else:
+            self.resolution_box.config(values=[_NO_RESOLUTION], state="disabled")
+            self.resolution_var.set(_NO_RESOLUTION)
+
+    def _on_engine_change(self, _event: object = None) -> None:
+        self._refresh_resolution_choices()
+
+    def _toggle_key_visibility(self) -> None:
+        show = "" if self.show_keys_var.get() else "•"
+        self.openrouter_entry.config(show=show)
+        self.fal_entry.config(show=show)
+
+    def _collect_settings(self) -> dict:
+        """界面「设置」区的值 → 写入 config.yaml 的键值(键为「节.键」)。"""
+        engine = self._selected_engine()
+        updates = {
+            "openrouter_api_key": self.openrouter_var.get().strip(),
+            "fal_api_key": self.fal_var.get().strip(),
+            "llm.model": self.llm_model_var.get().strip() or LLM_MODEL_PRESETS[0],
+            "video.engine": engine,
+        }
+        choices = ENGINE_RESOLUTIONS.get(engine, ())
+        if choices:
+            resolution = self.resolution_var.get()
+            if resolution not in choices:
+                resolution = choices[0]
+            self._resolutions[engine] = resolution
+            updates[f"{engine}.resolution"] = resolution
+        return updates
+
+    def _save_settings(self, silent: bool = False) -> bool:
+        """把界面设置写回 config.yaml;失败时弹窗提示(silent 为 True 只写日志)。"""
+        try:
+            save_settings(self._collect_settings())
+        except Exception as exc:  # noqa: BLE001 - 写文件失败不应让程序崩溃
+            message = f"设置保存失败: {exc}"
+            if silent:
+                self._log(f"⚠ {message}(本次生成仍按界面上的设置进行)")
+            else:
+                messagebox.showerror("保存失败", message)
+            return False
+        if not silent:
+            self.status_var.set(f"设置已保存到 {CONFIG_PATH.name}。")
+        return True
 
     def _clear_placeholder(self, _event: object) -> None:
         if self.desc_text.get("1.0", "end-1c") == _PLACEHOLDER:
@@ -186,7 +346,7 @@ class App:
         else:
             self.ref_var.set(
                 f"参考图 {len(picked)} 张(用途已标注;Seedance / Gemini 引擎支持多图,"
-                "Kling 仅作同一主角的多角度参考,即梦引擎不支持参考图)"
+                "Kling 仅作同一主角的多角度参考)"
             )
         self.ref_clear_btn.config(state="normal")
 
@@ -225,11 +385,20 @@ class App:
             )
             return
 
+        # 界面「设置」先落盘再读取,保证 config.yaml 与界面一致;
+        # 万一写盘失败,仍把界面上的值覆盖进本次使用的配置
+        self._save_settings(silent=True)
         try:
             config = load_config()
         except FileNotFoundError as exc:
             messagebox.showerror("配置错误", str(exc))
             return
+        for dotted, value in self._collect_settings().items():
+            section, _, key = dotted.partition(".")
+            if key:
+                config[section][key] = value
+            else:
+                config[section] = value
         problems = config.validate()
         if problems:
             messagebox.showerror("配置错误", "\n".join(problems))
