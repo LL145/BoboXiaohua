@@ -10,7 +10,8 @@
   未上传时导演模型判断有固定主角则自动文生图;参考图作为角色元素
   (@Element1)送入每个镜头组,任何一步失败都自动降级为纯文生视频;
 - 并行生成:多个镜头组同时提交视频引擎(默认 Seedance 2.5 经 fal.ai,
-  可切方舟直连 / Seedance 2.0 / Kling / 即梦),总耗时约等于单个镜头组;
+  可切方舟直连 / Seedance 2.0 / Kling / Gemini Omni Flash / 即梦),
+  总耗时约等于单个镜头组;
 - 单镜头组独立重试 + 超时看门狗,KEY 无效等致命错误立即终止,不空耗重试;
 - 旁白与字幕:导演判断影片需要解说时,用 Edge TTS 合成旁白并生成字幕;
   TTS 不可用、混音或字幕失败,都只是放弃对应环节,绝不影响画面成片;
@@ -253,7 +254,7 @@ class Pipeline:
         )
         current = stage_path
 
-        # 引擎不原生支持的画幅(Kling 的 3:4 / 4:3):片段按相邻原生画幅生成,
+        # 引擎不原生支持的画幅(Kling 的 3:4 / 4:3,Gemini 另含 1:1):片段按相邻原生画幅生成,
         # 在此居中裁剪出目标画幅(须在字幕烧录前,失败沿用生成画幅)
         aspect = str(config["video"]["aspect_ratio"])
         if generator.generation_aspect(aspect) != aspect:
@@ -486,7 +487,7 @@ class Pipeline:
 
         engine = self._config.engine
         limit = MAX_REFERENCE_IMAGES.get(engine, 1)
-        if engine in ("seedance", "seedance25", "ark"):
+        if engine in ("seedance", "seedance25", "ark", "gemini"):
             self._log(
                 f"  当前引擎 {self._config.engine_name} 支持多参考图"
                 f"(最多 {limit} 张),各图的用途说明会写入提示词。"

@@ -92,6 +92,12 @@ _DEFAULTS: dict[str, Any] = {
         "reference_endpoint": "fal-ai/kling-video/o3/pro/reference-to-video",
         "price_per_second": 0.168,
     },
+    "gemini": {
+        "text_endpoint": "google/gemini-omni-flash/v1.1/text-to-video",
+        "reference_endpoint": "google/gemini-omni-flash/v1.1/reference-to-video",
+        "resolution": "720p",
+        "price_per_second": 0.10,
+    },
     "jimeng": {
         "req_key": "jimeng_ti2v_v30_pro",
         "host": "visual.volcengineapi.com",
@@ -177,7 +183,7 @@ class Config:
     @property
     def engine(self) -> str:
         """视频生成引擎:seedance25(默认,fal.ai)、ark(Seedance 2.5 方舟直连)、
-        seedance、kling 或 jimeng。"""
+        seedance、kling、gemini 或 jimeng。"""
         return str(self._data["video"].get("engine") or "seedance25").strip().lower()
 
     @property
@@ -187,19 +193,21 @@ class Config:
             "seedance": "Seedance 2.0",
             "seedance25": "Seedance 2.5",
             "ark": "Seedance 2.5(火山方舟)",
+            "gemini": "Gemini Omni Flash 1.1",
             "jimeng": "即梦 3.0 Pro",
         }.get(self.engine, "Kling")
 
     @property
     def uses_fal_video(self) -> bool:
         """视频片段是否经 fal.ai 生成(决定 fal_api_key 是否必填)。"""
-        return self.engine in ("seedance", "seedance25", "kling")
+        return self.engine in ("seedance", "seedance25", "kling", "gemini")
 
     @property
     def engine_section(self) -> dict[str, Any]:
         """当前引擎的专属配置节(端点、单价等)。"""
         section = (
-            self.engine if self.engine in ("seedance", "seedance25", "ark", "jimeng")
+            self.engine
+            if self.engine in ("seedance", "seedance25", "ark", "gemini", "jimeng")
             else "kling"
         )
         return self._data[section]
@@ -251,9 +259,12 @@ class Config:
                 "生成;若想改用火山方舟官方 API,填 ark_api_key 并把 video.engine "
                 "设为 ark)"
             )
-        if self.engine not in ("seedance", "seedance25", "ark", "kling", "jimeng"):
+        if self.engine not in (
+            "seedance", "seedance25", "ark", "kling", "gemini", "jimeng"
+        ):
             problems.append(
-                "video.engine 需为 seedance25 / ark / seedance / kling / jimeng 之一"
+                "video.engine 需为 seedance25 / ark / seedance / kling / gemini / "
+                "jimeng 之一"
             )
         if not 3 <= int(self._data["video"]["clip_duration"]) <= 15:
             problems.append("video.clip_duration 需在 3~15 秒之间")
@@ -273,6 +284,10 @@ class Config:
             "480p", "720p", "1080p", "2k", "4k"
         ):
             problems.append("ark.resolution 需为 480p / 720p / 1080p / 2k / 4k 之一")
+        if str(self._data["gemini"]["resolution"]) not in (
+            "360p", "720p", "1080p", "4k"
+        ):
+            problems.append("gemini.resolution 需为 360p / 720p / 1080p / 4k 之一")
         for section in ("seedance25", "ark", "jimeng"):
             try:
                 int(self._data[section].get("seed", -1))
@@ -284,7 +299,7 @@ class Config:
             problems.append("video.transition 不能为负数")
         if not 0 <= float(self._data["narration"]["volume"]) <= 2:
             problems.append("narration.volume 需在 0~2 之间")
-        for section in ("seedance", "seedance25", "ark", "kling", "jimeng"):
+        for section in ("seedance", "seedance25", "ark", "kling", "gemini", "jimeng"):
             if float(self._data[section]["price_per_second"]) < 0:
                 problems.append(
                     f"{section}.price_per_second 不能为负数(设 0 可关闭费用预估)"

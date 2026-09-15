@@ -14,6 +14,10 @@
 - **Kling 3**(快手,经 fal.ai):多分镜走 multi_prompt 结构化参数;有固定
   主角时走 reference-to-video 的 elements 角色元素(@Element1);3:4/4:3
   画幅按相邻原生画幅生成、成片时居中裁剪。
+- **Gemini Omni Flash 1.1**(Google,经 fal.ai):单组 3~10 秒,原生同步音频
+  (含台词)始终开启;参考图(最多 10 张)按顺序送入模型、没有占位符语法,
+  提交前把 @Element1 改写为 "the character from reference image 1";
+  画幅原生仅 16:9/9:16,1:1/3:4/4:3 按相邻画幅生成、成片时居中裁剪。
 - **即梦 3.0 Pro**(字节跳动,经火山引擎视觉智能官方 API):适合已有
   即梦/火山引擎 AK+SK 的用户,用 HMAC-SHA256 V4 签名鉴权(无需方舟/fal
   KEY);单次生成固定 5 秒或 10 秒,原生支持全部画幅;不支持参考图与
@@ -61,6 +65,9 @@ _SEEDANCE_MAX_SECONDS = 15
 # Seedance 2.5(fal.ai 与火山方舟同)单次生成时长范围(秒):一次连续生成 30 秒
 _SEEDANCE25_MIN_SECONDS = 4
 _SEEDANCE25_MAX_SECONDS = 30
+# Gemini Omni Flash 1.1(fal.ai)单次生成时长范围(秒,整数)
+_GEMINI_MIN_SECONDS = 3
+_GEMINI_MAX_SECONDS = 10
 # 即梦(火山引擎视觉智能 API)单次只能生成 5 秒或 10 秒(frames = 24×秒数 + 1)
 _JIMENG_DURATIONS = (5, 10)
 _JIMENG_API_VERSION = "2022-08-31"
@@ -73,6 +80,7 @@ MAX_REFERENCE_IMAGES = {
     "ark": 30,         # 方舟官方:单次最多 30 张参考图
     "seedance": 9,     # fal Seedance 2.0 reference-to-video:最多 9 张
     "kling": 4,        # elements 单角色的多角度参考,保守取 4 张
+    "gemini": 10,      # fal reference-to-video:image_urls 最多 10 张
     "jimeng": 0,       # 即梦 API 不支持角色参考图(靠外观描述保持一致)
 }
 
@@ -86,6 +94,18 @@ def kling_generation_aspect(aspect: str) -> str:
     """返回 Kling 端点实际使用的生成画幅:非原生画幅映射到相邻原生画幅。"""
     aspect = str(aspect).strip()
     if aspect in _NATIVE_ASPECTS:
+        return aspect
+    return _GENERATION_ASPECT.get(aspect, "16:9")
+
+
+# Gemini Omni Flash 端点原生仅支持横竖屏;1:1 按 16:9 生成后居中裁剪
+_GEMINI_NATIVE_ASPECTS = ("16:9", "9:16")
+
+
+def gemini_generation_aspect(aspect: str) -> str:
+    """返回 Gemini Omni Flash 端点实际使用的生成画幅(1:1/3:4/4:3 需成片裁剪)。"""
+    aspect = str(aspect).strip()
+    if aspect in _GEMINI_NATIVE_ASPECTS:
         return aspect
     return _GENERATION_ASPECT.get(aspect, "16:9")
 
@@ -119,6 +139,14 @@ def element_to_image_tokens(prompt: str) -> str:
 def element_to_ark_image_tokens(prompt: str) -> str:
     """把 @Element1/@Image1 占位符转换为火山方舟官方的 @图片1 引用语法。"""
     return re.sub(r"@(?:Element|Image)(\d+)", r"@图片\1", prompt)
+
+
+def element_to_reference_phrases(prompt: str) -> str:
+    """把 @Element1/@Image1 占位符改写为自然语言引用(Gemini 端点无占位符语法,
+    参考图按 image_urls 顺序送入模型,靠"第 N 张参考图"的说法对应)。"""
+    return re.sub(
+        r"@(?:Element|Image)(\d+)\s*", r"the character from reference image \1 ", prompt
+    ).strip()
 
 
 def join_cut_prompts(prompts: list[str]) -> str:
@@ -164,15 +192,29 @@ def join_cut_prompts_timed(prompts_durations: list[tuple[str, int]]) -> str:
     return " ".join(parts)
 
 
-def reference_usage_note(notes: list[str], token_format: str) -> str:
+def reference_usage_note(
+    notes: list[str], token_format: str, english: bool = False
+) -> str:
     """生成参考素材的用途说明,附在 prompt 末尾。
 
     社区经验:未标注用途的参考图是效果不佳的最常见原因——每个参考素材
     都应说明用途,prompt 中用"参考图中的角色"式引用而非重新描述。
-    token_format 如 "@图片{}"(方舟)或 "@Image{}"(fal)。
+    token_format 如 "@图片{}"(方舟)、"@Image{}"(fal Seedance)或
+    "Reference image {}"(Gemini);english 为 True 时说明文字用英文
+    (用途本身照抄用户所写)。
     """
     if not notes:
         return ""
+    if english:
+        parts = [
+            f"{token_format.format(i)}: {note.strip() or 'main character reference'}"
+            for i, note in enumerate(notes, 1)
+        ]
+        return (
+            " Reference media usage — " + "; ".join(parts)
+            + ". Keep the main character's appearance strictly consistent with"
+            " the reference images."
+        )
     parts = [
         f"{token_format.format(i)}:{note.strip() or '主角形象参考'}"
         for i, note in enumerate(notes, 1)
@@ -632,7 +674,7 @@ class Seedance25Generator(_FalGenerator):
             endpoint = str(seedance25["text_endpoint"])
             prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
 
-        prompt = _join_seedance25_prompts(prompts, shot)
+        prompt = _join_timed_prompts(prompts, shot)
         refs: list[tuple[str, str]] = []
         if use_reference:
             refs = references[:MAX_REFERENCE_IMAGES["seedance25"]]
@@ -668,10 +710,10 @@ class Seedance25Generator(_FalGenerator):
         return endpoint, arguments, use_reference
 
 
-def _join_seedance25_prompts(prompts: list[str], shot: Shot) -> str:
-    """Seedance 2.5 的多分镜拼接:多分镜按时间戳分块(官方推荐,把各分镜的
-    时长比例明确传给模型,避免 30 秒长镜头组的"后半段漂移"),单分镜沿用
-    普通拼接。fal.ai 与火山方舟两条通路共用。"""
+def _join_timed_prompts(prompts: list[str], shot: Shot) -> str:
+    """多分镜按时间戳分块拼接(Seedance 2.5 官方推荐,把各分镜的时长比例
+    明确传给模型,避免长镜头组的"后半段漂移"),单分镜沿用普通拼接。
+    Seedance 2.5(fal.ai / 火山方舟)与 Gemini Omni Flash 共用。"""
     if len(shot.cuts) > 1:
         return join_cut_prompts_timed(
             [(p, cut.duration) for p, cut in zip(prompts, shot.cuts)]
@@ -840,7 +882,7 @@ class ArkSeedanceGenerator(_FalGenerator):
         else:
             prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
 
-        prompt = _join_seedance25_prompts(prompts, shot)
+        prompt = _join_timed_prompts(prompts, shot)
         refs: list[tuple[str, str]] = []
         if use_reference:
             refs = references[:MAX_REFERENCE_IMAGES["ark"]]
@@ -956,6 +998,64 @@ class KlingGenerator(_FalGenerator):
         else:
             arguments["prompt"] = prompts[0]
             arguments["duration"] = str(max(3, shot.duration))
+        return endpoint, arguments, use_reference
+
+
+class GeminiGenerator(_FalGenerator):
+    """Gemini Omni Flash 1.1(Google,经 fal.ai):可选引擎(video.engine: gemini)。
+
+    单组 3~10 秒;原生同步音频始终开启(端点无音效开关);参考图经
+    image_urls 按顺序送入,无占位符语法,prompt 里以 "reference image N"
+    自然语言引用;不支持 seed 与 negative_prompt;画幅原生仅 16:9/9:16,
+    其余画幅按相邻画幅生成后由成片阶段居中裁剪。
+    """
+
+    _ENGINE_LABEL = "Gemini Omni Flash"
+
+    def generation_aspect(self, aspect: str) -> str:
+        return gemini_generation_aspect(aspect)
+
+    def _build_arguments(
+        self, shot: Shot, references: list[tuple[str, str]] | None
+    ) -> tuple[str, dict, bool]:
+        """多分镜按时间戳分块拼成单条 prompt,有主角走 image_urls 参考图。"""
+        gemini = self._config["gemini"]
+        video_cfg = self._config["video"]
+        combined = shot.combined_prompt.lower()
+        use_reference = bool(references) and (
+            "@element" in combined or "@image" in combined
+        )
+
+        refs: list[tuple[str, str]] = []
+        if use_reference:
+            endpoint = str(gemini["reference_endpoint"])
+            refs = references[:MAX_REFERENCE_IMAGES["gemini"]]
+            prompts = [element_to_reference_phrases(cut.prompt) for cut in shot.cuts]
+        else:
+            endpoint = str(gemini["text_endpoint"])
+            prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
+
+        prompt = _join_timed_prompts(prompts, shot)
+        if refs:
+            prompt += reference_usage_note(
+                [note for _, note in refs], "Reference image {}", english=True
+            )
+        if len(prompt) > _MAX_SINGLE_PROMPT_CHARS:
+            self._log(
+                f"  ⚠ 镜头组 {shot.index} 提示词超长({len(prompt)} 字符),"
+                f"已裁剪到 {_MAX_SINGLE_PROMPT_CHARS} 字符内"
+            )
+            prompt = fit_prompt(prompt, _MAX_SINGLE_PROMPT_CHARS)
+
+        duration = min(_GEMINI_MAX_SECONDS, max(_GEMINI_MIN_SECONDS, int(shot.duration)))
+        arguments: dict = {
+            "prompt": prompt,
+            "duration": duration,  # 整数秒(3~10)
+            "aspect_ratio": gemini_generation_aspect(str(video_cfg["aspect_ratio"])),
+            "resolution": str(gemini["resolution"]),
+        }
+        if refs:
+            arguments["image_urls"] = [url for url, _ in refs]
         return endpoint, arguments, use_reference
 
 
@@ -1097,6 +1197,7 @@ def create_generator(
         "seedance": SeedanceGenerator,
         "seedance25": Seedance25Generator,
         "ark": ArkSeedanceGenerator,
+        "gemini": GeminiGenerator,
         "jimeng": JimengGenerator,
     }.get(config.engine, KlingGenerator)
     return cls(config, log, cancel_event=cancel_event)

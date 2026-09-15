@@ -25,11 +25,12 @@ _RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504, 524}
 # 镜头组时长约束(秒):一个镜头组一次生成,总长下限随引擎而异
 # (Kling 3 为 3 秒,Seedance 为 4 秒,即梦为 5 秒),上限也随引擎
 # (Seedance 2.5——fal.ai 与火山方舟直连 ark 同——一次可连续生成 30 秒,
-# 即梦为 10 秒,其余引擎为 15 秒);组内单个分镜最短可到 1 秒
+# Gemini Omni Flash 与即梦为 10 秒,其余引擎为 15 秒);组内单个分镜最短可到 1 秒
 _MIN_GROUP_SECONDS = 3
 _SEEDANCE_MIN_GROUP_SECONDS = 4
 _MAX_GROUP_SECONDS = 15
 _SEEDANCE25_MAX_GROUP_SECONDS = 30
+_GEMINI_MAX_GROUP_SECONDS = 10
 # 即梦 API 单次只能生成 5 秒或 10 秒(_snap_jimeng_durations 会取整到这两档)
 _JIMENG_GROUP_SECONDS = (5, 10)
 _MIN_CUT_SECONDS = 1
@@ -50,6 +51,8 @@ def _engine_min_group(engine: str) -> int:
 def _engine_max_group(engine: str) -> int:
     if engine == "jimeng":
         return _JIMENG_GROUP_SECONDS[-1]
+    if engine == "gemini":
+        return _GEMINI_MAX_GROUP_SECONDS
     return (
         _SEEDANCE25_MAX_GROUP_SECONDS if engine in ("seedance25", "ark")
         else _MAX_GROUP_SECONDS
@@ -504,6 +507,12 @@ class Director:
     }
     # 引擎专属的额外创作约束,随创意一起发给导演模型
     _ENGINE_NOTES = {
+        "gemini": (
+            "本片使用 Gemini Omni Flash 视频引擎:每个镜头组总时长必须为 3~10 秒"
+            "的整数;该引擎擅长用自然语言表达的镜头调度(推轨、镜头焦段、布光)"
+            "与真实物理,请在分镜 prompt 中直接写明镜头运动与光线;"
+            "原生同步音频始终开启,角色台词可直接写进分镜 prompt。"
+        ),
         "jimeng": (
             "本片使用即梦视频引擎,有三条硬性约束:\n"
             "1. 每个镜头组的总时长(组内分镜时长之和)必须严格为 5 秒或 "
@@ -516,8 +525,9 @@ class Director:
             "旁白(narration 字段,由本地语音合成配音)。"
         ),
     }
-    # Kling 端点不原生支持 3:4 / 4:3:由相邻原生画幅生成后居中裁剪
-    # (见 kling.kling_generation_aspect),提醒导演把关键内容放在画面中部
+    # Kling / Gemini 端点不原生支持 3:4 / 4:3(Gemini 连 1:1 也不支持):
+    # 由相邻原生画幅生成后居中裁剪(见 kling.kling_generation_aspect /
+    # gemini_generation_aspect),提醒导演把关键内容放在画面中部
     _KLING_CROP_NOTES = {
         "3:4": (
             "本片为竖幅 3:4 画幅(先按 9:16 生成,成片时上下居中裁剪出 3:4),"
@@ -526,6 +536,14 @@ class Director:
         "4:3": (
             "本片为横幅 4:3 画幅(先按 16:9 生成,成片时左右居中裁剪出 4:3),"
             "请把主体与关键动作放在画面水平方向的中部,不要依赖画面左右边缘。"
+        ),
+    }
+    _GEMINI_CROP_NOTES = {
+        **_KLING_CROP_NOTES,
+        "1:1": (
+            "本片为方形 1:1 画幅(先按 16:9 生成,成片时左右居中裁剪出 1:1,"
+            "画面左右各约三分之一会被裁掉),请把主体与关键动作严格放在画面"
+            "水平方向的中央三分之一内,不要依赖画面左右两侧。"
         ),
     }
 
@@ -567,6 +585,8 @@ class Director:
         note = self._ASPECT_NOTES.get(aspect)
         if engine == "kling":  # Kling 的 3:4/4:3 经裁剪实现,构图提示不同
             note = self._KLING_CROP_NOTES.get(aspect, note)
+        elif engine == "gemini":  # Gemini 原生仅横竖屏,1:1 也需裁剪
+            note = self._GEMINI_CROP_NOTES.get(aspect, note)
         if note:
             user_message += f"\n\n{note}"
         engine_note = self._ENGINE_NOTES.get(engine)
