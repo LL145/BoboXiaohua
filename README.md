@@ -1,4 +1,4 @@
-# AI 短视频生成器(OpenRouter × 火山方舟 × fal.ai)
+# AI 短视频生成器(OpenRouter × fal.ai)
 
 跨平台桌面小工具(Windows / macOS / Linux):输入一句话描述,点击「生成」,自动产出一条约 **60 秒**的高质量短视频。
 
@@ -10,17 +10,18 @@
    ▼
 ① LLM 导演(经 OpenRouter)     → 扩写为分镜脚本,镜头数量与每镜头时长
    │                              由导演按叙事节奏决定
-   │  默认 Qwen3.8-Max (high)       可换 OpenRouter 上任意模型
+   │  默认 GLM-5.3 (medium)         可换 OpenRouter 上任意模型
    │                              并判断是否存在贯穿全片的主角
    ▼
 ② 主角参考图(Nano Banana 2)   → 有主角时自动生成一张参考图(约 $0.08)
    │                              无主角(纯风景等)则跳过
    ▼
-③ Seedance 2.5(火山方舟)      → 多镜头并行生成,自带音效与配音,
+③ Seedance 2.5(fal.ai)        → 多镜头并行生成,自带音效与配音,
    │                              单镜头组最长 30 秒一次连续生成
-   │  有主角: 参考图随每个镜头送入(@图片1),全片角色外观一致
+   │  有主角: 参考图随每个镜头送入(@Image1),全片角色外观一致
    │  无主角: 纯文生视频             失败自动降级/重试,断点续传
-   │  可切换 Seedance 2.0 / Kling 3(fal.ai),config.yaml 一行切换
+   │  可切换火山方舟直连 / Seedance 2.0 / Kling 3 / Gemini Omni Flash / 即梦,
+   │  config.yaml 一行切换
    ▼
 ④ ffmpeg                        → 交叉溶解转场 + 首尾淡入淡出;
    │                              music/ 里有音频则由导演按情绪挑选混入
@@ -80,25 +81,28 @@ pip install -r requirements.txt
 
 ```yaml
 openrouter_api_key: "sk-or-..."   # https://openrouter.ai/settings/keys
-ark_api_key: "..."                # 火山方舟 https://console.volcengine.com/ark
-                                  # (创建 API Key 并开通 Seedance 2.5 模型)
+fal_api_key: "..."                # https://fal.ai/dashboard/keys
 ```
 
-默认已选用各环节当前先进的模型:编剧/导演为 **Qwen3.8-Max**(思考深度 high),
-视频为字节最新的 **Seedance 2.5**(fal.ai 暂未上线,经火山方舟官方 API;
-单镜头组最长 30 秒一次连续生成,支持原生 4K,720p 档),参考图为
-**Nano Banana 2**。分镜提示词按引擎自动选择语言(Seedance 系与即梦用中文,
-官方一等支持;Kling 用英文),角色台词一律默认中文配音。
-
-`fal_api_key` 在默认引擎下为可选:仅在自动文生主角参考图时用到,缺失则自动
-跳过(改用你上传的主角图片,或纯文生视频)。海外用户可在 `seedance25.*` 中
-改用 BytePlus 的地址与模型 ID(见配置注释)。
+默认已选用各环节当前先进的模型:编剧/导演为 **GLM-5.3**(思考深度 medium),
+视频为字节最新的 **Seedance 2.5**(经 fal.ai;单镜头组最长 30 秒一次连续
+生成,720p 档,参考图最多 30 张),参考图为 **Nano Banana 2**。
+分镜提示词按引擎自动选择语言(Seedance 系与即梦用中文,官方一等支持;
+Kling 与 Gemini 用英文),角色台词一律默认中文配音。
 
 想换模型只需改对应端点/模型 ID 一行,注释里有说明——例如 `llm.model` 支持
-OpenRouter 上的任意模型(如 `anthropic/claude-fable-5`、`openai/gpt-5.2`、
-`google/gemini-3-pro`);把 `video.engine` 改为 `seedance`(Seedance 2.0)或
-`kling`(Kling 3 Pro,费用约为 Seedance 的一半)即切回 fal.ai 引擎
-(此时必填 `fal_api_key`)。
+OpenRouter 上的任意模型(如 `qwen/qwen3.8-max`、`anthropic/claude-fable-5`、
+`openai/gpt-5.2`、`google/gemini-3-pro`);把 `video.engine` 改为 `seedance`
+(Seedance 2.0)、`kling`(Kling 3 Pro,费用约为 Seedance 的三分之一)或
+`gemini`(Google Gemini Omni Flash 1.1,720p 仅 $0.10/秒,单组 3~10 秒,
+原生同步音频始终开启)即可切换 fal.ai 上的其他引擎。
+
+已有**火山方舟**账号、或需要 2K/4K 与 negative_prompt 的用户,可让同一
+Seedance 2.5 改走方舟官方 API:把 `video.engine` 改为 `ark`,并填入
+[火山方舟控制台](https://console.volcengine.com/ark)创建的 `ark_api_key`
+(需开通 Seedance 2.5 模型);此时 `fal_api_key` 为可选(仅自动文生主角
+参考图用,缺失则自动跳过)。海外用户可在 `ark.*` 中改用 BytePlus 的地址与
+模型 ID(见配置注释)。旧版配置(只填了 `ark_api_key`)会自动沿用方舟直连。
 
 已有**即梦/火山引擎 AK+SK** 的用户可直接使用即梦引擎,无需申请方舟/fal KEY:
 把 `video.engine` 改为 `jimeng`,并填入火山引擎
@@ -125,16 +129,17 @@ video:
 再选择大约时长(**30 秒 / 1 分钟 / 2 分钟**),点击「🎬 生成视频」。
 全程约十几分钟(视频模型每个镜头需要数分钟),进度条按镜头推进,日志实时显示,
 完成后点击「打开成片」。
-导演模型会按所选画幅与时长设计构图和节奏(Kling 引擎下 4:3 与 3:4 由相邻画幅
-生成后自动居中裁剪,Seedance 原生支持全部画幅)。
+导演模型会按所选画幅与时长设计构图和节奏(Kling 引擎下 4:3 与 3:4、Gemini
+引擎下 1:1 / 4:3 / 3:4 由相邻画幅生成后自动居中裁剪,Seedance 原生支持全部画幅)。
 画幅、时长或引擎不同的未完成任务互相独立、各自断点续传。
 
 想指定主角长相时,可点「🖼 上传参考图(可多选)」选择一张或多张图片(如宠物照片、
 角色三视图、场景照):每张图可注明用途(主角正面/侧面/场景参考/风格参考等),
 参考图会锁定全片画面元素,导演模型也会照着图撰写分镜;不上传则由 AI 自动判断并生成主角形象。
 
-> 多图支持随引擎而异:**Seedance 2.5**(默认)最多 30 张、**Seedance 2.0** 最多
-> 9 张,各图的用途说明会写入提示词(角色三视图能显著提升角色一致性);
+> 多图支持随引擎而异:**Seedance 2.5**(默认;方舟直连同)最多 30 张、**Seedance 2.0** 最多
+> 9 张、**Gemini Omni Flash** 最多 10 张,各图的用途说明会写入提示词
+> (角色三视图能显著提升角色一致性);
 > **Kling** 仅把多张图作为**同一主角的多角度参考**,单独的用途说明不生效;
 > **即梦** API 不支持参考图(角色一致性由脚本中逐字重复的外观描述保证,
 > 上传的图片仍会帮助导演模型照图撰写外观描述)。
@@ -170,11 +175,13 @@ output/20260803_153000_雨巷橘猫/
 - **macOS 提示"已损坏"或"无法验证开发者"** — 因为程序未做付费签名。首次启动请
   右键(按住 Control 点击)→ 打开;若仍被拦截,在终端执行
   `xattr -cr AI短视频生成器.app` 后再打开。
-- **想换视频引擎/版本** — `video.engine` 可选 `seedance25`(默认,火山方舟
-  官方 API,需 `ark_api_key`)、`seedance`(Seedance 2.0,fal.ai)、`kling`
-  (Kling 3,fal.ai)或 `jimeng`(即梦 3.0 Pro,火山引擎官方 API,
-  需 AK/SK);各引擎的端点/模型在 `seedance25.*` / `seedance.*` /
-  `kling.*` / `jimeng.*` 中修改,fal 引擎的可选端点见
+- **想换视频引擎/版本** — `video.engine` 可选 `seedance25`(默认,Seedance 2.5,
+  fal.ai)、`ark`(同一 Seedance 2.5 走火山方舟官方 API,需 `ark_api_key`)、
+  `seedance`(Seedance 2.0,fal.ai)、`kling`(Kling 3,fal.ai)、`gemini`
+  (Gemini Omni Flash 1.1,fal.ai)或 `jimeng`(即梦 3.0 Pro,火山引擎官方 API,
+  需 AK/SK);各引擎的端点/模型在
+  `seedance25.*` / `ark.*` / `seedance.*` / `kling.*` / `gemini.*` / `jimeng.*` 中修改,
+  fal 引擎的可选端点见
   [fal.ai 模型页](https://fal.ai/models)。
   注意旧版 Kling(2.x)仅支持 5/10 秒镜头且无原生音效。
 - **只有即梦账号的 AK/SK,没有方舟 API Key** — 把 `video.engine` 改为
@@ -182,16 +189,20 @@ output/20260803_153000_雨巷橘猫/
   需先在火山引擎控制台开通「即梦AI」视频生成服务。
 - **想换编剧模型** — 修改 `config.yaml` 中 `llm.model` 为 OpenRouter 上的任意模型 ID;
   `llm.reasoning_effort` 控制思考深度(不支持思考的模型自动忽略)。
-- **想复现/对比生成结果** — 把 `seedance25.seed`(即梦引擎为 `jimeng.seed`)
-  固定为非负整数,相同参数下可复现同一结果,便于微调提示词后对比;
-  默认 -1 为每次随机(仅 Seedance 2.5 与即梦引擎支持)。
-- **想省钱** — 把 `seedance25.resolution`(或 fal 引擎的 `seedance.resolution`)
-  降到 `480p`,或把 `video.engine` 改为 `kling`(约 $0.168/秒);
+- **想复现/对比生成结果** — 把 `seedance25.seed`(方舟直连为 `ark.seed`,
+  即梦引擎为 `jimeng.seed`)固定为非负整数,相同参数下可复现同一结果,便于
+  微调提示词后对比;默认 -1 为每次随机(fal 的 Seedance 2.5 端点仅带参考图的
+  镜头组支持 seed;Seedance 2.0、Kling 与 Gemini 不支持)。
+- **想省钱** — 把 `seedance25.resolution` 降到 `480p`(约 $0.22/秒),
+  或把 `video.engine` 改为 `ark`(方舟按 token 计费,720p 约 $0.21/秒)、
+  `kling`(约 $0.168/秒)、`gemini`(720p 约 $0.10/秒,360p 仅 $0.03/秒);
   Kling 引擎下 `video.generate_audio: false` 还能再省约 1/3
-  (Seedance 系开关音效同价)。
-- **费用参考**(以各平台实时定价为准)— 60 秒成片:Seedance 2.0 标准档 720p 约
-  $18(1080p 约 $41);Seedance 2.5(方舟按 token 计费)720p 约 $13;
-  Kling 3 Pro 含音效约 $10,关音效约 $6.7;参考图 $0.08;
+  (Seedance 系开关音效同价,Gemini 音频始终开启)。
+- **费用参考**(以各平台实时定价为准)— 60 秒成片:Seedance 2.5(fal,按 token
+  计费)720p 约 $28、480p 约 $13;Seedance 2.5 方舟直连 720p 约 $13;
+  Seedance 2.0 标准档 720p 约 $18(1080p 约 $41);
+  Kling 3 Pro 含音效约 $10,关音效约 $6.7;Gemini Omni Flash 720p 约 $6
+  (1080p 约 $9);参考图 $0.08;
   分镜脚本几美分到几十美分(视模型而定)。
 
 ## 发布新版本(维护者)

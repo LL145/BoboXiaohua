@@ -1,17 +1,23 @@
 """调用视频引擎生成素材:主角参考图(文生图)与各镜头组视频片段。
 
-支持三个视频引擎(config.yaml 的 video.engine 切换,默认 seedance25):
+支持五个视频引擎(config.yaml 的 video.engine 切换,默认 seedance25):
+- **Seedance 2.5**(字节跳动,经 fal.ai,默认):单组最长 30 秒一次连续生成,
+  多分镜按时间戳分块拼进单条 prompt;有固定主角时走 reference-to-video,
+  参考图(最多 30 张)经 image_urls 送入、prompt 中以 @Image1 引用(导演
+  脚本统一写 @Element1,提交前自动转换);原生支持全部画幅与音频。
+- **Seedance 2.5 方舟直连**(video.engine: ark):同一模型,改走火山方舟官方
+  任务接口(需 ark_api_key,适合已有方舟账号或需要 4K 的用户);参考图以
+  base64 data URL 随请求送入(role: reference_image),prompt 中按方舟官方
+  语法以 @图片1 引用;支持 negative_prompt 与 2K/4K。
 - **Seedance 2.0**(字节跳动,经 fal.ai):多分镜用 "Cut scene to" 语法拼进
-  单条 prompt 一次连续生成;有固定主角时走 reference-to-video,参考图经
-  image_urls 送入、prompt 中以 @Image1 引用(导演脚本统一写 @Element1,
-  提交前自动转换);原生支持 16:9/9:16/1:1/3:4/4:3 全部画幅与音频。
-- **Seedance 2.5**(字节跳动,经火山方舟官方 API,默认):fal.ai 尚未上线 2.5,
-  直连火山方舟(Volcengine Ark)的视频生成任务接口(需额外配 ark_api_key);
-  单组最长 30 秒一次连续生成,参考图以 base64 data URL 随请求送入
-  (role: reference_image),prompt 中按方舟官方语法以 @图片1 引用。
+  单条 prompt 一次连续生成(单组 4~15 秒);参考图同样经 image_urls 送入。
 - **Kling 3**(快手,经 fal.ai):多分镜走 multi_prompt 结构化参数;有固定
   主角时走 reference-to-video 的 elements 角色元素(@Element1);3:4/4:3
   画幅按相邻原生画幅生成、成片时居中裁剪。
+- **Gemini Omni Flash 1.1**(Google,经 fal.ai):单组 3~10 秒,原生同步音频
+  (含台词)始终开启;参考图(最多 10 张)按顺序送入模型、没有占位符语法,
+  提交前把 @Element1 改写为 "the character from reference image 1";
+  画幅原生仅 16:9/9:16,1:1/3:4/4:3 按相邻画幅生成、成片时居中裁剪。
 - **即梦 3.0 Pro**(字节跳动,经火山引擎视觉智能官方 API):适合已有
   即梦/火山引擎 AK+SK 的用户,用 HMAC-SHA256 V4 签名鉴权(无需方舟/fal
   KEY);单次生成固定 5 秒或 10 秒,原生支持全部画幅;不支持参考图与
@@ -56,9 +62,12 @@ _MAX_SEEDANCE_PROMPT_CHARS = 2500
 # Seedance 2.0 单次生成时长范围(秒)
 _SEEDANCE_MIN_SECONDS = 4
 _SEEDANCE_MAX_SECONDS = 15
-# Seedance 2.5(火山方舟)单次生成时长范围(秒):官方支持一次连续生成 30 秒
-_ARK_MIN_SECONDS = 4
-_ARK_MAX_SECONDS = 30
+# Seedance 2.5(fal.ai 与火山方舟同)单次生成时长范围(秒):一次连续生成 30 秒
+_SEEDANCE25_MIN_SECONDS = 4
+_SEEDANCE25_MAX_SECONDS = 30
+# Gemini Omni Flash 1.1(fal.ai)单次生成时长范围(秒,整数)
+_GEMINI_MIN_SECONDS = 3
+_GEMINI_MAX_SECONDS = 10
 # 即梦(火山引擎视觉智能 API)单次只能生成 5 秒或 10 秒(frames = 24×秒数 + 1)
 _JIMENG_DURATIONS = (5, 10)
 _JIMENG_API_VERSION = "2022-08-31"
@@ -67,9 +76,11 @@ _JIMENG_DETERMINISTIC_CODES = {50400, 50411, 50412, 50413, 50511, 50512}
 
 # 各引擎支持的参考图张数上限(超出部分按顺序丢弃,pipeline 会提前告知用户)
 MAX_REFERENCE_IMAGES = {
-    "seedance25": 30,  # 方舟官方:单次最多 30 张参考图
-    "seedance": 9,     # fal reference-to-video:最多 9 张
+    "seedance25": 30,  # fal Seedance 2.5 reference-to-video:最多 30 张
+    "ark": 30,         # 方舟官方:单次最多 30 张参考图
+    "seedance": 9,     # fal Seedance 2.0 reference-to-video:最多 9 张
     "kling": 4,        # elements 单角色的多角度参考,保守取 4 张
+    "gemini": 10,      # fal reference-to-video:image_urls 最多 10 张
     "jimeng": 0,       # 即梦 API 不支持角色参考图(靠外观描述保持一致)
 }
 
@@ -83,6 +94,18 @@ def kling_generation_aspect(aspect: str) -> str:
     """返回 Kling 端点实际使用的生成画幅:非原生画幅映射到相邻原生画幅。"""
     aspect = str(aspect).strip()
     if aspect in _NATIVE_ASPECTS:
+        return aspect
+    return _GENERATION_ASPECT.get(aspect, "16:9")
+
+
+# Gemini Omni Flash 端点原生仅支持横竖屏;1:1 按 16:9 生成后居中裁剪
+_GEMINI_NATIVE_ASPECTS = ("16:9", "9:16")
+
+
+def gemini_generation_aspect(aspect: str) -> str:
+    """返回 Gemini Omni Flash 端点实际使用的生成画幅(1:1/3:4/4:3 需成片裁剪)。"""
+    aspect = str(aspect).strip()
+    if aspect in _GEMINI_NATIVE_ASPECTS:
         return aspect
     return _GENERATION_ASPECT.get(aspect, "16:9")
 
@@ -116,6 +139,14 @@ def element_to_image_tokens(prompt: str) -> str:
 def element_to_ark_image_tokens(prompt: str) -> str:
     """把 @Element1/@Image1 占位符转换为火山方舟官方的 @图片1 引用语法。"""
     return re.sub(r"@(?:Element|Image)(\d+)", r"@图片\1", prompt)
+
+
+def element_to_reference_phrases(prompt: str) -> str:
+    """把 @Element1/@Image1 占位符改写为自然语言引用(Gemini 端点无占位符语法,
+    参考图按 image_urls 顺序送入模型,靠"第 N 张参考图"的说法对应)。"""
+    return re.sub(
+        r"@(?:Element|Image)(\d+)\s*", r"the character from reference image \1 ", prompt
+    ).strip()
 
 
 def join_cut_prompts(prompts: list[str]) -> str:
@@ -161,15 +192,29 @@ def join_cut_prompts_timed(prompts_durations: list[tuple[str, int]]) -> str:
     return " ".join(parts)
 
 
-def reference_usage_note(notes: list[str], token_format: str) -> str:
+def reference_usage_note(
+    notes: list[str], token_format: str, english: bool = False
+) -> str:
     """生成参考素材的用途说明,附在 prompt 末尾。
 
     社区经验:未标注用途的参考图是效果不佳的最常见原因——每个参考素材
     都应说明用途,prompt 中用"参考图中的角色"式引用而非重新描述。
-    token_format 如 "@图片{}"(方舟)或 "@Image{}"(fal)。
+    token_format 如 "@图片{}"(方舟)、"@Image{}"(fal Seedance)或
+    "Reference image {}"(Gemini);english 为 True 时说明文字用英文
+    (用途本身照抄用户所写)。
     """
     if not notes:
         return ""
+    if english:
+        parts = [
+            f"{token_format.format(i)}: {note.strip() or 'main character reference'}"
+            for i, note in enumerate(notes, 1)
+        ]
+        return (
+            " Reference media usage — " + "; ".join(parts)
+            + ". Keep the main character's appearance strictly consistent with"
+            " the reference images."
+        )
     parts = [
         f"{token_format.format(i)}:{note.strip() or '主角形象参考'}"
         for i, note in enumerate(notes, 1)
@@ -599,23 +644,102 @@ class SeedanceGenerator(_FalGenerator):
         return endpoint, arguments, use_reference
 
 
-class ArkSeedanceGenerator(_FalGenerator):
-    """Seedance 2.5(字节跳动,经火山方舟官方 API):默认视频引擎。
+class Seedance25Generator(_FalGenerator):
+    """Seedance 2.5(字节跳动,经 fal.ai):默认视频引擎(video.engine: seedance25)。
 
-    fal.ai 尚未上线 Seedance 2.5,因此直连火山方舟(Volcengine Ark)的
-    视频生成任务接口:POST 创建任务 → 轮询状态 → 下载成片,鉴权用 ark_api_key。
+    与 Seedance 2.0 同一套 fal 提交/轮询逻辑,差异:单组最长 30 秒,多分镜
+    按时间戳分块拼接(防长组后半段漂移),参考图最多 30 张,reference 端点
+    支持 seed;端点不支持 negative_prompt。
+    """
+
+    _ENGINE_LABEL = "Seedance 2.5"
+
+    def _build_arguments(
+        self, shot: Shot, references: list[tuple[str, str]] | None
+    ) -> tuple[str, dict, bool]:
+        """多分镜按时间戳分块拼成单条 prompt,有主角走 image_urls 参考图。"""
+        seedance25 = self._config["seedance25"]
+        video_cfg = self._config["video"]
+        combined = shot.combined_prompt.lower()
+        use_reference = bool(references) and (
+            "@element" in combined or "@image" in combined
+        )
+
+        if use_reference:
+            endpoint = str(seedance25["reference_endpoint"])
+            # fal 端点在 prompt 中用 @Image1 引用 image_urls 里的参考图;
+            # 导演脚本统一写 @Element1,在此转换(旧脚本的 @Image1 原样可用)
+            prompts = [element_to_image_tokens(cut.prompt) for cut in shot.cuts]
+        else:
+            endpoint = str(seedance25["text_endpoint"])
+            prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
+
+        prompt = _join_timed_prompts(prompts, shot)
+        refs: list[tuple[str, str]] = []
+        if use_reference:
+            refs = references[:MAX_REFERENCE_IMAGES["seedance25"]]
+            prompt += reference_usage_note([note for _, note in refs], "@Image{}")
+        if len(prompt) > _MAX_SEEDANCE_PROMPT_CHARS:
+            self._log(
+                f"  ⚠ 镜头组 {shot.index} 提示词超长({len(prompt)} 字符),"
+                f"已裁剪到 {_MAX_SEEDANCE_PROMPT_CHARS} 字符内"
+            )
+            prompt = fit_prompt(prompt, _MAX_SEEDANCE_PROMPT_CHARS)
+
+        duration = min(
+            _SEEDANCE25_MAX_SECONDS, max(_SEEDANCE25_MIN_SECONDS, shot.duration)
+        )
+        arguments: dict = {
+            "prompt": prompt,
+            # 端点的 duration 为字符串枚举("auto" 或 "4"~"30")
+            "duration": str(duration),
+            # Seedance 2.5 原生支持 16:9/9:16/1:1/3:4/4:3 全部画幅,无需映射裁剪
+            "aspect_ratio": str(video_cfg["aspect_ratio"]),
+            "resolution": str(seedance25["resolution"]),
+            "generate_audio": bool(video_cfg["generate_audio"]),
+        }
+        if use_reference:
+            arguments["image_urls"] = [url for url, _ in refs]
+            # seed 仅 reference-to-video 端点接受(text-to-video 无此参数)
+            try:
+                seed = int(seedance25.get("seed", -1))
+            except (TypeError, ValueError):
+                seed = -1
+            if seed >= 0:
+                arguments["seed"] = seed
+        return endpoint, arguments, use_reference
+
+
+def _join_timed_prompts(prompts: list[str], shot: Shot) -> str:
+    """多分镜按时间戳分块拼接(Seedance 2.5 官方推荐,把各分镜的时长比例
+    明确传给模型,避免长镜头组的"后半段漂移"),单分镜沿用普通拼接。
+    Seedance 2.5(fal.ai / 火山方舟)与 Gemini Omni Flash 共用。"""
+    if len(shot.cuts) > 1:
+        return join_cut_prompts_timed(
+            [(p, cut.duration) for p, cut in zip(prompts, shot.cuts)]
+        )
+    return join_cut_prompts(prompts)
+
+
+class ArkSeedanceGenerator(_FalGenerator):
+    """Seedance 2.5 方舟直连(字节跳动,经火山方舟官方 API):可选引擎
+    (video.engine: ark)。
+
+    直连火山方舟(Volcengine Ark)的视频生成任务接口:POST 创建任务 →
+    轮询状态 → 下载成片,鉴权用 ark_api_key。适合已有方舟账号、需要
+    2K/4K 或 negative_prompt 的用户。
     复用基类的重试/降级/下载/取消逻辑,仅替换任务提交与参考图上传:
     参考图无需对象存储,直接编码为 base64 data URL 随请求送入
     (role: reference_image);主角参考图的自动文生图仍走 fal,
     未配置 fal_api_key 时自动跳过并降级纯文生视频。
     """
 
-    _ENGINE_LABEL = "Seedance 2.5"
+    _ENGINE_LABEL = "Seedance 2.5(方舟)"
 
     # ---------------- 方舟请求要素 ----------------
 
     def _api_base(self) -> str:
-        return str(self._config["seedance25"]["api_base"]).rstrip("/")
+        return str(self._config["ark"]["api_base"]).rstrip("/")
 
     def _headers(self) -> dict:
         return {
@@ -723,10 +847,10 @@ class ArkSeedanceGenerator(_FalGenerator):
                 "火山方舟 API KEY 无效或无权限,请检查 config.yaml 中的 ark_api_key"
             )
         if resp.status_code == 404 or code in ("ModelNotFound", "ModelNotOpen"):
-            model = str(self._config["seedance25"]["model"])
+            model = str(self._config["ark"]["model"])
             return FatalGenerationError(
                 f"火山方舟模型不可用: {model}。请确认已在方舟控制台开通该模型,"
-                "并检查 config.yaml 中的 seedance25.model / seedance25.api_base"
+                "并检查 config.yaml 中的 ark.model / ark.api_base"
             )
         if resp.status_code == 402 or code in ("AccountOverdueError", "QuotaExceeded"):
             return FatalGenerationError(
@@ -745,7 +869,7 @@ class ArkSeedanceGenerator(_FalGenerator):
         self, shot: Shot, references: list[tuple[str, str]] | None
     ) -> tuple[str, dict, bool]:
         """多分镜按时间戳分块拼成单条 prompt,有主角以 reference_image 送入。"""
-        seedance25 = self._config["seedance25"]
+        ark = self._config["ark"]
         video_cfg = self._config["video"]
         combined = shot.combined_prompt.lower()
         use_reference = bool(references) and (
@@ -758,17 +882,10 @@ class ArkSeedanceGenerator(_FalGenerator):
         else:
             prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
 
-        if len(shot.cuts) > 1:
-            # 时间戳分块(官方推荐):把各分镜的时长比例明确传给模型,
-            # 避免 30 秒长镜头组的"后半段漂移"
-            prompt = join_cut_prompts_timed(
-                [(p, cut.duration) for p, cut in zip(prompts, shot.cuts)]
-            )
-        else:
-            prompt = join_cut_prompts(prompts)
+        prompt = _join_timed_prompts(prompts, shot)
         refs: list[tuple[str, str]] = []
         if use_reference:
-            refs = references[:MAX_REFERENCE_IMAGES["seedance25"]]
+            refs = references[:MAX_REFERENCE_IMAGES["ark"]]
             prompt += reference_usage_note([note for _, note in refs], "@图片{}")
         if len(prompt) > _MAX_SEEDANCE_PROMPT_CHARS:
             self._log(
@@ -784,13 +901,15 @@ class ArkSeedanceGenerator(_FalGenerator):
                 "image_url": {"url": url},
                 "role": "reference_image",
             })
-        duration = min(_ARK_MAX_SECONDS, max(_ARK_MIN_SECONDS, shot.duration))
+        duration = min(
+            _SEEDANCE25_MAX_SECONDS, max(_SEEDANCE25_MIN_SECONDS, shot.duration)
+        )
         arguments = {
-            "model": str(seedance25["model"]),
+            "model": str(ark["model"]),
             "content": content,
             # Seedance 2.5 原生支持 16:9/9:16/1:1/3:4/4:3 全部画幅,无需映射裁剪
             "ratio": str(video_cfg["aspect_ratio"]),
-            "resolution": str(seedance25["resolution"]),
+            "resolution": str(ark["resolution"]),
             "duration": duration,
             "generate_audio": bool(video_cfg["generate_audio"]),
             "watermark": False,
@@ -799,7 +918,7 @@ class ArkSeedanceGenerator(_FalGenerator):
         if negative:
             arguments["negative_prompt"] = fit_prompt(negative, _MAX_SINGLE_PROMPT_CHARS)
         try:
-            seed = int(seedance25.get("seed", -1))
+            seed = int(ark.get("seed", -1))
         except (TypeError, ValueError):
             seed = -1
         if seed >= 0:
@@ -879,6 +998,64 @@ class KlingGenerator(_FalGenerator):
         else:
             arguments["prompt"] = prompts[0]
             arguments["duration"] = str(max(3, shot.duration))
+        return endpoint, arguments, use_reference
+
+
+class GeminiGenerator(_FalGenerator):
+    """Gemini Omni Flash 1.1(Google,经 fal.ai):可选引擎(video.engine: gemini)。
+
+    单组 3~10 秒;原生同步音频始终开启(端点无音效开关);参考图经
+    image_urls 按顺序送入,无占位符语法,prompt 里以 "reference image N"
+    自然语言引用;不支持 seed 与 negative_prompt;画幅原生仅 16:9/9:16,
+    其余画幅按相邻画幅生成后由成片阶段居中裁剪。
+    """
+
+    _ENGINE_LABEL = "Gemini Omni Flash"
+
+    def generation_aspect(self, aspect: str) -> str:
+        return gemini_generation_aspect(aspect)
+
+    def _build_arguments(
+        self, shot: Shot, references: list[tuple[str, str]] | None
+    ) -> tuple[str, dict, bool]:
+        """多分镜按时间戳分块拼成单条 prompt,有主角走 image_urls 参考图。"""
+        gemini = self._config["gemini"]
+        video_cfg = self._config["video"]
+        combined = shot.combined_prompt.lower()
+        use_reference = bool(references) and (
+            "@element" in combined or "@image" in combined
+        )
+
+        refs: list[tuple[str, str]] = []
+        if use_reference:
+            endpoint = str(gemini["reference_endpoint"])
+            refs = references[:MAX_REFERENCE_IMAGES["gemini"]]
+            prompts = [element_to_reference_phrases(cut.prompt) for cut in shot.cuts]
+        else:
+            endpoint = str(gemini["text_endpoint"])
+            prompts = [strip_reference_tokens(cut.prompt) for cut in shot.cuts]
+
+        prompt = _join_timed_prompts(prompts, shot)
+        if refs:
+            prompt += reference_usage_note(
+                [note for _, note in refs], "Reference image {}", english=True
+            )
+        if len(prompt) > _MAX_SINGLE_PROMPT_CHARS:
+            self._log(
+                f"  ⚠ 镜头组 {shot.index} 提示词超长({len(prompt)} 字符),"
+                f"已裁剪到 {_MAX_SINGLE_PROMPT_CHARS} 字符内"
+            )
+            prompt = fit_prompt(prompt, _MAX_SINGLE_PROMPT_CHARS)
+
+        duration = min(_GEMINI_MAX_SECONDS, max(_GEMINI_MIN_SECONDS, int(shot.duration)))
+        arguments: dict = {
+            "prompt": prompt,
+            "duration": duration,  # 整数秒(3~10)
+            "aspect_ratio": gemini_generation_aspect(str(video_cfg["aspect_ratio"])),
+            "resolution": str(gemini["resolution"]),
+        }
+        if refs:
+            arguments["image_urls"] = [url for url, _ in refs]
         return endpoint, arguments, use_reference
 
 
@@ -1015,10 +1192,12 @@ class JimengGenerator(_FalGenerator):
 def create_generator(
     config: Config, log: LogFn, cancel_event: threading.Event | None = None
 ) -> _FalGenerator:
-    """按 video.engine 创建对应引擎的生成器(默认 seedance25)。"""
+    """按 video.engine 创建对应引擎的生成器(默认 seedance25,经 fal.ai)。"""
     cls = {
         "seedance": SeedanceGenerator,
-        "seedance25": ArkSeedanceGenerator,
+        "seedance25": Seedance25Generator,
+        "ark": ArkSeedanceGenerator,
+        "gemini": GeminiGenerator,
         "jimeng": JimengGenerator,
     }.get(config.engine, KlingGenerator)
     return cls(config, log, cancel_event=cancel_event)

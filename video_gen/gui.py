@@ -16,8 +16,9 @@ from .pipeline import GenerationCancelled, Pipeline
 _PLACEHOLDER = "例如:一只橘猫在雨后的东京街头漫步,霓虹灯倒映在水洼里,电影感画面"
 _REF_HINT_EMPTY = "未选择(有固定主角时将由 AI 自动生成形象)"
 
-# 画幅选项:显示文案 → 配置值(Seedance 原生支持全部画幅;
-# Kling 引擎下 3:4 / 4:3 由相邻画幅生成后自动居中裁剪)
+# 画幅选项:显示文案 → 配置值(Seedance 与即梦原生支持全部画幅;
+# Kling 引擎下 3:4 / 4:3、Gemini 引擎下 1:1 / 3:4 / 4:3 由相邻画幅生成后
+# 自动居中裁剪)
 _ASPECT_CHOICES = {
     "🖥 横屏 16:9": "16:9",
     "📱 竖屏 9:16": "9:16",
@@ -184,7 +185,7 @@ class App:
             self.ref_var.set(f"参考图:{picked[0][0].name}")
         else:
             self.ref_var.set(
-                f"参考图 {len(picked)} 张(用途已标注;Seedance 引擎支持多图,"
+                f"参考图 {len(picked)} 张(用途已标注;Seedance / Gemini 引擎支持多图,"
                 "Kling 仅作同一主角的多角度参考,即梦引擎不支持参考图)"
             )
         self.ref_clear_btn.config(state="normal")

@@ -63,8 +63,8 @@ _DEFAULTS: dict[str, Any] = {
     "jimeng_access_key": "",
     "jimeng_secret_key": "",
     "llm": {
-        "model": "qwen/qwen3.8-max",
-        "reasoning_effort": "high",
+        "model": "z-ai/glm-5.3",
+        "reasoning_effort": "medium",
         "max_tokens": 32000,
     },
     "seedance": {
@@ -74,6 +74,13 @@ _DEFAULTS: dict[str, Any] = {
         "price_per_second": 0.3034,
     },
     "seedance25": {
+        "text_endpoint": "bytedance/seedance-2.5/text-to-video",
+        "reference_endpoint": "bytedance/seedance-2.5/reference-to-video",
+        "resolution": "720p",
+        "seed": -1,
+        "price_per_second": 0.473,
+    },
+    "ark": {
         "model": "doubao-seedance-2-5-260628",
         "api_base": "https://ark.cn-beijing.volces.com/api/v3",
         "resolution": "720p",
@@ -84,6 +91,12 @@ _DEFAULTS: dict[str, Any] = {
         "text_endpoint": "fal-ai/kling-video/v3/pro/text-to-video",
         "reference_endpoint": "fal-ai/kling-video/o3/pro/reference-to-video",
         "price_per_second": 0.168,
+    },
+    "gemini": {
+        "text_endpoint": "google/gemini-omni-flash/v1.1/text-to-video",
+        "reference_endpoint": "google/gemini-omni-flash/v1.1/reference-to-video",
+        "resolution": "720p",
+        "price_per_second": 0.10,
     },
     "jimeng": {
         "req_key": "jimeng_ti2v_v30_pro",
@@ -120,6 +133,11 @@ _LEGACY_KLING_KEYS = (
     "aspect_ratio", "generate_audio", "clip_duration",
     "max_retries", "concurrency", "shot_timeout",
 )
+# 旧版(fal.ai 尚未上线 Seedance 2.5 时)seedance25 节即火山方舟直连的配置;
+# 现在 seedance25 指 fal.ai 端点,方舟直连改为 ark 引擎/节。这些键只属于方舟
+_LEGACY_ARK_ONLY_KEYS = ("model", "api_base")
+# 两节共有、需随引擎一起迁移的键
+_LEGACY_ARK_SHARED_KEYS = ("resolution", "seed", "price_per_second")
 
 
 def _merge(base: dict, override: dict) -> dict:
@@ -149,7 +167,7 @@ class Config:
 
     @property
     def ark_api_key(self) -> str:
-        """火山方舟(Volcengine Ark)API KEY,Seedance 2.5 引擎使用。"""
+        """火山方舟(Volcengine Ark)API KEY,ark 引擎(Seedance 2.5 方舟直连)使用。"""
         return (self._data.get("ark_api_key") or "").strip()
 
     @property
@@ -164,7 +182,8 @@ class Config:
 
     @property
     def engine(self) -> str:
-        """视频生成引擎:seedance25(默认)、seedance、kling 或 jimeng。"""
+        """视频生成引擎:seedance25(默认,fal.ai)、ark(Seedance 2.5 方舟直连)、
+        seedance、kling、gemini 或 jimeng。"""
         return str(self._data["video"].get("engine") or "seedance25").strip().lower()
 
     @property
@@ -173,14 +192,22 @@ class Config:
         return {
             "seedance": "Seedance 2.0",
             "seedance25": "Seedance 2.5",
+            "ark": "Seedance 2.5(火山方舟)",
+            "gemini": "Gemini Omni Flash 1.1",
             "jimeng": "即梦 3.0 Pro",
         }.get(self.engine, "Kling")
+
+    @property
+    def uses_fal_video(self) -> bool:
+        """视频片段是否经 fal.ai 生成(决定 fal_api_key 是否必填)。"""
+        return self.engine in ("seedance", "seedance25", "kling", "gemini")
 
     @property
     def engine_section(self) -> dict[str, Any]:
         """当前引擎的专属配置节(端点、单价等)。"""
         section = (
-            self.engine if self.engine in ("seedance", "seedance25", "jimeng")
+            self.engine
+            if self.engine in ("seedance", "seedance25", "ark", "gemini", "jimeng")
             else "kling"
         )
         return self._data[section]
@@ -208,14 +235,14 @@ class Config:
         problems = []
         if not self.openrouter_api_key:
             problems.append("config.yaml 中缺少 openrouter_api_key")
-        if self.engine == "seedance25":
-            # Seedance 2.5 经火山方舟官方 API 生成,需要方舟 KEY;
+        if self.engine == "ark":
+            # 方舟直连引擎经火山方舟官方 API 生成,需要方舟 KEY;
             # fal KEY 仅用于自动文生主角参考图,缺失时自动降级,不拦截
             if not self.ark_api_key:
                 problems.append(
-                    "config.yaml 中缺少 ark_api_key(默认引擎 Seedance 2.5 需要"
-                    "火山方舟 API KEY;若想改用 fal.ai,把 video.engine 设为"
-                    " seedance 或 kling)"
+                    "config.yaml 中缺少 ark_api_key(ark 引擎经火山方舟官方 API "
+                    "生成 Seedance 2.5,需要方舟 API KEY;若想改用 fal.ai,"
+                    "把 video.engine 设为 seedance25)"
                 )
         elif self.engine == "jimeng":
             # 即梦经火山引擎视觉智能 API 生成,用 AK/SK 签名鉴权;
@@ -227,10 +254,17 @@ class Config:
                     "「访问控制-密钥管理」中获取)"
                 )
         elif not self.fal_api_key:
-            problems.append("config.yaml 中缺少 fal_api_key")
-        if self.engine not in ("seedance", "seedance25", "kling", "jimeng"):
             problems.append(
-                "video.engine 需为 seedance / seedance25 / kling / jimeng 之一"
+                "config.yaml 中缺少 fal_api_key(默认引擎 Seedance 2.5 经 fal.ai "
+                "生成;若想改用火山方舟官方 API,填 ark_api_key 并把 video.engine "
+                "设为 ark)"
+            )
+        if self.engine not in (
+            "seedance", "seedance25", "ark", "kling", "gemini", "jimeng"
+        ):
+            problems.append(
+                "video.engine 需为 seedance25 / ark / seedance / kling / gemini / "
+                "jimeng 之一"
             )
         if not 3 <= int(self._data["video"]["clip_duration"]) <= 15:
             problems.append("video.clip_duration 需在 3~15 秒之间")
@@ -243,26 +277,29 @@ class Config:
         ):
             problems.append("seedance.resolution 需为 480p / 720p / 1080p / 4k 之一")
         if str(self._data["seedance25"]["resolution"]) not in (
+            "480p", "720p", "1080p"
+        ):
+            problems.append("seedance25.resolution 需为 480p / 720p / 1080p 之一")
+        if str(self._data["ark"]["resolution"]) not in (
             "480p", "720p", "1080p", "2k", "4k"
         ):
-            problems.append(
-                "seedance25.resolution 需为 480p / 720p / 1080p / 2k / 4k 之一"
-            )
-        try:
-            int(self._data["seedance25"].get("seed", -1))
-        except (TypeError, ValueError):
-            problems.append("seedance25.seed 需为整数(-1 表示每次随机)")
-        try:
-            int(self._data["jimeng"].get("seed", -1))
-        except (TypeError, ValueError):
-            problems.append("jimeng.seed 需为整数(-1 表示每次随机)")
+            problems.append("ark.resolution 需为 480p / 720p / 1080p / 2k / 4k 之一")
+        if str(self._data["gemini"]["resolution"]) not in (
+            "360p", "720p", "1080p", "4k"
+        ):
+            problems.append("gemini.resolution 需为 360p / 720p / 1080p / 4k 之一")
+        for section in ("seedance25", "ark", "jimeng"):
+            try:
+                int(self._data[section].get("seed", -1))
+            except (TypeError, ValueError):
+                problems.append(f"{section}.seed 需为整数(-1 表示每次随机)")
         if not 10 <= int(self._data["video"]["target_duration"]) <= 600:
             problems.append("video.target_duration 需在 10~600 秒之间")
         if float(self._data["video"]["transition"]) < 0:
             problems.append("video.transition 不能为负数")
         if not 0 <= float(self._data["narration"]["volume"]) <= 2:
             problems.append("narration.volume 需在 0~2 之间")
-        for section in ("seedance", "seedance25", "kling", "jimeng"):
+        for section in ("seedance", "seedance25", "ark", "kling", "gemini", "jimeng"):
             if float(self._data[section]["price_per_second"]) < 0:
                 problems.append(
                     f"{section}.price_per_second 不能为负数(设 0 可关闭费用预估)"
@@ -291,4 +328,39 @@ def load_config() -> Config:
                 video_section = user_data.setdefault("video", {}) or {}
                 user_data["video"] = video_section
                 video_section.setdefault(key, legacy.pop(key))
+    _migrate_legacy_ark(user_data)
     return Config(_merge(_DEFAULTS, user_data))
+
+
+def _migrate_legacy_ark(user_data: dict) -> None:
+    """兼容旧版配置:当年 fal.ai 尚未上线 Seedance 2.5,seedance25 节与
+    seedance25 引擎都指火山方舟直连;现在 seedance25 指 fal.ai,方舟直连
+    改名为 ark。迁移规则:
+    - seedance25 节里方舟专属的 model/api_base 一律搬到 ark 节;
+    - 旧配置选了 seedance25 引擎、只填了 ark_api_key 而没填 fal_api_key,
+      显然是在用方舟直连,自动改为 ark 引擎并把 resolution/seed/单价一并
+      搬过去,避免升级后无故报「缺少 fal_api_key」。
+    """
+    legacy = user_data.get("seedance25")
+    if not isinstance(legacy, dict):
+        return
+    ark_section = user_data.get("ark")
+    if not isinstance(ark_section, dict):
+        ark_section = {}
+    for key in _LEGACY_ARK_ONLY_KEYS:
+        if key in legacy:
+            ark_section.setdefault(key, legacy.pop(key))
+    video_section = user_data.get("video")
+    if not isinstance(video_section, dict):
+        video_section = {}
+    engine = str(video_section.get("engine") or "seedance25").strip().lower()
+    ark_key = str(user_data.get("ark_api_key") or "").strip()
+    fal_key = str(user_data.get("fal_api_key") or "").strip()
+    if engine == "seedance25" and ark_key and not fal_key:
+        video_section["engine"] = "ark"
+        user_data["video"] = video_section
+        for key in _LEGACY_ARK_SHARED_KEYS:
+            if key in legacy:
+                ark_section.setdefault(key, legacy.pop(key))
+    if ark_section:
+        user_data["ark"] = ark_section
