@@ -13,6 +13,7 @@ from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 from .config import (
     CONFIG_PATH,
     DEFAULT_ENGINE,
+    DEFAULT_NARRATION_MODE,
     ENGINES,
     LLM_MODEL_PRESETS,
     app_dir,
@@ -44,6 +45,12 @@ _DURATION_CHOICES = {
     "30 秒": 30,
     "1 分钟": 60,
     "2 分钟": 120,
+}
+# 旁白方式(显示文案 → narration.mode 配置值)
+_NARRATION_CHOICES = {
+    "原生配音": "native",
+    "TTS 合成": "tts",
+    "关闭": "off",
 }
 
 
@@ -121,7 +128,9 @@ class App:
         ttk.Button(bar, text="打开输出文件夹", command=self._open_output_dir).pack(side="left", padx=(8, 0))
         ttk.Button(bar, text="打开配置文件", command=self._open_config).pack(side="left", padx=(8, 0))
 
-        default_aspect, default_duration, default_subtitles = self._config_defaults()
+        default_aspect, default_duration, default_subtitles, default_narration = (
+            self._config_defaults()
+        )
         # 画幅与时长下拉框以显示文案为值,提交时经映射表转回配置值
         self.aspect_var = tk.StringVar(
             value=next(
@@ -149,6 +158,18 @@ class App:
         ttk.Checkbutton(
             bar, text="旁白字幕", variable=self.subtitle_var
         ).pack(side="right", padx=(0, 16))
+        # 旁白方式:原生配音(视频模型画外音,默认)/ TTS 合成 / 关闭
+        self.narration_var = tk.StringVar(
+            value=next(
+                (label for label, v in _NARRATION_CHOICES.items() if v == default_narration),
+                next(iter(_NARRATION_CHOICES)),
+            )
+        )
+        ttk.Combobox(
+            bar, textvariable=self.narration_var, state="readonly",
+            values=list(_NARRATION_CHOICES), width=9,
+        ).pack(side="right", padx=(0, 10))
+        ttk.Label(bar, text="旁白:").pack(side="right", padx=(0, 4))
 
         prog_frame = ttk.Frame(self.root)
         prog_frame.pack(fill="x", padx=12)
@@ -352,19 +373,21 @@ class App:
         self.ref_clear_btn.config(state="disabled")
 
     @staticmethod
-    def _config_defaults() -> tuple[str, int, bool]:
-        """界面选项默认值取自 config.yaml:画幅、目标时长(取最接近的档位)与字幕开关。"""
-        aspect, duration, subtitles = "", 60, True
+    def _config_defaults() -> tuple[str, int, bool, str]:
+        """界面选项默认值取自 config.yaml:画幅、目标时长(取最接近的档位)、
+        字幕开关与旁白方式。"""
+        aspect, duration, subtitles, narration = "", 60, True, DEFAULT_NARRATION_MODE
         try:
             config = load_config()
             aspect = str(config["video"]["aspect_ratio"])
             duration = int(config["video"]["target_duration"])
             subtitles = bool(config["narration"]["subtitles"])
+            narration = config.narration_mode
         except Exception:  # noqa: BLE001 - 首次启动可能还没有配置文件
             pass
         if aspect not in _ASPECT_CHOICES.values():
             aspect = "16:9"
-        return aspect, duration, subtitles
+        return aspect, duration, subtitles, narration
 
     # ---------------- 事件 ----------------
 
@@ -399,7 +422,7 @@ class App:
         if problems:
             messagebox.showerror("配置错误", "\n".join(problems))
             return
-        # 界面上选择的画幅、时长与字幕开关优先于 config.yaml
+        # 界面上选择的画幅、时长、字幕开关与旁白方式优先于 config.yaml
         config["video"]["aspect_ratio"] = _ASPECT_CHOICES.get(
             self.aspect_var.get(), "16:9"
         )
@@ -407,6 +430,10 @@ class App:
             self.duration_var.get(), 60
         )
         config["narration"]["subtitles"] = bool(self.subtitle_var.get())
+        config["narration"]["mode"] = _NARRATION_CHOICES.get(
+            self.narration_var.get(), DEFAULT_NARRATION_MODE
+        )
+        config["narration"]["enabled"] = True  # 界面选择覆盖旧配置的 enabled: false
 
         self._final_path = None
         self._cancel_event = threading.Event()

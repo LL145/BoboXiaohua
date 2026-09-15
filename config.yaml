@@ -55,15 +55,16 @@ kling:
 image:
   endpoint: "fal-ai/nano-banana-2"
 
-# 旁白解说(Edge TTS,免费)
+# 旁白解说(是否需要旁白由导演模型判断)
 narration:
-  # 由导演模型判断影片是否需要旁白
-  enabled: true
+  # 旁白方式:native 由视频模型原生配画外音(默认,声音自然)/ tts 用 Edge TTS 合成后混入 / off 不要旁白(界面选择优先)
+  mode: "native"
+  # 字幕默认开关(界面勾选优先)
+  subtitles: true
+  # ---- 以下仅 tts 方式生效 ----
   # 常用中文音色:zh-CN-XiaoxiaoNeural(女)/ zh-CN-YunxiNeural(男)
   voice: "zh-CN-XiaoxiaoNeural"
   volume: 1.0
-  # 字幕默认开关(界面勾选优先)
-  subtitles: true
   # Edge TTS 失败时的付费后备(fal.ai MiniMax,约 $0.10/千字);留空则不启用
   fallback_endpoint: "fal-ai/minimax/speech-02-hd"
   # 后备音色(MiniMax voice_id)

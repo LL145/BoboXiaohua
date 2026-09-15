@@ -73,6 +73,7 @@ class EngineSpec:
     native_aspects: tuple[str, ...]  # 原生画幅;其余画幅按相邻画幅生成后成片居中裁剪
     max_reference_images: int        # 参考图张数上限
     reference_notes: bool = True     # 各图的用途说明是否生效(Kling 仅作多角度参考)
+    audio_always_on: bool = False    # 原生音频始终开启、不受 video.generate_audio 控制(Gemini)
 
 
 # 视频引擎(全部经 fal.ai):配置值 → 能力表;顺序即界面下拉框顺序,首项为默认。
@@ -85,6 +86,7 @@ ENGINES: dict[str, EngineSpec] = {
         prompt_language="英文",
         native_aspects=("16:9", "9:16"),
         max_reference_images=10,
+        audio_always_on=True,
     ),
     "seedance25": EngineSpec(
         name="Seedance 2.5",
@@ -135,6 +137,9 @@ LLM_MODEL_PRESETS: tuple[str, ...] = (
 )
 # 角色台词的默认语言(写进导演系统提示词;用户创意明确要求其他语言时除外)
 DEFAULT_DIALOGUE_LANGUAGE = "中文普通话"
+# 旁白方式:native 视频模型原生配画外音 / tts Edge TTS 合成后混入 / off 不要旁白
+NARRATION_MODES: tuple[str, ...] = ("native", "tts", "off")
+DEFAULT_NARRATION_MODE = NARRATION_MODES[0]
 
 _DEFAULTS: dict[str, Any] = {
     "openrouter_api_key": "",
@@ -174,6 +179,9 @@ _DEFAULTS: dict[str, Any] = {
     },
     "image": {"endpoint": "fal-ai/nano-banana-2"},
     "narration": {
+        # 旁白方式:native 由视频模型原生配画外音(默认)/ tts 由 Edge TTS 合成 / off 不要旁白
+        "mode": "native",
+        # 旧配置兼容:enabled: false 等同 mode: off
         "enabled": True,
         "voice": "zh-CN-XiaoxiaoNeural",
         "volume": 1.0,
@@ -287,6 +295,32 @@ class Config:
             return 0.0
 
     @property
+    def narration_mode(self) -> str:
+        """配置的旁白方式(native / tts / off);旧配置 enabled: false 视为 off,
+        非法值回退默认。是否真能原生配音还取决于引擎音频开关,见 effective_narration_mode。"""
+        section = self._data["narration"]
+        if not bool(section.get("enabled", True)):
+            return "off"
+        mode = str(section.get("mode") or "").strip().lower()
+        return mode if mode in NARRATION_MODES else DEFAULT_NARRATION_MODE
+
+    @property
+    def effective_narration_mode(self) -> str:
+        """本次生成实际采用的旁白方式:native 需要引擎原生音频开启
+        (Gemini 始终开启;其余引擎关掉 video.generate_audio 时改用 tts)。"""
+        mode = self.narration_mode
+        if mode == "native" and not self.native_audio_enabled:
+            return "tts"
+        return mode
+
+    @property
+    def native_audio_enabled(self) -> bool:
+        """当前引擎本次是否会生成原生音频(音效/台词/画外音)。"""
+        return self.engine_spec.audio_always_on or bool(
+            self._data["video"].get("generate_audio", True)
+        )
+
+    @property
     def dialogue_language(self) -> str:
         """角色台词的默认语言(留空时回退为中文普通话)。"""
         value = str(self._data["video"].get("dialogue_language") or "").strip()
@@ -339,6 +373,9 @@ class Config:
             problems.append("video.transition 不能为负数")
         if not 0 <= float(self._data["narration"]["volume"]) <= 2:
             problems.append("narration.volume 需在 0~2 之间")
+        mode = str(self._data["narration"].get("mode") or DEFAULT_NARRATION_MODE).strip().lower()
+        if mode not in NARRATION_MODES:
+            problems.append("narration.mode 需为 " + " / ".join(NARRATION_MODES) + " 之一")
         for section in ENGINES:
             price = self._data[section].get("price_per_second", 0)
             values = price.values() if isinstance(price, dict) else [price]

@@ -135,6 +135,7 @@ class Storyboard:
     shots: list[Shot]
     reference_prompt: str = ""  # 主角参考图的文生图提示词,空串表示无固定主角
     bgm_file: str = ""          # 导演按情绪挑选的背景音乐文件名,空串表示未选
+    narrator_voice: str = ""    # 旁白声线描述(原生配音时逐组附进 prompt 保持声线一致)
 
     @property
     def total_duration(self) -> int:
@@ -150,6 +151,7 @@ class Storyboard:
             "logline": self.logline,
             "reference_prompt": self.reference_prompt,
             "bgm_file": self.bgm_file,
+            "narrator_voice": self.narrator_voice,
             "shots": [s.to_dict() for s in self.shots],
         }
 
@@ -160,6 +162,7 @@ class Storyboard:
             logline=data["logline"],
             reference_prompt=data.get("reference_prompt", ""),
             bgm_file=data.get("bgm_file", ""),
+            narrator_voice=str(data.get("narrator_voice", "")),
             shots=[Shot.from_dict(raw) for raw in data["shots"]],
         )
 
@@ -189,6 +192,13 @@ _STORYBOARD_SCHEMA = {
                 "Empty string if there is no recurring subject."
             ),
         },
+        "narrator_voice": {
+            "type": "string",
+            "description": (
+                "旁白声线的固定描述(性别、年龄感、语气,按系统提示词要求的语言),"
+                "全片只写一次;影片没有旁白时置空字符串"
+            ),
+        },
         "shots": {
             "type": "array",
             "description": (
@@ -207,8 +217,8 @@ _STORYBOARD_SCHEMA = {
                     "narration": {
                         "type": "string",
                         "description": (
-                            "该镜头组的中文旁白解说词(口语自然,约每秒 4 个字,"
-                            "字数不超过组时长×4)。整部影片不需要旁白时置空字符串"
+                            "该镜头组的中文旁白解说词(口语自然,遵守系统提示词"
+                            "给出的字数上限)。整部影片不需要旁白时置空字符串"
                         ),
                     },
                     "transition": {
@@ -261,7 +271,9 @@ _STORYBOARD_SCHEMA = {
             },
         },
     },
-    "required": ["title", "logline", "style_anchor", "reference_prompt", "shots"],
+    "required": [
+        "title", "logline", "style_anchor", "reference_prompt", "narrator_voice", "shots",
+    ],
     "additionalProperties": False,
 }
 
@@ -309,14 +321,10 @@ style_anchor 的风格词。该参考图会作为角色元素随每个镜头组�
 所有 prompt 中都不得出现 @Element1。
 
 ## 声音设计(重要)
-先判断本片的叙事声音形态,二选一:
-- 解说型(科普、产品介绍、纪录片、广告、故事旁白等叙述性题材):为每个镜头组的 \
-narration 字段撰写中文旁白。要求:口语自然、贴合画面;语速约每秒 4 个字,\
-每组字数不超过"组时长 × 4",宁短勿长;所有组的旁白连起来必须是一篇完整流畅的解说词。
-- 沉浸型(氛围片、MV、纯剧情等):所有镜头组的 narration 一律置空字符串。
-角色台词(两种形态下都可用):**所有角色台词一律使用{dialogue_language}**(除非用户创意\
+{narration_rule}
+角色台词:**所有角色台词一律使用{dialogue_language}**(除非用户创意\
 明确要求其他语言),绝不写其他语言的台词。需要角色开口说话时,把台词直接写进对应分镜的 \
-prompt,格式如 {dialogue_example}(模型会原生生成配音与口型)。解说型影片中,\
+prompt,格式如 {dialogue_example}(模型会原生生成配音与口型)。有旁白的影片中,\
 带台词的分镜要避免与旁白抢话,该组旁白应留白或极简。环境音效由模型自动生成,\
 除引擎说明另有要求外无需描述;绝不在 prompt 里要求配乐——背景音乐由程序统一混入。
 
@@ -341,9 +349,40 @@ text, watermark, extra limbs, deformed hands, flickering)。
 ## 输出格式
 只输出一个 JSON 对象(不要 Markdown 代码块、不要任何解释文字),字段为:
 title(string)、logline(string)、style_anchor(string)、reference_prompt(string)、\
-shots(数组,每项含 title、negative_prompt、narration、transition、cuts;cuts 为数组,\
-每项含 prompt、duration);若用户消息中提供了背景音乐列表,则额外包含 bgm_file(string)。
+narrator_voice(string)、shots(数组,每项含 title、negative_prompt、narration、\
+transition、cuts;cuts 为数组,每项含 prompt、duration);若用户消息中提供了背景音乐\
+列表,则额外包含 bgm_file(string)。
 """
+
+# 系统提示词的旁白规则,按 narration.mode 渲染(见 config.NARRATION_MODES):
+# native 由视频模型在生成画面时原生配画外音(程序把旁白附在该组 prompt 末尾),
+# tts 由 Edge TTS 事后合成混入,off 不要旁白
+_NARRATION_RULES = {
+    "native": """\
+先判断本片的叙事声音形态,二选一:
+- 解说型(科普、产品介绍、纪录片、教程等以讲解为主的题材):为每个镜头组的 \
+narration 字段撰写中文旁白。旁白会由视频模型在生成该组画面时**原生配成画外音**\
+(程序自动把旁白附在该组提示词末尾,你不要把旁白写进分镜 prompt)。要求:口语自然、\
+贴合画面、像真人解说而不是广告文案;每组字数不超过"组时长 × 3"(必须留出呼吸,\
+宁短勿长,允许个别组留空);所有组的旁白连起来必须是一篇完整流畅的解说词。\
+同时在 narrator_voice 字段用一句{prompt_language}固定描述旁白声线(性别、年龄感、\
+语气,如 {narrator_example}),全片只写一次,程序会逐组附上以保持各组声线一致。
+- 沉浸型(氛围片、MV、剧情片、广告等靠画面与台词表达的题材):所有镜头组的 \
+narration 与 narrator_voice 一律置空字符串。
+""",
+    "tts": """\
+先判断本片的叙事声音形态,二选一:
+- 解说型(科普、产品介绍、纪录片、广告、故事旁白等叙述性题材):为每个镜头组的 \
+narration 字段撰写中文旁白(由程序事后用语音合成配音并混入)。要求:口语自然、\
+贴合画面;语速约每秒 4 个字,每组字数不超过"组时长 × 4",宁短勿长;所有组的旁白\
+连起来必须是一篇完整流畅的解说词。narrator_voice 置空字符串。
+- 沉浸型(氛围片、MV、纯剧情等):所有镜头组的 narration 与 narrator_voice 一律置空字符串。
+""",
+    "off": """\
+本片不要旁白:所有镜头组的 narration 与 narrator_voice 一律置空字符串,\
+叙事全部依靠画面、角色台词与环境音完成。
+""",
+}
 
 # 系统提示词中随 prompt 语言变化的示例与长度规则
 # (Seedance 系引擎用中文撰写分镜,Kling 与 Gemini 用英文,见 config.ENGINES;
@@ -357,6 +396,7 @@ _LANG_PROMPT_PARTS = {
         "camera_example": '如"缓慢推近,中近景"/"航拍跟随,广角"',
         "lighting_example": '如"黄金时刻逆光"/"清晨薄雾漫射光"',
         "dialogue_example": '……年轻女子抬起头,说:"我们出发吧"……',
+        "narrator_example": '"沉稳的中年男声,纪录片解说语气,语速从容"',
         "length_rule": (
             "**长度约束**:每条分镜 prompt(含 style_anchor、角色外观描述与 "
             "@Element1 占位符)总长控制在 220 个字以内;style_anchor 与外观描述"
@@ -376,6 +416,9 @@ _LANG_PROMPT_PARTS = {
         "dialogue_example": (
             '... the young woman looks up and says in Chinese: "我们出发吧" ...'
             "(中文台词保留中文原文)"
+        ),
+        "narrator_example": (
+            '"calm middle-aged male narrator, documentary tone, unhurried pace"'
         ),
         "length_rule": (
             "**长度硬约束**:每条分镜 prompt(含 style_anchor、角色外观描述与 "
@@ -528,16 +571,22 @@ class Director:
         max_shots = max(1, -(-total_max // min_group))
 
         prompt_language = spec.prompt_language
+        lang_parts = _LANG_PROMPT_PARTS[prompt_language]
+        narration_mode = config.effective_narration_mode
+        narration_rule = _NARRATION_RULES[narration_mode].format(
+            prompt_language=prompt_language, **lang_parts
+        )
         system = _SYSTEM_PROMPT.format(
             engine_name=spec.name,
             prompt_language=prompt_language,
             dialogue_language=config.dialogue_language,
+            narration_rule=narration_rule,
             group_min=min_group,
             group_max=max_group,
             target=target,
             total_min=total_min,
             total_max=total_max,
-            **_LANG_PROMPT_PARTS[prompt_language],
+            **lang_parts,
         )
 
         user_message = f"请为以下创意撰写分镜脚本:\n\n{description}"
@@ -674,7 +723,8 @@ class Director:
                 )
         parsed = _extract_json(content)
         storyboard = self._build_storyboard(
-            parsed, max_shots, fallback_duration, min_group, max_group
+            parsed, max_shots, fallback_duration, min_group, max_group,
+            narration_mode=narration_mode,
         )
         return storyboard
 
@@ -739,17 +789,19 @@ class Director:
     @classmethod
     def _build_storyboard(
         cls, data: dict, max_shots: int, fallback_duration: int,
-        min_group: int, max_group: int,
+        min_group: int, max_group: int, narration_mode: str = "native",
     ) -> Storyboard:
         raw_shots = data["shots"][:max_shots]
         if not raw_shots:
             raise KeyError("shots 为空")
+        # 关闭旁白时即使模型仍写了 narration 也一律丢弃
+        keep_narration = narration_mode != "off"
         shots = [
             Shot(
                 index=i + 1,
                 title=str(raw["title"]),
                 negative_prompt=str(raw.get("negative_prompt", "")),
-                narration=str(raw.get("narration", "")).strip(),
+                narration=str(raw.get("narration", "")).strip() if keep_narration else "",
                 transition=_normalize_transition(raw.get("transition")),
                 cuts=cls._build_cuts(raw, fallback_duration, min_group, max_group),
             )
@@ -760,6 +812,7 @@ class Director:
             logline=str(data["logline"]),
             reference_prompt=str(data.get("reference_prompt", "")).strip(),
             bgm_file=str(data.get("bgm_file", "")).strip(),
+            narrator_voice=str(data.get("narrator_voice", "")).strip() if keep_narration else "",
             shots=shots,
         )
 

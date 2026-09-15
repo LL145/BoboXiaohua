@@ -53,7 +53,11 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
    用户可上传参考图(可多张,各带用途说明):随创意以多模态消息(最多 4 张,
    `_MAX_DIRECTOR_IMAGES`)发给导演模型照图撰写 @Element1 外观描述,
    模型不支持图片输入时自动去图重试(文字说明仍列出各图用途)。导演同时决定声音形态:
-   解说型逐组写中文旁白(`narration` 字段),沉浸型全部置空;系统提示词禁止在分镜
+   解说型逐组写中文旁白(`narration` 字段),沉浸型全部置空;旁白规则按
+   `config.effective_narration_mode` 从 `_NARRATION_RULES` 渲染进系统提示词
+   (`native` 默认:旁白由视频模型原生配画外音,字数上限组时长×3,并在
+   `Storyboard.narrator_voice` 用 prompt 语言固定一段声线描述;`tts`:事后合成,
+   字数上限组时长×4;`off`:一律置空,解析时也强制清空);系统提示词禁止在分镜
    prompt 里要求配乐(背景音乐由程序统一混入);Gemini 的 `_ENGINE_NOTES` 额外要求
    每条分镜末尾写明英文声音设计、单分镜组写明 "single continuous shot, no cuts"
    (该引擎不写明就会自行配乐/自行切分镜头);角色台词直接写进分镜
@@ -114,9 +118,14 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
      16:9/9:16/1:1,3:4、4:3 经 `config.generation_aspect` 映射生成,拼接后由
      `assembler.crop_to_aspect` 居中裁剪(在字幕烧录之前);端点无分辨率参数
      (能力表 `resolutions` 为空,界面分辨率框禁用)。
+   **原生旁白**(`narration.mode: native`,默认):pipeline 生成前设定
+   `generator.narration_mode`/`narrator_voice`,`_voiceover` 经 `voiceover_note`
+   把该组中文旁白写成画外音指令(语言随引擎 prompt 语言,声线逐组重复)附在
+   prompt 末尾;Kling 多分镜经 `split_narration_by_cuts` 按分镜时长比例整句拆分
+   到各 multi_prompt 分镜。
    `FatalGenerationError`(KEY 无效/余额不足/端点不存在)立即终止全部镜头组;
    422 参数校验错误是确定性的,跳过重试直接降级/报错;其余错误逐组重试。
-3. **tts.py** — Edge TTS(免费)合成导演写的中文旁白,逐组落盘
+3. **tts.py** — 仅 `narration.mode: tts` 时使用:Edge TTS(免费)合成导演写的中文旁白,逐组落盘
    `narration_XX.mp3`(断点续传复用),同步记录逐句精确时间轴
    `narration_XX.timeline.json`(SentenceBoundary 事件)供字幕对齐,
    旧版 edge-tts 只有词边界时按句子字数归组推算;SRT 生成优先用该时间轴,
@@ -131,7 +140,9 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
    无损拼接;返回各镜头组在成片时间轴上的偏移,供旁白与字幕定位。旁白超长时先用
    edge-tts 语速参数(+N%,≤40)重合成(音质自然),仍超长才 atempo 加速≤1.4
    并截断;`mix_narration` 把原生音轨以旁白为侧链做 `sidechaincompress` 闪避
-   (旁白时压低,间隙恢复),侧链失败退回等量 amix;字幕优先烧录(libass,使用随程序分发的
+   (旁白时压低,间隙恢复),侧链失败退回等量 amix(以上仅 tts 方式;原生旁白已在
+   片段音轨里,pipeline `_native_narration_srt` 只按镜头组偏移与句子字数估算字幕);
+   字幕优先烧录(libass,使用随程序分发的
    `fonts/` 内 Noto Sans SC 字体,缺失时回退平台系统字体),失败退 mp4 软字幕;
    `music/` 目录有音频时由导演挑选一首混入(bgm)。每级失败都沿用上一级产物。
 5. **config.py** — 读取程序目录 `config.yaml`,与 `_DEFAULTS` 深合并;`app_dir()` 兼容
@@ -143,7 +154,11 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
    aspect)` 给出实际生成画幅;`LLM_MODEL_PRESETS` 为编剧模型候选。费用预估单价
    `<engine>.price_per_second` 为「分辨率 → 美元/秒」映射(旧配置的单个数字仍兼容;
    Kling 无分辨率参数,关音效时取 `price_per_second_no_audio`),`Config.price_per_second`
-   按当前引擎/分辨率/音效开关取值,未登记的分辨率取最贵一档。
+   按当前引擎/分辨率/音效开关取值,未登记的分辨率取最贵一档。旁白方式
+   `narration.mode`(`NARRATION_MODES`:native/tts/off,旧配置 `enabled: false`
+   等同 off)经 `Config.narration_mode` 读取;`effective_narration_mode` 在引擎
+   原生音频关闭时(能力表 `audio_always_on` 为假且 `video.generate_audio` 为假)
+   把 native 降为 tts。
    `save_settings({"llm.model": …, "video.engine": …})` 把界面设置写回
    `config.yaml`:逐行改写对应键(`_set_yaml_value`,保留其余行与注释,缺键则
    补行),写完用 YAML 解析校验,校验失败才整体 `safe_dump` 重写。
@@ -152,7 +167,8 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
 6. **gui.py** — Tkinter 界面;顶部「设置」区(`_build_settings`)有两个 API KEY、
    编剧模型(可选可填)、视频引擎与分辨率(随引擎变化,各引擎各自记住上次选择),
    点「保存设置」或「生成」时经 `save_settings` 落盘,生成前再把这些值覆盖进本次
-   `Config`(写盘失败也能按界面设置生成)。工作线程经队列把日志/进度转回主线程,
+   `Config`(写盘失败也能按界面设置生成);底部工具栏的画幅/时长/字幕/旁白方式
+   (`_NARRATION_CHOICES`)只覆盖本次 `Config`,不写盘。工作线程经队列把日志/进度转回主线程,
    不直接碰控件。
 
 ## 关键约定
@@ -160,7 +176,9 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
 - **断点续传**:任务目录(`output/日期_标题_<描述哈希>/`)落盘 `manifest.json`
   (描述、画幅、目标时长、引擎、storyboard)与各 `shot_XX.mp4`。同一描述再次生成时
   复用已有脚本与片段,只补缺失镜头;画幅、目标时长或引擎不同的旧任务不续传
-  (无 `engine` 字段的旧 manifest 视为 kling 任务)——所以 `Shot`/`Storyboard`
+  (无 `engine` 字段的旧 manifest 视为 kling 任务),有旁白且旁白方式
+  (`narration_mode`,缺省视为 tts)不同的旧任务也不续传(原生旁白已烧进片段
+  音轨)——所以 `Shot`/`Storyboard`
   字段变更要保持 `from_dict` 对旧 manifest 兼容(用 `.get()` + 默认值)。
 - **配置兼容**:引擎无关参数(画幅/音效/重试/并发/超时等)在 `video` 节,引擎专属
   参数在 `gemini`/`seedance25`/`seedance`/`kling` 节;`load_config` 会把旧版配置中
