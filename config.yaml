@@ -14,7 +14,17 @@ llm:
   reasoning_effort: "medium"
   max_tokens: 32000
 
-# Seedance 2.5(默认引擎):单组最长 30 秒,参考图最多 30 张
+# Gemini Omni Flash 1.1(默认引擎):单组 3~10 秒,音频始终开启;
+# 仅 16:9 / 9:16 原生,其余画幅按相邻画幅生成后居中裁剪
+gemini:
+  text_endpoint: "google/gemini-omni-flash/v1.1/text-to-video"
+  reference_endpoint: "google/gemini-omni-flash/v1.1/reference-to-video"
+  # 360p / 720p / 1080p / 4k
+  resolution: "720p"
+  # 费用预估单价(美元/秒),0 为不显示
+  price_per_second: 0.10
+
+# Seedance 2.5:单组最长 30 秒,参考图最多 30 张
 seedance25:
   text_endpoint: "bytedance/seedance-2.5/text-to-video"
   reference_endpoint: "bytedance/seedance-2.5/reference-to-video"
@@ -22,7 +32,6 @@ seedance25:
   resolution: "720p"
   # 随机种子,-1 为每次随机(仅带参考图的镜头组生效)
   seed: -1
-  # 费用预估单价(美元/秒),0 为不显示
   price_per_second: 0.473
 
 # Seedance 2.0:单组最长 15 秒
@@ -33,20 +42,12 @@ seedance:
   resolution: "720p"
   price_per_second: 0.3034
 
-# Kling 3:费用较低;3:4 / 4:3 画幅按相邻画幅生成后居中裁剪
+# Kling 3:3:4 / 4:3 画幅按相邻画幅生成后居中裁剪
 kling:
   text_endpoint: "fal-ai/kling-video/v3/pro/text-to-video"
   reference_endpoint: "fal-ai/kling-video/o3/pro/reference-to-video"
   # 开启原生音效的单价;关闭音效约 0.112
   price_per_second: 0.168
-
-# Gemini Omni Flash 1.1:单组 3~10 秒,音频始终开启;仅 16:9 / 9:16 原生,其余裁剪
-gemini:
-  text_endpoint: "google/gemini-omni-flash/v1.1/text-to-video"
-  reference_endpoint: "google/gemini-omni-flash/v1.1/reference-to-video"
-  # 360p / 720p / 1080p / 4k
-  resolution: "720p"
-  price_per_second: 0.10
 
 # 主角参考图的文生图模型(fal.ai)
 image:
@@ -64,13 +65,13 @@ narration:
 
 # 成片与生成参数
 video:
-  # 视频引擎:seedance25 / seedance / kling / gemini(界面选择优先)
-  engine: "seedance25"
+  # 视频引擎:gemini / seedance25 / seedance / kling(界面选择优先)
+  engine: "gemini"
   # 默认画幅:16:9 / 9:16 / 1:1 / 4:3 / 3:4(界面选择优先)
   aspect_ratio: "16:9"
   # 角色台词的默认语言(用户创意明确要求其他语言时除外)
   dialogue_language: "中文普通话"
-  # 原生音效与台词配音(Kling 关闭可省约 1/3 费用;Gemini 始终开启)
+  # 原生音效与台词配音(Gemini 始终开启;Kling 关闭可省约 1/3 费用)
   generate_audio: true
   # 模型未给出分镜时长时的回退值(秒),3~15
   clip_duration: 10

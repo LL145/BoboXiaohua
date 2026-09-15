@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -58,20 +58,72 @@ def bundled_font_dir() -> Path | None:
 
 CONFIG_PATH = app_dir() / "config.yaml"
 
-# 视频引擎(全部经 fal.ai):配置值 → 展示名;顺序即界面下拉框顺序,首项为默认
-ENGINES: dict[str, str] = {
-    "seedance25": "Seedance 2.5",
-    "seedance": "Seedance 2.0",
-    "kling": "Kling 3",
-    "gemini": "Gemini Omni Flash 1.1",
+ALL_ASPECTS = ("16:9", "9:16", "1:1", "3:4", "4:3")
+
+
+@dataclass(frozen=True)
+class EngineSpec:
+    """一个视频引擎的能力描述:director/pipeline/gui/generator 各处按此查表,
+    引擎之间的差异只登记在这里,不散落成 if engine == … 分支。"""
+
+    name: str                        # 展示名(界面下拉框与日志)
+    resolutions: tuple[str, ...]     # 可选分辨率;空元组表示端点不接受分辨率参数
+    group_seconds: tuple[int, int]   # 单个镜头组一次生成的时长下限/上限(秒)
+    prompt_language: str             # 分镜 prompt 语言:"中文" / "英文"
+    native_aspects: tuple[str, ...]  # 原生画幅;其余画幅按相邻画幅生成后成片居中裁剪
+    max_reference_images: int        # 参考图张数上限
+    reference_notes: bool = True     # 各图的用途说明是否生效(Kling 仅作多角度参考)
+
+
+# 视频引擎(全部经 fal.ai):配置值 → 能力表;顺序即界面下拉框顺序,首项为默认。
+# 字节系 Seedance 对中文提示词有官方一等支持,Kling / Gemini 用英文
+ENGINES: dict[str, EngineSpec] = {
+    "gemini": EngineSpec(
+        name="Gemini Omni Flash 1.1",
+        resolutions=("360p", "720p", "1080p", "4k"),
+        group_seconds=(3, 10),
+        prompt_language="英文",
+        native_aspects=("16:9", "9:16"),
+        max_reference_images=10,
+    ),
+    "seedance25": EngineSpec(
+        name="Seedance 2.5",
+        resolutions=("480p", "720p", "1080p"),
+        group_seconds=(4, 30),
+        prompt_language="中文",
+        native_aspects=ALL_ASPECTS,
+        max_reference_images=30,
+    ),
+    "seedance": EngineSpec(
+        name="Seedance 2.0",
+        resolutions=("480p", "720p", "1080p", "4k"),
+        group_seconds=(4, 15),
+        prompt_language="中文",
+        native_aspects=ALL_ASPECTS,
+        max_reference_images=9,
+    ),
+    "kling": EngineSpec(
+        name="Kling 3",
+        resolutions=(),
+        group_seconds=(3, 15),
+        prompt_language="英文",
+        native_aspects=("16:9", "9:16", "1:1"),
+        max_reference_images=4,
+        reference_notes=False,
+    ),
 }
-# 各引擎可选的输出分辨率(空元组表示该引擎端点不接受分辨率参数)
-ENGINE_RESOLUTIONS: dict[str, tuple[str, ...]] = {
-    "seedance25": ("480p", "720p", "1080p"),
-    "seedance": ("480p", "720p", "1080p", "4k"),
-    "kling": (),
-    "gemini": ("360p", "720p", "1080p", "4k"),
-}
+DEFAULT_ENGINE = next(iter(ENGINES))
+# 非原生画幅按相邻原生画幅生成,成片时居中裁剪出目标画幅
+_GENERATION_ASPECT = {"3:4": "9:16", "4:3": "16:9", "1:1": "16:9"}
+
+
+def generation_aspect(engine: str, aspect: str) -> str:
+    """引擎实际使用的生成画幅;与目标画幅不同时成片阶段会居中裁剪。"""
+    aspect = str(aspect).strip()
+    spec = ENGINES.get(engine)
+    if spec is None or aspect in spec.native_aspects:
+        return aspect
+    return _GENERATION_ASPECT.get(aspect, "16:9")
 # 编剧模型的常用候选(OpenRouter 模型 ID),界面下拉框可直接选、也可手填任意模型
 LLM_MODEL_PRESETS: tuple[str, ...] = (
     "z-ai/glm-5.3",
@@ -92,6 +144,12 @@ _DEFAULTS: dict[str, Any] = {
         "reasoning_effort": "medium",
         "max_tokens": 32000,
     },
+    "gemini": {
+        "text_endpoint": "google/gemini-omni-flash/v1.1/text-to-video",
+        "reference_endpoint": "google/gemini-omni-flash/v1.1/reference-to-video",
+        "resolution": "720p",
+        "price_per_second": 0.10,
+    },
     "seedance25": {
         "text_endpoint": "bytedance/seedance-2.5/text-to-video",
         "reference_endpoint": "bytedance/seedance-2.5/reference-to-video",
@@ -110,12 +168,6 @@ _DEFAULTS: dict[str, Any] = {
         "reference_endpoint": "fal-ai/kling-video/o3/pro/reference-to-video",
         "price_per_second": 0.168,
     },
-    "gemini": {
-        "text_endpoint": "google/gemini-omni-flash/v1.1/text-to-video",
-        "reference_endpoint": "google/gemini-omni-flash/v1.1/reference-to-video",
-        "resolution": "720p",
-        "price_per_second": 0.10,
-    },
     "image": {"endpoint": "fal-ai/nano-banana-2"},
     "narration": {
         "enabled": True,
@@ -124,7 +176,7 @@ _DEFAULTS: dict[str, Any] = {
         "subtitles": True,
     },
     "video": {
-        "engine": "seedance25",
+        "engine": DEFAULT_ENGINE,
         "aspect_ratio": "16:9",
         "dialogue_language": DEFAULT_DIALOGUE_LANGUAGE,
         "generate_audio": True,
@@ -139,6 +191,12 @@ _DEFAULTS: dict[str, Any] = {
     },
     "ffmpeg": {"path": "ffmpeg"},
 }
+
+
+def default_resolution(engine: str) -> str:
+    """引擎的默认分辨率(端点无分辨率参数时为空串)。"""
+    return str(_DEFAULTS.get(engine, {}).get("resolution", ""))
+
 
 # 旧版配置把这些引擎无关参数放在 kling 节;读取时迁移到 video 节保持兼容
 _LEGACY_KLING_KEYS = (
@@ -180,18 +238,23 @@ class Config:
 
     @property
     def engine(self) -> str:
-        """视频生成引擎:seedance25(默认)、seedance、kling 或 gemini,均经 fal.ai。"""
-        return str(self._data["video"].get("engine") or "seedance25").strip().lower()
+        """视频生成引擎的配置值(ENGINES 的键),均经 fal.ai;留空取默认引擎。"""
+        return str(self._data["video"].get("engine") or DEFAULT_ENGINE).strip().lower()
+
+    @property
+    def engine_spec(self) -> EngineSpec:
+        """当前引擎的能力表;未知引擎(validate 会报错)按默认引擎处理。"""
+        return ENGINES.get(self.engine) or ENGINES[DEFAULT_ENGINE]
 
     @property
     def engine_name(self) -> str:
         """引擎的展示名(日志与界面用)。"""
-        return ENGINES.get(self.engine, "Kling 3")
+        return self.engine_spec.name
 
     @property
     def engine_section(self) -> dict[str, Any]:
         """当前引擎的专属配置节(端点、分辨率、单价等)。"""
-        return self._data[self.engine if self.engine in ENGINES else "kling"]
+        return self._data.get(self.engine) or self._data[DEFAULT_ENGINE]
 
     @property
     def dialogue_language(self) -> str:
@@ -227,17 +290,15 @@ class Config:
         if self.engine not in ENGINES:
             problems.append("video.engine 需为 " + " / ".join(ENGINES) + " 之一")
         else:
-            allowed = ENGINE_RESOLUTIONS[self.engine]
+            allowed = self.engine_spec.resolutions
             if allowed and str(self.engine_section.get("resolution")) not in allowed:
                 problems.append(
                     f"{self.engine}.resolution 需为 {' / '.join(allowed)} 之一"
                 )
         if not 3 <= int(self._data["video"]["clip_duration"]) <= 15:
             problems.append("video.clip_duration 需在 3~15 秒之间")
-        if str(self._data["video"]["aspect_ratio"]) not in (
-            "16:9", "9:16", "1:1", "3:4", "4:3"
-        ):
-            problems.append("video.aspect_ratio 需为 16:9 / 9:16 / 1:1 / 3:4 / 4:3 之一")
+        if str(self._data["video"]["aspect_ratio"]) not in ALL_ASPECTS:
+            problems.append("video.aspect_ratio 需为 " + " / ".join(ALL_ASPECTS) + " 之一")
         try:
             int(self._data["seedance25"].get("seed", -1))
         except (TypeError, ValueError):
@@ -293,7 +354,7 @@ def load_config() -> Config:
     if isinstance(video_section, dict):
         engine = str(video_section.get("engine") or "").strip().lower()
         if engine in _RETIRED_ENGINES:
-            video_section["engine"] = _DEFAULTS["video"]["engine"]
+            video_section["engine"] = DEFAULT_ENGINE
     return Config(_merge(_DEFAULTS, user_data))
 
 

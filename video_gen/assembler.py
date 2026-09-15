@@ -187,7 +187,7 @@ class Assembler:
     def crop_to_aspect(self, video: Path, aspect: str, out_path: Path) -> bool:
         """把成片居中裁剪到目标画幅(如 3:4 / 4:3),失败时沿用原画幅。
 
-        Kling 端点不原生支持这类画幅,片段按相邻原生画幅生成,
+        引擎不原生支持目标画幅时,片段按相邻原生画幅生成,
         在拼接后一次性裁剪(需在烧录字幕之前,避免字幕被裁掉)。
         """
         try:
@@ -346,7 +346,7 @@ class Assembler:
     def add_bgm(self, video: Path, bgm: Path, duration: float, out_path: Path) -> Path:
         """混入背景音乐:循环补齐时长、压低音量、结尾淡出。
 
-        优先与原片音轨混音(保留 Kling 原生音效);若成片无音轨则仅用
+        优先与原片音轨混音(保留视频模型的原生音效);若成片无音轨则仅用
         背景音乐。任一步失败都不影响成片——直接沿用无音乐版本。
         """
         fade_start = max(0, duration - 2)

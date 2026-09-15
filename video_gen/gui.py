@@ -12,10 +12,11 @@ from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
 from .config import (
     CONFIG_PATH,
-    ENGINE_RESOLUTIONS,
+    DEFAULT_ENGINE,
     ENGINES,
     LLM_MODEL_PRESETS,
     app_dir,
+    default_resolution,
     load_config,
     save_settings,
 )
@@ -24,14 +25,13 @@ from .pipeline import GenerationCancelled, Pipeline
 _PLACEHOLDER = "例如:一只橘猫在雨后的东京街头漫步,霓虹灯倒映在水洼里,电影感画面"
 _REF_HINT_EMPTY = "未选择(有固定主角时将由 AI 自动生成形象)"
 _NO_RESOLUTION = "(引擎默认)"  # 该引擎端点不接受分辨率参数时的占位文案
-_ENGINE_LABELS = {  # 引擎下拉框:展示名 → 配置值(首项为默认引擎)
-    f"{name}(默认)" if i == 0 else name: engine
-    for i, (engine, name) in enumerate(ENGINES.items())
+_ENGINE_LABELS = {  # 引擎下拉框:展示名 → 配置值
+    f"{spec.name}(默认)" if engine == DEFAULT_ENGINE else spec.name: engine
+    for engine, spec in ENGINES.items()
 }
 
-# 画幅选项:显示文案 → 配置值(Seedance 原生支持全部画幅;
-# Kling 引擎下 3:4 / 4:3、Gemini 引擎下 1:1 / 3:4 / 4:3 由相邻画幅生成后
-# 自动居中裁剪)
+# 画幅选项:显示文案 → 配置值(引擎不原生支持的画幅由相邻画幅生成后
+# 自动居中裁剪,见 config.ENGINES)
 _ASPECT_CHOICES = {
     "🖥 横屏 16:9": "16:9",
     "📱 竖屏 9:16": "9:16",
@@ -229,17 +229,13 @@ class App:
     @staticmethod
     def _load_settings() -> dict:
         """从 config.yaml 读取界面「设置」区的当前值(没有配置文件时用默认值)。"""
-        engine = next(iter(ENGINES))
         values = {
             "openrouter_api_key": "",
             "fal_api_key": "",
             "llm_model": LLM_MODEL_PRESETS[0],
-            "engine": engine,
-            # 各引擎各自记住分辨率,切换引擎时不互相覆盖
-            "resolutions": {
-                e: (choices[1] if len(choices) > 1 else choices[0]) if choices else ""
-                for e, choices in ENGINE_RESOLUTIONS.items()
-            },
+            "engine": DEFAULT_ENGINE,
+            # 各引擎各自记住分辨率,切换引擎时不互相覆盖;初值取配置默认值
+            "resolutions": {e: default_resolution(e) for e in ENGINES},
         }
         try:
             config = load_config()
@@ -250,19 +246,19 @@ class App:
         values["llm_model"] = str(config["llm"]["model"] or LLM_MODEL_PRESETS[0])
         if config.engine in ENGINES:
             values["engine"] = config.engine
-        for e, choices in ENGINE_RESOLUTIONS.items():
+        for e, spec in ENGINES.items():
             current = str(config[e].get("resolution") or "")
-            if current in choices:
+            if current in spec.resolutions:
                 values["resolutions"][e] = current
         return values
 
     def _selected_engine(self) -> str:
-        return _ENGINE_LABELS.get(self.engine_var.get(), next(iter(ENGINES)))
+        return _ENGINE_LABELS.get(self.engine_var.get(), DEFAULT_ENGINE)
 
     def _refresh_resolution_choices(self) -> None:
-        """分辨率下拉框随引擎变化:Kling 端点无分辨率参数时禁用。"""
+        """分辨率下拉框随引擎变化:端点无分辨率参数(Kling)时禁用。"""
         engine = self._selected_engine()
-        choices = ENGINE_RESOLUTIONS.get(engine, ())
+        choices = ENGINES[engine].resolutions
         if choices:
             self.resolution_box.config(values=list(choices), state="readonly")
             current = self._resolutions.get(engine) or choices[0]
@@ -288,7 +284,7 @@ class App:
             "llm.model": self.llm_model_var.get().strip() or LLM_MODEL_PRESETS[0],
             "video.engine": engine,
         }
-        choices = ENGINE_RESOLUTIONS.get(engine, ())
+        choices = ENGINES[engine].resolutions
         if choices:
             resolution = self.resolution_var.get()
             if resolution not in choices:
@@ -327,7 +323,7 @@ class App:
         if not paths:
             return
         # 逐张询问用途:标注用途能显著提升参考图效果(未标注是效果不佳的
-        # 最常见原因);多图时 Kling 引擎仅作多角度参考、用途说明不生效
+        # 最常见原因);多图支持情况随引擎,生成日志会提示
         picked: list[tuple[Path, str]] = []
         for i, raw in enumerate(paths, 1):
             path = Path(raw)
@@ -345,7 +341,7 @@ class App:
             self.ref_var.set(f"参考图:{picked[0][0].name}")
         else:
             self.ref_var.set(
-                f"参考图 {len(picked)} 张(用途已标注;Seedance / Gemini 引擎支持多图,"
+                f"参考图 {len(picked)} 张(用途已标注;Gemini / Seedance 引擎支持多图,"
                 "Kling 仅作同一主角的多角度参考)"
             )
         self.ref_clear_btn.config(state="normal")

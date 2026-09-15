@@ -22,7 +22,7 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
 ```
 
 - 运行依赖 `config.yaml`(程序目录下),需填 `openrouter_api_key` 与 `fal_api_key`
-  (视频只支持 fal.ai 一个平台:seedance25/seedance/kling/gemini 四个引擎均经
+  (视频只支持 fal.ai 一个平台:gemini/seedance25/seedance/kling 四个引擎均经
   fal.ai);两个 KEY、编剧模型、视频引擎与分辨率都能在界面顶部「设置」区填写,
   经 `config.save_settings` 写回 `config.yaml`(只改对应行、保留注释);
   源码运行还需本机 ffmpeg/ffprobe(打包版已内置)。
@@ -37,17 +37,17 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
    模型拒绝该档位时自动去掉 `reasoning` 参数重试),经 OpenRouter
    (OpenAI 兼容接口)把一句话扩写为 `Storyboard`(含镜头组 `Shot` 列表,每组内含
    1~6 个分镜 `Cut`)。组内分镜由视频引擎一次连续生成,组间才用转场;
-   组总长上下限均随引擎(下限 Kling 3 秒、Seedance 4 秒,`_engine_min_group`;
-   上限 Seedance 2.5 为 30 秒、Gemini 10 秒、其余 15 秒,
-   `_engine_max_group`),
+   组总长范围取自引擎能力表 `config.ENGINES[engine].group_seconds`(Gemini 3~10、
+   Seedance 2.5 4~30、Seedance 2.0 4~15、Kling 3~15),
    代码约束总时长在 `video.target_duration` ±15% 内并用 `_clamp_duration`/`_build_cuts`
-   钳制;`video.clip_duration` 仅是模型未给时长时的回退值。单条分镜 prompt 要求模型
+   钳制;`video.clip_duration` 仅是模型未给时长时的回退值(同样钳进范围)。
+   单条分镜 prompt 要求模型
    控制在语言对应的长度内(英文 450 字符,对应 Kling multi_prompt 512 字符硬上限;
    中文 220 字)。系统提示词按引擎渲染(`{engine_name}`/`{group_min}`/`{group_max}`/
    `{prompt_language}` 及 `_LANG_PROMPT_PARTS` 的示例);分镜 prompt 结构要求
    主体+核心动作放开头(模型优先锁定开头内容)、每分镜单一动作弧线、光影用单个
-   强关键词;Kling 下 3:4/4:3、Gemini 下 1:1/3:4/4:3 画幅用裁剪构图提示
-   (`_KLING_CROP_NOTES` / `_GEMINI_CROP_NOTES`)。
+   强关键词;引擎不原生支持所选画幅时(`config.generation_aspect` 返回值不同于
+   目标画幅)改用裁剪构图提示(`_CROP_NOTES`,按目标画幅 3:4/4:3/1:1 取)。
    用户可上传参考图(可多张,各带用途说明):随创意以多模态消息(最多 4 张,
    `_MAX_DIRECTOR_IMAGES`)发给导演模型照图撰写 @Element1 外观描述,
    模型不支持图片输入时自动去图重试(文字说明仍列出各图用途)。导演同时决定声音形态:
@@ -56,26 +56,43 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
    `中文普通话`,`Config.dialogue_language`,经 `{dialogue_language}` 渲染进
    系统提示词的硬性要求)。请求带 `response_format: json_schema`,
    不支持结构化输出的模型由 `_extract_json` 容错兜底。
-2. **kling.py** — 视频生成模块,四引擎全部经 fal.ai(不再支持其他平台):
-   `_FalGenerator` 基类承载提交/轮询/下载/看门狗/取消/降级重试等公共逻辑,
-   `create_generator` 按 `video.engine` 实例化 `Seedance25Generator`(seedance25,
-   默认)、`SeedanceGenerator`(seedance)、`KlingGenerator` 或 `GeminiGenerator`
-   (gemini);子类只实现 `_build_arguments`。
+2. **generator.py** — 视频生成模块,四引擎全部经 fal.ai(不再支持其他平台):
+   `_FalGenerator` 基类承载提交/轮询/下载/看门狗/取消/降级重试等公共逻辑与
+   子类共用的小工具(`_wants_reference`/`_pick_references`/`_group_duration`/`_fit`),
+   并从 `config.engine_spec` 读取引擎能力;`_SinglePromptGenerator` 承载"整组
+   分镜拼成单条 prompt 一次生成"的共同请求形状,`SeedanceGenerator`(seedance)、
+   `Seedance25Generator`(seedance25)、`GeminiGenerator`(gemini,默认)只用类属性
+   (`_TIMED_JOIN`/`_AUDIO_FLAG`/`_SEED`/`_INT_DURATION`/`_TOKEN_FORMAT`/
+   `_ENGLISH_NOTE`/`_convert_tokens`)描述差异;`KlingGenerator` 自有
+   `_build_arguments`(multi_prompt / elements);`create_generator` 按 `video.engine`
+   实例化。**新增引擎**:在 `config.ENGINES` 登记能力、`_DEFAULTS` 加节、
+   这里加子类并登记到 `_GENERATORS`。
    参考图取 `generate_clip(references=[(URL, 用途说明), …])`:优先用用户上传的
    参考图(pipeline 复制进任务目录并上传,用途持久化在 `references.json` 供断点
-   续传),否则有固定主角时先文生图;各引擎参考图张数上限见 `MAX_REFERENCE_IMAGES`
-   (2.5 30 张 / 2.0 9 张 / Gemini 10 张 / Kling 4 张,pipeline 会向用户提示当前
-   引擎的多图支持与超限截断);Seedance 系把各图用途经 `reference_usage_note`
-   写进 prompt 尾部;参考图任何一步失败自动降级纯文生视频
+   续传),否则有固定主角时先文生图;各引擎参考图张数上限见能力表的
+   `max_reference_images`(Gemini 10 张 / 2.5 30 张 / 2.0 9 张 / Kling 4 张,
+   pipeline 会向用户提示当前引擎的多图支持与超限截断);各图用途经
+   `reference_usage_note` 写进 prompt 尾部(Kling 除外,`reference_notes=False`);
+   参考图任何一步失败自动降级纯文生视频
    (`strip_reference_tokens` 去掉占位符,兼容旧 manifest 的 `@Image1`/`@图片1`)。
-   - **Seedance 2.5**(默认,`video.engine: seedance25`):端点
+   - **Gemini Omni Flash 1.1**(默认,`video.engine: gemini`):端点
+     `google/gemini-omni-flash/v1.1/text-to-video` 与 `reference-to-video`;
+     `duration` 为 3~10 的整数,分辨率 360p/720p/1080p/4k,画幅原生仅 16:9/9:16
+     (1:1/3:4/4:3 经 `config.generation_aspect` 映射生成、成片时裁剪);原生
+     音频始终开启(无 `generate_audio`),无 seed/negative_prompt;参考图走
+     `image_urls`(最多 10 张)按顺序送入、没有占位符语法,`@Element1` 经
+     `element_to_reference_phrases` 改写为 "the character from reference image 1",
+     各图用途经 `reference_usage_note(..., english=True)` 以英文附在 prompt 尾部;
+     提示词语言为英文(同 Kling)。
+   - **Seedance 2.5**(`video.engine: seedance25`):端点
      `bytedance/seedance-2.5/text-to-video` 与 `reference-to-video`;多分镜经
      `join_cut_prompts_timed` 按时间戳分块拼接(如 `[0-4秒] …`,把分镜时长比例
      传给模型,防 30 秒长组后半段漂移;单分镜组仍走 `join_cut_prompts`;
-     与 Gemini 共用 `_join_timed_prompts`),参考图走 `image_urls`(最多 30 张),
+     `_TIMED_JOIN`),参考图走 `image_urls`(最多 30 张),
      `@Element1` 经 `element_to_image_tokens` 转为 `@Image1`;`duration` 为字符串
      枚举("4"~"30"),分辨率 480p/720p/1080p,原生全部画幅;端点不支持
      negative_prompt,`seed`(`seedance25.seed`,-1 随机)仅 reference 端点接受。
+     Seedance 2.5 与 Gemini 共用 `_TIMED_JOIN`(多分镜时间戳分块)。
    - **Seedance 2.0**(`video.engine: seedance`):多分镜用 `join_cut_prompts`
      以 "Cut scene to" 语法(中文脚本自动用「镜头切换:」)拼成单条 prompt
      一次生成,时长取组总长(钳到 4~15);参考图走 reference-to-video 的
@@ -86,18 +103,9 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
      (prompt 中 `@Element1`;多张参考图仅作同一主角的多角度参考,不支持
      按用途区分);提交前 `fit_prompt` 按分句边界钳制到端点硬上限
      (multi_prompt 单条 512 字符,单 prompt/negative_prompt 2500)。画幅原生仅
-     16:9/9:16/1:1,3:4、4:3 经 `kling_generation_aspect` 映射生成,拼接后由
+     16:9/9:16/1:1,3:4、4:3 经 `config.generation_aspect` 映射生成,拼接后由
      `assembler.crop_to_aspect` 居中裁剪(在字幕烧录之前);端点无分辨率参数
-     (`ENGINE_RESOLUTIONS["kling"]` 为空,界面分辨率框禁用)。
-   - **Gemini Omni Flash 1.1**(`video.engine: gemini`):端点
-     `google/gemini-omni-flash/v1.1/text-to-video` 与 `reference-to-video`;
-     `duration` 为 3~10 的整数,分辨率 360p/720p/1080p/4k,画幅原生仅 16:9/9:16
-     (1:1/3:4/4:3 经 `gemini_generation_aspect` 映射生成、成片时裁剪);原生
-     音频始终开启(无 `generate_audio`),无 seed/negative_prompt;参考图走
-     `image_urls`(最多 10 张)按顺序送入、没有占位符语法,`@Element1` 经
-     `element_to_reference_phrases` 改写为 "the character from reference image 1",
-     各图用途经 `reference_usage_note(..., english=True)` 以英文附在 prompt 尾部;
-     提示词语言为英文(同 Kling)。
+     (能力表 `resolutions` 为空,界面分辨率框禁用)。
    `FatalGenerationError`(KEY 无效/余额不足/端点不存在)立即终止全部镜头组;
    422 参数校验错误是确定性的,跳过重试直接降级/报错;其余错误逐组重试。
 3. **tts.py** — Edge TTS(免费)合成导演写的中文旁白,逐组落盘
@@ -112,10 +120,13 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
    `fonts/` 内 Noto Sans SC 字体,缺失时回退平台系统字体),失败退 mp4 软字幕;
    `music/` 目录有音频时由导演挑选一首混入(bgm)。每级失败都沿用上一级产物。
 5. **config.py** — 读取程序目录 `config.yaml`,与 `_DEFAULTS` 深合并;`app_dir()` 兼容
-   PyInstaller 冻结与 macOS .app 布局。引擎表 `ENGINES`(配置值→展示名,顺序即
-   界面下拉框顺序)、`ENGINE_RESOLUTIONS`(各引擎可选分辨率)与 `LLM_MODEL_PRESETS`
-   (编剧模型候选)由 config 与 gui 共用,新增引擎只需在这两张表与 `_DEFAULTS`
-   登记。`save_settings({"llm.model": …, "video.engine": …})` 把界面设置写回
+   PyInstaller 冻结与 macOS .app 布局。**引擎能力表 `ENGINES`**(配置值 →
+   `EngineSpec`:展示名、可选分辨率、单组时长范围、提示词语言、原生画幅、参考图
+   上限、用途说明是否生效;顺序即界面下拉框顺序,首项为 `DEFAULT_ENGINE`)是
+   引擎差异的唯一登记处,director/pipeline/gui/generator 一律查表
+   (`Config.engine_spec`),不再散落 `if engine == …`;`generation_aspect(engine,
+   aspect)` 给出实际生成画幅;`LLM_MODEL_PRESETS` 为编剧模型候选。
+   `save_settings({"llm.model": …, "video.engine": …})` 把界面设置写回
    `config.yaml`:逐行改写对应键(`_set_yaml_value`,保留其余行与注释,缺键则
    补行),写完用 YAML 解析校验,校验失败才整体 `safe_dump` 重写。
    **新增配置项必须同时更新 `_DEFAULTS`、`config.yaml` 的注释(注释保持简短,
@@ -134,11 +145,11 @@ python build.py                   # PyInstaller 打包 + 内置 ffmpeg,产出 di
   (无 `engine` 字段的旧 manifest 视为 kling 任务)——所以 `Shot`/`Storyboard`
   字段变更要保持 `from_dict` 对旧 manifest 兼容(用 `.get()` + 默认值)。
 - **配置兼容**:引擎无关参数(画幅/音效/重试/并发/超时等)在 `video` 节,引擎专属
-  参数在 `seedance25`/`seedance`/`kling`/`gemini` 节;`load_config` 会把旧版配置中
+  参数在 `gemini`/`seedance25`/`seedance`/`kling` 节;`load_config` 会把旧版配置中
   kling 节里的引擎无关参数自动迁移到 video 节,旧配置选了已下线的 `ark`/`jimeng`
   引擎(`_RETIRED_ENGINES`)时改回默认引擎,旧的 `ark_api_key`/`jimeng_*` 等多余键
   由 `_merge` 原样忽略。
-- **提示词语言与台词**:分镜 prompt 语言随引擎(`_engine_prompt_language`):
+- **提示词语言与台词**:分镜 prompt 语言随引擎(能力表 `prompt_language`):
   Seedance 系用中文(官方一等支持),Kling 与 Gemini 用英文;系统提示词的
   示例与长度规则按语言取自 `_LANG_PROMPT_PARTS`;引擎专属创作约束
   经 `_ENGINE_NOTES` 附在用户消息里。

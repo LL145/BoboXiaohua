@@ -9,15 +9,15 @@
 - 主角参考图:用户可上传主角图片(随创意发给导演模型照图写外观描述),
   未上传时导演模型判断有固定主角则自动文生图;参考图作为角色元素
   (@Element1)送入每个镜头组,任何一步失败都自动降级为纯文生视频;
-- 并行生成:多个镜头组同时提交视频引擎(全部经 fal.ai,默认 Seedance 2.5,
-  可切 Seedance 2.0 / Kling 3 / Gemini Omni Flash),总耗时约等于单个镜头组;
+- 并行生成:多个镜头组同时提交视频引擎(全部经 fal.ai,默认 Gemini Omni Flash,
+  可切 Seedance 2.5 / 2.0 / Kling 3),总耗时约等于单个镜头组;
 - 单镜头组独立重试 + 超时看门狗,KEY 无效等致命错误立即终止,不空耗重试;
 - 旁白与字幕:导演判断影片需要解说时,用 Edge TTS 合成旁白并生成字幕;
   TTS 不可用、混音或字幕失败,都只是放弃对应环节,绝不影响画面成片;
 - 运行日志同步写入任务目录 log.txt,便于排查问题;
 - 背景音乐:程序目录 music/ 下有音频文件时,由导演模型按影片情绪挑选混入;
 - 费用预估:生成前按待生成镜头秒数估算 fal 费用并展示;
-- 可取消:界面「取消」按钮置位 cancel_event,Kling 轮询/等待/片段下载、
+- 可取消:界面「取消」按钮置位 cancel_event,视频任务轮询/等待/片段下载、
   旁白合成循环与拼接各阶段之间均及时检查,以 GenerationCancelled 停止,
   已完成产物保留、可断点续传。
 """
@@ -118,7 +118,7 @@ class Pipeline:
         并随创意发给导演模型照图撰写外观描述;不提供时由导演判断是否自动生成。
         """
         user_refs = _normalize_references(reference_images)
-        from .kling import FatalGenerationError, clip_is_valid, create_generator
+        from .generator import FatalGenerationError, clip_is_valid, create_generator
 
         config = self._config
         log = self._log
@@ -253,7 +253,7 @@ class Pipeline:
         )
         current = stage_path
 
-        # 引擎不原生支持的画幅(Kling 的 3:4 / 4:3,Gemini 另含 1:1):片段按相邻原生画幅生成,
+        # 引擎不原生支持的画幅(见 config.ENGINES):片段按相邻原生画幅生成,
         # 在此居中裁剪出目标画幅(须在字幕烧录前,失败沿用生成画幅)
         aspect = str(config["video"]["aspect_ratio"])
         if generator.generation_aspect(aspect) != aspect:
@@ -427,7 +427,7 @@ class Pipeline:
 
     def _existing_references(self, run_dir: Path) -> list[tuple[Path, str]]:
         """任务目录中已保存的参考图(断点续传):[(文件, 用途说明)]。"""
-        from .kling import image_is_valid
+        from .generator import image_is_valid
 
         notes: dict[str, str] = {}
         meta_path = run_dir / _REFERENCES_META
@@ -448,19 +448,17 @@ class Pipeline:
         """告知用户当前引擎对多参考图的支持程度(仅多图时)。"""
         if count <= 1:
             return
-        from .kling import MAX_REFERENCE_IMAGES
-
-        engine = self._config.engine
-        limit = MAX_REFERENCE_IMAGES.get(engine, 1)
-        if engine in ("seedance", "seedance25", "gemini"):
+        spec = self._config.engine_spec
+        limit = spec.max_reference_images
+        if spec.reference_notes:
             self._log(
-                f"  当前引擎 {self._config.engine_name} 支持多参考图"
+                f"  当前引擎 {spec.name} 支持多参考图"
                 f"(最多 {limit} 张),各图的用途说明会写入提示词。"
             )
         else:
             self._log(
-                "  ⚠ 当前引擎 Kling 仅把多张图片作为同一主角的多角度参考,"
-                "各图单独的用途说明不生效(需要按用途区分时请切换 Seedance 引擎)。"
+                f"  ⚠ 当前引擎 {spec.name} 仅把多张图片作为同一主角的多角度参考,"
+                "各图单独的用途说明不生效(需要按用途区分时请切换其他引擎)。"
             )
         if count > limit:
             self._log(f"  ⚠ 参考图共 {count} 张,超出引擎上限,仅使用前 {limit} 张。")
@@ -478,14 +476,7 @@ class Pipeline:
         参考图(断点续传,用途存于 references.json)→ 按导演的
         reference_prompt 文生图。
         """
-        from .kling import MAX_REFERENCE_IMAGES, image_is_valid
-
-        if MAX_REFERENCE_IMAGES.get(self._config.engine, 1) == 0:
-            self._log(
-                f"  当前引擎 {self._config.engine_name} 不支持参考图,"
-                "角色一致性由分镜脚本中逐字重复的外观描述保证。"
-            )
-            return None
+        from .generator import image_is_valid
 
         locals_with_notes: list[tuple[Path, str]] = []
         if user_images:
